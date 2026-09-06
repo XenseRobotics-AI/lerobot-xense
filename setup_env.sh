@@ -273,6 +273,10 @@ print("yes" if actual_release == expected_release else "no")
 PY
 }
 
+# Installs or upgrades ONE package to >=min_version. `--upgrade-package`, not
+# `--upgrade`: uv's `--upgrade` drops the prefer-installed rule for the whole
+# resolution, so it also walks every dependency up to the newest release --
+# which is how conda-owned packages get overwritten (check_conda_uv_consistency).
 ensure_python_package_min_version() {
     local package_name=$1
     local min_version=$2
@@ -293,7 +297,7 @@ PY
 
     if [[ -z "$current_version" ]]; then
         echo "[python] Installing missing package: $package_name>=$min_version"
-        uv pip install --upgrade "$package_name>=$min_version"
+        uv pip install --upgrade-package "$package_name" "$package_name>=$min_version"
         return
     fi
 
@@ -312,7 +316,7 @@ PY
         echo "[python] Keeping $package_name==$current_version"
     else
         echo "[python] Upgrading $package_name from $current_version to >=$min_version"
-        uv pip install --upgrade "$package_name>=$min_version"
+        uv pip install --upgrade-package "$package_name" "$package_name>=$min_version"
     fi
 }
 
@@ -363,16 +367,18 @@ def dist_infos(name):
                 for row in csv.reader(fh):
                     if row and row[0] and not row[0].endswith(".pyc"):
                         files.add(os.path.normpath(os.path.join(sp, row[0])))
-            seen[m.group(1)] = files
+            seen[m.group(1)] = (di, files)
     return seen
 
 bad = []
 for name, cver, cfiles in conda_pkgs():
-    for uver, ufiles in dist_infos(name).items():
+    for uver, (di, ufiles) in dist_infos(name).items():
         if uver == cver or not (cfiles & ufiles):
             continue
         missing = sum(1 for f in cfiles if not os.path.exists(os.path.join(prefix, f)))
-        bad.append((name, cver, uver, len(cfiles & ufiles), missing, len(cfiles)))
+        di_rel = os.path.relpath(di, prefix)
+        extra = sorted(f for f in ufiles - cfiles if not f.startswith(di_rel))
+        bad.append((name, cver, uver, len(cfiles & ufiles), missing, len(cfiles), di, extra))
 
 # The per-user site directory (~/.local/lib/pythonX.Y/site-packages) is not part
 # of this env but conda envs inherit it, so a `pip install --user` anywhere on the
@@ -421,10 +427,20 @@ print("[WARN]  The next `mamba env update` will relink conda's copy over uv's an
 print("[WARN]  leave uv's extra files behind, which is how pip broke with")
 print("[WARN]  \"ImportError: cannot import name 'get_runnable_pip'\".")
 print(f"[WARN]  {'package':22s} {'conda-meta':12s} {'on disk':12s} {'shared':>7s} {'conda files gone':>17s}")
-for name, cver, uver, shared, missing, total in sorted(bad):
+for name, cver, uver, shared, missing, total, _, _ in sorted(bad):
     print(f"[WARN]  {name:22s} {cver:12s} {uver:12s} {shared:7d} {f'{missing}/{total}':>17s}")
 print("[WARN]  Fix by making one side own each: pin it in conda_environment.yaml to")
-print("[WARN]  the version the wheel stack needs, or stop uv from upgrading it.")
+print("[WARN]  the version the wheel stack needs, or stop uv from upgrading it")
+print("[WARN]  (`uv pip install --upgrade` upgrades every dependency in the")
+print("[WARN]  resolution, not just the named package; use --upgrade-package).")
+print("[WARN]  To put this env back on conda's copy right now, per package:")
+for name, cver, uver, _, _, _, di, extra in sorted(bad):
+    print(f"[WARN]    mamba install -p {prefix} -y --force-reinstall '{name}=={cver}'")
+    print(f"[WARN]    rm -rf '{di}'")
+    if extra:
+        paths = " ".join(f"'{os.path.join(prefix, f)}'" for f in extra[:4])
+        more = f"  # +{len(extra) - 4} more, see its RECORD" if len(extra) > 4 else ""
+        print(f"[WARN]    rm -f {paths}{more}")
 PYEOF
 }
 
@@ -843,7 +859,7 @@ install_xense() {
     # libxense_c.so.20 and a newer libxense_c.so.1.0.0 (the file the backend now
     # loads), so no separate xense_xu / pyxensexu build is needed. --no-deps keeps
     # the env's numpy/cryptography pins (see block above).
-    uv pip install --no-deps --upgrade "xensesdk==${XENSESDK_VERSION}"
+    uv pip install --no-deps --upgrade-package xensesdk "xensesdk==${XENSESDK_VERSION}"
     # Install XGripper from local submodule (import package: xgripper). It is
     # used by the serial / xense grippers and imports the xensesdk installed
     # above; --no-deps avoids PyPI wheels that are incomplete for Python 3.12.
@@ -982,7 +998,14 @@ install_elite() {
     # that is no longer on disk. The next `mamba env update` then relinks conda's
     # copy over uv's and leaves uv's extra files behind -- exactly how pip broke
     # with `ImportError: cannot import name 'get_runnable_pip'`.
-    uv pip install --upgrade pybind11-stubgen build
+    #
+    # `--upgrade-package`, not `--upgrade`: uv's `--upgrade` drops the
+    # prefer-installed rule for the WHOLE resolution, not just the named
+    # packages. `--upgrade build` walked build's `packaging>=24.0` dependency
+    # from conda's 26.2 to a 26.3 conda-forge does not ship (2026-09-01). `-P`
+    # upgrades only the named packages and keeps every dependency where it is.
+    uv pip install --upgrade-package pybind11-stubgen --upgrade-package build \
+        pybind11-stubgen build
 
     # Build the pybind wheel, pointing the Python SDK at our LOCAL C++ SDK
     # submodule (ELITE_CS_SDK_REPO is required and must be a local path — the
