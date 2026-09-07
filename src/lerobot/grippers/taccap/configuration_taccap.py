@@ -16,13 +16,15 @@
 
 """Configuration for the TacCap follower (actuated) gripper.
 
-Wraps ``xense.taccap.FollowerGripper``. The follower drives an FDCAN motor via
-the MIT force-position (impedance) primitive; the driver runs a background
-``ControlLoop`` so reads/writes are non-blocking. Left/right units are told
-apart automatically by the firmware-burned serial number (``side``), so no
-per-unit SN/port needs configuring in the common case.
+Wraps ``xense.taccap.FollowerGripper``. The recipe selects either the
+position-impedance ``ControlLoop`` or contact-aware
+``ForcePositionController``; both run in the SDK background so reads/writes
+remain non-blocking. Left/right units are told apart automatically by the
+firmware-burned serial number (``side``), so no per-unit SN/port needs
+configuring in the common case.
 """
 
+import math
 from dataclasses import dataclass
 
 from ..configs import GripperConfig
@@ -33,6 +35,11 @@ from ..configs import GripperConfig
 # motor's usable envelope (cf. the max_torque values in the codec tests). This is a
 # safety rail, not a recommendation — the gentle-grasp example aborts at 0.30 Nm.
 MAX_FEEDFORWARD_TORQUE_NM = 3.5
+TACCAP_CONTROLLERS = ("control_loop", "force_position")
+TACCAP_SUBMIT_PHASES = ("stream_locked", "free_running")
+TACCAP_STALL_ACTIONS = ("hold_position", "none")
+FORCE_POSITION_MAX_HOLD_TORQUE_NM = 1.8
+FORCE_POSITION_MAX_MOTION_TORQUE_NM = 6.0
 
 
 @GripperConfig.register_subclass("taccap_follower")
@@ -50,27 +57,28 @@ class TaccapFollowerConfig(GripperConfig):
                      to bypass side-based discovery. Use only when auto-discovery
                      is not viable.
 
-    Control (MIT impedance):
-        kp:          Position-tracking stiffness gain (Nm/rad).
-        kd:          Velocity damping gain (Nm·s/rad).
-        feedforward_torque: Constant torque bias (Nm) added to every MIT frame,
-                     on top of the kp/kd position term. SIGN: negative = closing
-                     (clamps harder), positive = opening. Default 0.0. This is a
-                     *constant* bias — it acts even with an empty jaw (holds the
-                     mechanical stop and biases the open pose), unlike kp which
-                     only produces force when there is a position error. Bounded
-                     to |ff| <= MAX_FEEDFORWARD_TORQUE_NM to catch sign/scale
-                     typos; the SDK's own gentle-grasp example treats 0.30 Nm as
-                     an abort threshold, so values past ~1 Nm are a hard crush.
-        control_hz:  Rate of the background ControlLoop that resubmits the latest
-                     normalized target to the firmware. **Ignored under the SDK's
-                     default submit phase.** ControlLoop now phase-locks its
-                     submits to the motor-status stream (one frame per received
-                     status frame, ~100 Hz), because a submit that overlaps the
-                     MCU's own transmission makes it drop bytes out of the frame
-                     it is sending -- which cost us status frames at random.
-                     Kept because it still drives the SDK's free-running phase,
-                     which this config does not currently select.
+    Controller:
+        controller: Selects the SDK background controller at connect time.
+                     ``control_loop`` is normalized position impedance;
+                     ``force_position`` closes with bounded velocity/damping,
+                     detects contact, then holds ``grasp_torque_nm`` using pure
+                     feed-forward torque. Switching requires restarting the
+                     LeRobot command; YAML is not hot-reloaded.
+
+    ControlLoop:
+        kp/kd:       Position stiffness and velocity damping.
+        feedforward_torque: Constant torque bias added to every impedance frame.
+                     Negative closes and positive opens. It is not a target
+                     torque and remains active with an empty jaw.
+        control_hz:  Used only by ``free_running``. The default
+                     ``stream_locked`` phase submits once per motor-status frame,
+                     at ``motor_stream_hz``.
+
+    ForcePositionController:
+        grasp_torque_nm: Positive target torque magnitude used after contact.
+        contact_torque_nm: Contact detector floor, not the grasp target.
+        hold_torque_limit_nm: Long-term torque ceiling (SDK maximum 1.8 Nm).
+        motion_torque_limit_nm: Transient motion ceiling (SDK maximum 6.0 Nm).
 
     Behavior:
         init_open:       If True, drive fully open on ``connect()``.
@@ -83,15 +91,54 @@ class TaccapFollowerConfig(GripperConfig):
     side: str = "left"  # "left" | "right" (firmware-SN auto side)
     mcu_device: str | None = None  # optional explicit device path override
 
-    # ── Control (MIT impedance) ────────────────────────────────────────────────
+    # ── SDK controller selection ───────────────────────────────────────────────
+    controller: str = "control_loop"  # "control_loop" | "force_position"
+
+    # ── ControlLoop (position impedance) ───────────────────────────────────────
     kp: float = 8.0  # Nm/rad
     kd: float = 1.0  # Nm·s/rad
     feedforward_torque: float = 0.0  # Nm; NEGATIVE = closing/clamp, POSITIVE = opening
     control_hz: int = 100  # ControlLoop resubmit rate (ignored while phase-locked)
+    submit_phase: str = "stream_locked"  # "stream_locked" | "free_running"
+    max_position_torque_nm: float = 1.5
+    rated_torque_nm: float = 2.0
+    rated_hold_ms: int = 20
+    rated_release_rad: float = 0.05
+    stall_torque_nm: float = 1.2
+    stall_vel_radps: float = 0.15
+    stall_hold_ms: int = 60
+    stall_action: str = "hold_position"  # "hold_position" | "none"
+
+    # Both SDK controllers own the same motor-status stream. The current
+    # transport is hardware-validated at no more than 100 Hz.
+    motor_stream_hz: int = 100
+
+    # ── ForcePositionController (contact-aware force/position) ─────────────────
+    close_position: float = 0.0
+    close_speed_radps: float = 0.5
+    grasp_torque_nm: float = 0.35
+    hold_torque_limit_nm: float = FORCE_POSITION_MAX_HOLD_TORQUE_NM
+    motion_torque_limit_nm: float = FORCE_POSITION_MAX_MOTION_TORQUE_NM
+    contact_torque_nm: float = 0.080
+    contact_vel_radps: float = 0.035
+    contact_vel_ratio: float = 0.25
+    contact_moved_rad: float = 0.010
+    position_kp: float = 20.0
+    position_kd: float = 1.0
+    brake_distance_rad: float = 0.10
+    close_endpoint_tolerance_rad: float = 0.03
+    contact_samples: int = 3
+    startup_guard_ms: int = 250
+    status_timeout_ms: int = 350
 
     # ── Behavior ───────────────────────────────────────────────────────────────
     init_open: bool = True
     require_calibrated: bool = True
+    # Read the already-streamed SDK snapshot and publish one compact row per
+    # gripper into the teleop live panel at this lower update rate. This never
+    # polls Motor.read_status() and therefore adds no traffic to the control bus.
+    print_status: bool = False
+    status_print_hz: float = 5.0
     # On by default: a TacCap gripper is a self-contained USB hub carrying its own
     # wrist camera and two GSPS sensors, so they travel with the gripper and are
     # cheaper to sniff than to pin per bench.
@@ -119,6 +166,11 @@ class TaccapFollowerConfig(GripperConfig):
     def __post_init__(self):
         if self.side not in ("left", "right"):
             raise ValueError(f"TaccapFollowerConfig: side must be 'left' or 'right', got {self.side!r}.")
+        if self.controller not in TACCAP_CONTROLLERS:
+            raise ValueError(
+                f"TaccapFollowerConfig: controller must be one of {TACCAP_CONTROLLERS}, "
+                f"got {self.controller!r}."
+            )
         if not self.kp > 0.0:
             raise ValueError(f"TaccapFollowerConfig: kp must be positive, got {self.kp}.")
         if not self.kd >= 0.0:
@@ -143,6 +195,101 @@ class TaccapFollowerConfig(GripperConfig):
                 "Rates at or above 250 Hz measurably cost motor-status frames when the SDK's "
                 "control loop runs free (see tc-gu-01 issue #1); the default phase ignores this "
                 "value entirely and submits at the status-stream rate."
+            )
+        if self.submit_phase not in TACCAP_SUBMIT_PHASES:
+            raise ValueError(
+                f"TaccapFollowerConfig: submit_phase must be one of {TACCAP_SUBMIT_PHASES}, "
+                f"got {self.submit_phase!r}."
+            )
+        if self.stall_action not in TACCAP_STALL_ACTIONS:
+            raise ValueError(
+                f"TaccapFollowerConfig: stall_action must be one of {TACCAP_STALL_ACTIONS}, "
+                f"got {self.stall_action!r}."
+            )
+        if not 0 < self.motor_stream_hz <= 100:
+            raise ValueError(
+                f"TaccapFollowerConfig: motor_stream_hz must be in [1, 100], got {self.motor_stream_hz}."
+            )
+
+        non_negative = {
+            "max_position_torque_nm": self.max_position_torque_nm,
+            "rated_torque_nm": self.rated_torque_nm,
+            "rated_release_rad": self.rated_release_rad,
+            "stall_torque_nm": self.stall_torque_nm,
+            "stall_vel_radps": self.stall_vel_radps,
+            "contact_moved_rad": self.contact_moved_rad,
+            "position_kd": self.position_kd,
+            "brake_distance_rad": self.brake_distance_rad,
+            "close_endpoint_tolerance_rad": self.close_endpoint_tolerance_rad,
+        }
+        for name, value in non_negative.items():
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(
+                    f"TaccapFollowerConfig: {name} must be finite and >= 0, got {value}."
+                )
+        for name, value in {
+            "rated_hold_ms": self.rated_hold_ms,
+            "stall_hold_ms": self.stall_hold_ms,
+            "startup_guard_ms": self.startup_guard_ms,
+        }.items():
+            if value < 0:
+                raise ValueError(f"TaccapFollowerConfig: {name} must be >= 0, got {value}.")
+
+        if not math.isfinite(self.close_position) or not 0.0 <= self.close_position <= 1.0:
+            raise ValueError(
+                f"TaccapFollowerConfig: close_position must be in [0, 1], got {self.close_position}."
+            )
+        positive = {
+            "close_speed_radps": self.close_speed_radps,
+            "grasp_torque_nm": self.grasp_torque_nm,
+            "contact_torque_nm": self.contact_torque_nm,
+            "contact_vel_radps": self.contact_vel_radps,
+            "position_kp": self.position_kp,
+        }
+        for name, value in positive.items():
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(
+                    f"TaccapFollowerConfig: {name} must be finite and > 0, got {value}."
+                )
+        if not 0.0 < self.hold_torque_limit_nm <= FORCE_POSITION_MAX_HOLD_TORQUE_NM:
+            raise ValueError(
+                "TaccapFollowerConfig: hold_torque_limit_nm must be in (0, 1.8], "
+                f"got {self.hold_torque_limit_nm}."
+            )
+        if not 0.0 < self.motion_torque_limit_nm <= FORCE_POSITION_MAX_MOTION_TORQUE_NM:
+            raise ValueError(
+                "TaccapFollowerConfig: motion_torque_limit_nm must be in (0, 6.0], "
+                f"got {self.motion_torque_limit_nm}."
+            )
+        if self.hold_torque_limit_nm > self.motion_torque_limit_nm:
+            raise ValueError(
+                "TaccapFollowerConfig: hold_torque_limit_nm must not exceed motion_torque_limit_nm."
+            )
+        if self.grasp_torque_nm > self.hold_torque_limit_nm:
+            raise ValueError(
+                "TaccapFollowerConfig: grasp_torque_nm must not exceed hold_torque_limit_nm."
+            )
+        if self.contact_torque_nm > self.grasp_torque_nm:
+            raise ValueError(
+                "TaccapFollowerConfig: contact_torque_nm must not exceed grasp_torque_nm; "
+                "otherwise contact can never latch."
+            )
+        if not math.isfinite(self.contact_vel_ratio) or not 0.0 < self.contact_vel_ratio <= 1.0:
+            raise ValueError(
+                f"TaccapFollowerConfig: contact_vel_ratio must be in (0, 1], got {self.contact_vel_ratio}."
+            )
+        if self.contact_samples <= 0:
+            raise ValueError(
+                f"TaccapFollowerConfig: contact_samples must be > 0, got {self.contact_samples}."
+            )
+        if self.status_timeout_ms <= 0:
+            raise ValueError(
+                f"TaccapFollowerConfig: status_timeout_ms must be > 0, got {self.status_timeout_ms}."
+            )
+        if not math.isfinite(self.status_print_hz) or self.status_print_hz <= 0.0:
+            raise ValueError(
+                "TaccapFollowerConfig: status_print_hz must be finite and > 0, "
+                f"got {self.status_print_hz}."
             )
         if not 0.0 <= self.fisheye_balance <= 1.0:
             raise ValueError(f"TaccapFollowerConfig: fisheye_balance must be in [0, 1], got {self.fisheye_balance}.")

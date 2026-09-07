@@ -328,7 +328,10 @@ class Pico4(Teleoperator):
         self._prev_target_quat = self._target_quat.copy()
         self._last_action_time = None
 
-        self.logger.info(f"Reset target pose to: pos={pose_7d[:3]}, quat={pose_7d[3:7]}, gripper={gripper_pos}")
+        # Reset is invoked for both arms on a trigger edge. Keep the detailed
+        # pose diagnostic in the file/debug log instead of injecting two lines
+        # into the live terminal panel while it is being redrawn.
+        self.logger.debug(f"Reset target pose to: pos={pose_7d[:3]}, quat={pose_7d[3:7]}, gripper={gripper_pos}")
 
     def _quaternion_multiply(self, q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
         """Multiply two quaternions q1 * q2. Both in [qw, qx, qy, qz] format."""

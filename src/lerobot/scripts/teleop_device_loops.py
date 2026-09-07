@@ -45,6 +45,7 @@ from typing import Any, Protocol
 
 import numpy as np
 
+from lerobot.grippers.taccap.taccap_follower import get_taccap_status_lines
 from lerobot.robots import Robot
 from lerobot.teleoperators import Teleoperator
 from lerobot.utils.robot_utils import get_logger
@@ -167,7 +168,7 @@ def run_cartesian_teleop_loop(
                 if not reset_display_cleared:
                     print("\033[2J\033[H", end="", flush=True)
                     reset_display_cleared = True
-                _print_obs_state(obs, display_len, "RESETTING")
+                _print_obs_state(obs, display_len, "RESETTING", extra_lines=get_taccap_status_lines())
             _sleep_to_fps(loop_start, fps)
             continue
 
@@ -179,7 +180,7 @@ def run_cartesian_teleop_loop(
                 if not reset_display_cleared:
                     print("\033[2J\033[H", end="", flush=True)
                     reset_display_cleared = True
-                _print_obs_state(obs, display_len, "MOVING")
+                _print_obs_state(obs, display_len, "MOVING", extra_lines=get_taccap_status_lines())
             prev_rt_moving = True
             _sleep_to_fps(loop_start, fps)
             continue
@@ -208,7 +209,13 @@ def run_cartesian_teleop_loop(
                 print(f"{'NAME':<{display_len}} | {'NORM':>7}")
                 for motor, value in action.items():
                     print(f"{motor:<{display_len}} | {value:>7.4f}")
-                move_cursor_up(len(action) + 5)
+                status_lines = get_taccap_status_lines()
+                for line in status_lines:
+                    print(f"\033[2K{line}")
+                # Rewind the exact panel height: blank/separator + header + N rows.
+                # Two extra rows made the panel climb into asynchronous logs
+                # and eventually overwrite its own TCP values.
+                move_cursor_up(len(action) + len(status_lines) + 3)
 
         dt_s = time.perf_counter() - loop_start
         precise_sleep(max(1 / fps - dt_s, 0))

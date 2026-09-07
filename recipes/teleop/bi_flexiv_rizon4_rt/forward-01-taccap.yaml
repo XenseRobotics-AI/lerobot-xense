@@ -48,10 +48,61 @@ robot:
   # USB hub at connect, which is why only the head camera is pinned above.
   gripper:
     type: taccap_follower
-    kp: 8.0 # MIT impedance stiffness (Nm/rad)
-    kd: 1.0 # MIT impedance damping (Nm·s/rad)
-    feedforward_torque: 0.0 # Nm; negative = clamp harder. |ff| <= 3.5
-    control_hz: 200 # ControlLoop resubmit rate
+
+    # Change this one value, then restart lerobot-teleoperate:
+    #   control_loop   = normalized position impedance (ControlLoop)
+    #   force_position = contact-aware close, then pure-torque hold
+    # The SDK exposes these two background controllers. Motor.set_position /
+    # set_velocity / set_torque / set_impedance are low-level one-shot commands
+    # and must not run concurrently with either controller.
+    controller: force_position
+
+    # ── ControlLoop parameters (used only when controller: control_loop) ──────
+    kp: 20.0                         # Nm/rad, position stiffness
+    kd: 0.3                         # Nm·s/rad, velocity damping
+    # A small constant closing bias remains active when target=0 and the
+    # calibrated position error has vanished, so the jaw stays seated/loaded.
+    feedforward_torque: -0.20       # Nm; negative closes, positive opens
+    control_hz: 100                 # used only by free_running; stream_locked ignores it
+    submit_phase: stream_locked     # stream_locked | free_running
+    # 0.9 position + 0.2 closing bias keeps the nominal closing demand at 1.1 Nm.
+    max_position_torque_nm: 0.9     # kp*position-error contribution limit; 0 disables
+    rated_torque_nm: 1.1            # measured-torque backstop; 0 disables
+    rated_hold_ms: 20
+    rated_release_rad: 0.05
+    stall_torque_nm: 1.2
+    stall_vel_radps: 0.15
+    stall_hold_ms: 60
+    stall_action: hold_position     # hold_position | none
+
+    # Shared motor-status stream rate for both controllers.
+    motor_stream_hz: 100            # valid range: 1..100 Hz
+
+    # ── Runtime status print (both controllers) ───────────────────────────────
+    # Uses each controller's in-memory stream snapshot: no extra motor polling,
+    # ACK traffic, or background thread. L/R occupy two fixed live-panel rows.
+    # ControlLoop ends in measured hz; ForcePosition ends in state + commanded torque.
+    print_status: true              # one-click switch: true | false
+    status_print_hz: 5.0            # row-content rate; teleop stays 30 Hz, SDK stream 100 Hz
+
+    # ── ForcePositionController parameters (used only for force_position) ─────
+    close_position: 0.0             # normalized [0,1], 0 = fully closed
+    close_speed_radps: 3.0           # lower impact speed reduces zero-stop rebound
+    grasp_torque_nm: 1.8            # target torque after contact (positive magnitude)
+    hold_torque_limit_nm: 1.8       # ceiling only; motor continuous/rated limit
+    motion_torque_limit_nm: 6.0     # peak/transient ceiling, not holding torque
+    contact_torque_nm: 0.08         # contact detector floor, not grasp target
+    contact_vel_radps: 0.035
+    contact_vel_ratio: 0.25
+    contact_moved_rad: 0.01
+    position_kp: 20.0
+    position_kd: 1.0
+    brake_distance_rad: 0.10
+    close_endpoint_tolerance_rad: 0.03
+    contact_samples: 3
+    startup_guard_ms: 250
+    status_timeout_ms: 350
+
     auto_discover_cameras: true
     enable_tactile: true
     # ── Wrist fisheye rectification ── the intrinsics live in THIS gripper's MCU

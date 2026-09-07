@@ -232,7 +232,9 @@ def _obs_ms(timing: dict, key: str) -> str:
     return f"{value:.1f}" if isinstance(value, (int, float)) else "--"
 
 
-def _print_obs_state(obs: dict, display_len: int, status: str) -> None:
+def _print_obs_state(
+    obs: dict, display_len: int, status: str, *, extra_lines: tuple[str, ...] = ()
+) -> None:
     """Print scalar observation values with a status tag (used during reset/moving)."""
     scalar_keys = [k for k, v in obs.items() if not isinstance(v, np.ndarray)]
     col = max((len(k) for k in scalar_keys), default=display_len)
@@ -240,7 +242,10 @@ def _print_obs_state(obs: dict, display_len: int, status: str) -> None:
     print(f"{'NAME':<{col}} | {'OBS':>10}  {status}")
     for k in scalar_keys:
         print(f"{k:<{col}} | {float(obs[k]):>10.4f}")
-    move_cursor_up(len(scalar_keys) + 5)
+    for line in extra_lines:
+        print(f"\033[2K{line}")
+    # Rewind the exact panel height: blank/separator + header + N scalar rows.
+    move_cursor_up(len(scalar_keys) + len(extra_lines) + 3)
 
 
 # ---------------------------------------------------------------------------

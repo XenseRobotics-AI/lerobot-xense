@@ -16,11 +16,11 @@
 
 """TacCap follower (actuated) gripper driver — arm-agnostic, shared across robots.
 
-Wraps ``xense.taccap.FollowerGripper``. The follower drives an FDCAN motor via
-the MIT force-position (impedance) primitive. A background ``ControlLoop`` (a C++
-thread) resubmits the latest normalized target at a fixed rate and keeps a
-thread-safe observation fresh, so ``get_gripper_position`` / ``set_gripper_position``
-are non-blocking.
+Wraps ``xense.taccap.FollowerGripper``. The recipe selects either the SDK's
+position-impedance ``ControlLoop`` or contact-aware
+``ForcePositionController``. Both own their background motor-status/control
+loop and keep a thread-safe observation fresh, so ``get_gripper_position`` /
+``set_gripper_position`` remain non-blocking.
 
 Left/right units are told apart by the firmware-burned serial number via the
 SDK's side-aware discovery (``find_left`` / ``find_right``). When the arm has
@@ -32,6 +32,9 @@ The ``xense.taccap`` SDK is imported lazily (guarded) so importing the grippers
 package does not hard-fail on hosts where the native extension is not built —
 the error is raised with rebuild guidance at ``connect()`` time instead.
 """
+
+import threading
+import time
 
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 from lerobot.utils.robot_utils import get_logger
@@ -49,6 +52,34 @@ except Exception as e:  # pragma: no cover - depends on native build being prese
 
 # GripperConfig.flags bit 0 = calibrated (see SDK gripper_control_test.py).
 _CALIBRATED_FLAG = 0x0001
+
+# ForcePositionController::set_target resets its contact guard and contact
+# counter. Teleop repeats the latest action every frame, so identical targets
+# must be coalesced or the controller can never latch contact.
+_FORCE_POSITION_TARGET_EPS = 1e-4
+
+# The teleop UI owns terminal cursor movement. Gripper reads only publish their
+# latest line here; printing directly from each side would scroll two new lines
+# through the TCP panel on every status update.
+_STATUS_LOCK = threading.Lock()
+_STATUS_LINES: dict[str, str] = {}
+
+
+def get_taccap_status_lines() -> tuple[str, ...]:
+    """Return the latest enabled TacCap status lines in stable L/R order."""
+
+    with _STATUS_LOCK:
+        return tuple(_STATUS_LINES[side] for side in ("left", "right") if side in _STATUS_LINES)
+
+
+def _set_taccap_status_line(side: str, line: str) -> None:
+    with _STATUS_LOCK:
+        _STATUS_LINES[side] = line
+
+
+def _clear_taccap_status_line(side: str) -> None:
+    with _STATUS_LOCK:
+        _STATUS_LINES.pop(side, None)
 
 
 class TaccapFollower(Gripper):
@@ -75,17 +106,18 @@ class TaccapFollower(Gripper):
         self._config = config
         self._side = config.side
         self._mcu_device = config.mcu_device
-        self._kp = config.kp
-        self._kd = config.kd
-        self._feedforward_torque = config.feedforward_torque
-        self._control_hz = config.control_hz
+        self._controller_name = config.controller
         self._init_open = config.init_open
         self._require_calibrated = config.require_calibrated
+        self._print_status = config.print_status
+        self._status_print_period_s = 1.0 / config.status_print_hz
+        self._last_status_print_time = float("-inf")
+        self._last_target_position: float | None = None
 
         self.logger = get_logger(f"TaccapFollower-{config.side}")
         self._is_connected: bool = False
         self._gripper = None  # xense.taccap.FollowerGripper
-        self._loop = None  # xense.taccap.ControlLoop
+        self._loop = None  # active ControlLoop or ForcePositionController
 
         # Seed so get_gripper_position() returns something sane before the loop
         # produces its first observation.
@@ -113,6 +145,134 @@ class TaccapFollower(Gripper):
         finder = taccap.find_left if self._side == "left" else taccap.find_right
         eps = finder()  # throws if the requested side isn't visible on the bus
         return eps.mcu_device
+
+    def _make_sdk_controller(self):
+        """Build the SDK controller selected by the recipe."""
+
+        cfg = self._config
+        if self._controller_name == "control_loop":
+            # Recipes express feedforward in normalized gripper coordinates:
+            # negative closes and positive opens. The mirrored right gripper
+            # has a reversed raw-radian map, so flip its motor torque sign.
+            direction_open = -1.0 if self._gripper.position_map().reverse else 1.0
+            raw_feedforward_torque = cfg.feedforward_torque * direction_open
+            phase = {
+                "stream_locked": taccap.SubmitPhase.STREAM_LOCKED,
+                "free_running": taccap.SubmitPhase.FREE_RUNNING,
+            }[cfg.submit_phase]
+            stall_action = {
+                "hold_position": taccap.StallAction.HOLD_POSITION,
+                "none": taccap.StallAction.NONE,
+            }[cfg.stall_action]
+            return taccap.ControlLoop(
+                self._gripper,
+                hz=cfg.control_hz,
+                kp=cfg.kp,
+                kd=cfg.kd,
+                feedforward_torque=raw_feedforward_torque,
+                motor_stream_hz=cfg.motor_stream_hz,
+                phase=phase,
+                max_position_torque_nm=cfg.max_position_torque_nm,
+                rated_torque_nm=cfg.rated_torque_nm,
+                rated_hold_ms=cfg.rated_hold_ms,
+                rated_release_rad=cfg.rated_release_rad,
+                stall_torque_nm=cfg.stall_torque_nm,
+                stall_vel_radps=cfg.stall_vel_radps,
+                stall_hold_ms=cfg.stall_hold_ms,
+                stall_action=stall_action,
+            )
+
+        if not hasattr(taccap, "ForcePositionController") or not hasattr(taccap, "ForcePositionConfig"):
+            raise RuntimeError(
+                "The installed xense.taccap SDK does not expose ForcePositionController. "
+                "Reinstall third_party/taccap-gripper in the active LeRobot environment."
+            )
+        force_cfg = taccap.ForcePositionConfig()
+        missing_fields = []
+        for name in (
+            "close_position",
+            "close_speed_radps",
+            "grasp_torque_nm",
+            "hold_torque_limit_nm",
+            "motion_torque_limit_nm",
+            "contact_torque_nm",
+            "contact_vel_radps",
+            "contact_vel_ratio",
+            "contact_moved_rad",
+            "position_kp",
+            "position_kd",
+            "brake_distance_rad",
+            "close_endpoint_tolerance_rad",
+            "contact_samples",
+            "startup_guard_ms",
+            "status_timeout_ms",
+            "motor_stream_hz",
+        ):
+            # Keep an older installed native extension usable while it is being
+            # rebuilt.  Newer SDKs expose every field; an old .so may not yet
+            # expose fields added after its wheel was installed.  Passing such
+            # a field raises AttributeError during connect and aborts both
+            # grippers before the robot can start.  Skip only the unavailable
+            # field and make the required SDK upgrade explicit in the log.
+            if hasattr(force_cfg, name):
+                setattr(force_cfg, name, getattr(cfg, name))
+            else:
+                missing_fields.append(name)
+        if missing_fields:
+            self.logger.warning(
+                "Installed xense.taccap native extension lacks ForcePositionConfig "
+                f"fields {missing_fields}; using SDK defaults for them. Reinstall "
+                "third_party/taccap-gripper to enable the configured endpoint "
+                "tolerance and other new safety parameters."
+            )
+        return taccap.ForcePositionController(self._gripper, force_cfg)
+
+    def _latest_observation(self):
+        """Return a GripperObservation from either SDK controller."""
+
+        if self._controller_name == "control_loop":
+            return self._loop.observation()
+        return self._loop.snapshot().observation
+
+    def _maybe_print_status(
+        self,
+        observation,
+        *,
+        controller_state: str | None = None,
+        commanded_torque_nm: float | None = None,
+    ) -> None:
+        """Publish rate-limited diagnostics for the teleop live panel.
+
+        This method deliberately performs no ``Motor.read_status()`` or other
+        request/ACK transaction. ``observation`` already came from the motor
+        status stream owned by the active SDK controller, so printing cannot
+        contend with the control loop on the serial bus.
+        """
+
+        if not self._print_status:
+            return
+        now = time.monotonic()
+        if now - self._last_status_print_time < self._status_print_period_s:
+            return
+        self._last_status_print_time = now
+
+        status = (
+            f"{self._side[0].upper()} "
+            f"pos={float(observation.position):.3f} "
+            f"raw={float(observation.raw_pos):+.4f}rad "
+            f"vel={float(observation.velocity):+.2f}rad/s "
+            f"tq={float(observation.torque):+.2f}Nm "
+            f"temp={float(observation.motor_temp_c):.0f}C "
+            f"age={float(observation.age_ms):.1f}ms"
+        )
+        if self._controller_name == "control_loop":
+            status += f" hz={float(self._loop.submit_hz):.1f}"
+        else:
+            if controller_state is not None:
+                status += f" state={controller_state}"
+            if commanded_torque_nm is not None:
+                status += f" cmd={float(commanded_torque_nm):+.2f}Nm"
+        _set_taccap_status_line(self._side, status)
 
     def connect(self) -> None:
         """Discover the follower, verify calibration, enable the motor, and start
@@ -155,43 +315,42 @@ class TaccapFollower(Gripper):
                     "third_party/taccap-gripper/python/examples/calibrate.py."
                 )
 
-            # Enable the motor before any motion.
             self._gripper.motor.clear_fault()
-            self._gripper.motor.enable()
+            self._loop = self._make_sdk_controller()
 
-            # Background control loop: keeps a fresh thread-safe observation and
-            # resubmits the latest target once per received motor-status frame
-            # (~100 Hz). It phase-locks rather than running on its own clock
-            # because a submit landing inside the MCU's own transmission makes
-            # the MCU drop bytes from the frame it is sending; control_hz is
-            # passed through but the SDK's default phase ignores it. start() seeds target = current pos (no jump).
-            # feedforward_torque is a CONSTANT bias added to every MIT frame (negative =
-            # closing/clamp); with a non-zero clamp bias the jaw settles ~ff/kp rad short
-            # of any commanded open, and init_open below will warn on the timeout — expected.
-            self._loop = taccap.ControlLoop(
-                self._gripper,
-                hz=self._control_hz,
-                kp=self._kp,
-                kd=self._kd,
-                feedforward_torque=self._feedforward_torque,
-            )
-            if self._feedforward_torque != 0.0:
+            # ForcePositionController.start() validates the persisted motor
+            # torque limit before motion, so the SDK requires start-before-enable.
+            # ControlLoop retains the existing enable-before-start sequence.
+            if self._controller_name == "force_position":
+                self._loop.start()
+                self._gripper.motor.enable()
                 self.logger.info(
-                    f"MIT feed-forward torque bias = {self._feedforward_torque:+.2f} Nm "
-                    f"({'closing/clamp' if self._feedforward_torque < 0 else 'opening'})."
+                    "TacCap controller=force_position "
+                    f"(grasp={self._config.grasp_torque_nm:.3f} Nm, "
+                    f"hold_limit={self._config.hold_torque_limit_nm:.3f} Nm)."
                 )
-            self._loop.start()
+            else:
+                self._gripper.motor.enable()
+                self._loop.start()
+                self.logger.info(
+                    "TacCap controller=control_loop "
+                    f"(kp={self._config.kp:.3f}, kd={self._config.kd:.3f}, "
+                    f"ff={self._config.feedforward_torque:+.3f} Nm, "
+                    f"phase={self._config.submit_phase})."
+                )
         except Exception:
             self._release_after_failed_connect()
             raise
 
+        self._last_target_position = None
         self._is_connected = True
         try:
-            self._cached_position = float(self._loop.observation().position)
+            self._cached_position = float(self._latest_observation().position)
         except Exception:
             self._cached_position = 1.0 if self._init_open else 0.0
         self.logger.info(f"TacCap follower connected (side={self._side}) on {device}.")
 
+        _clear_taccap_status_line(self._side)
         if self._init_open:
             try:
                 self.initialize_gripper_position(1.0)
@@ -216,6 +375,8 @@ class TaccapFollower(Gripper):
             except Exception as e:  # pragma: no cover — best-effort
                 self.logger.debug(f"Error disabling motor during rollback: {e}")
             self._gripper = None
+
+        _clear_taccap_status_line(self._side)
 
     def read_wrist_fisheye_calibration(self):
         """The wrist lens' fisheye intrinsics for this gripper.
@@ -263,6 +424,7 @@ class TaccapFollower(Gripper):
             self._gripper = None
 
         self._is_connected = False
+        _clear_taccap_status_line(self._side)
         self.logger.info(f"TacCap follower disconnected (side={self._side}).")
 
     # ── Position interface ─────────────────────────────────────────────────────
@@ -279,7 +441,21 @@ class TaccapFollower(Gripper):
         if not self._is_connected or self._loop is None:
             raise DeviceNotConnectedError(f"{self} is not connected.")
         try:
-            self._cached_position = _clamp01(float(self._loop.observation().position))
+            if self._controller_name == "control_loop":
+                observation = self._loop.observation()
+                controller_state = None
+                commanded_torque_nm = None
+            else:
+                snapshot = self._loop.snapshot()
+                observation = snapshot.observation
+                controller_state = str(snapshot.state)
+                commanded_torque_nm = snapshot.commanded_torque_nm
+            self._cached_position = _clamp01(float(observation.position))
+            self._maybe_print_status(
+                observation,
+                controller_state=controller_state,
+                commanded_torque_nm=commanded_torque_nm,
+            )
         except Exception as e:
             self.logger.debug(f"observation() read failed, returning cached: {e}")
         return self._cached_position
@@ -290,7 +466,15 @@ class TaccapFollower(Gripper):
             raise DeviceNotConnectedError(f"{self} is not connected.")
         if not 0.0 <= normalized_pos <= 1.0:
             raise ValueError(f"normalized_pos must be in [0, 1], got {normalized_pos}.")
+        if (
+            self._controller_name == "force_position"
+            and self._last_target_position is not None
+            and abs(normalized_pos - self._last_target_position) <= _FORCE_POSITION_TARGET_EPS
+        ):
+            return
         self._loop.set_target(normalized_pos)
+        if self._controller_name == "force_position":
+            self._last_target_position = normalized_pos
 
 
 def _clamp01(x: float) -> float:
