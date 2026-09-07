@@ -139,6 +139,14 @@ Things that do **not** work, so nobody re-tries them:
   has none of `setuptools 84.0.0`, `wheel 0.48.0`, `pybind11 3.1.0`,
   `packaging 26.3`. For those the fix is the other direction: stop uv from
   upgrading them and let conda's version stand.
+- **`uv pip install --upgrade <pkg>` to bump one package.** uv's `--upgrade`
+  lifts the prefer-installed rule for the _whole_ resolution, not just the named
+  packages: `--upgrade pybind11-stubgen build` walked `build`'s `packaging>=24.0`
+  from conda's 26.2 to a 26.3 conda-forge does not ship (2026-09-01), and that
+  is the only way `packaging` — never named anywhere in this repo — ever moved.
+  `--upgrade-package <pkg>` (`-P`) is the per-package form, and a bare
+  `uv pip install "<pkg>>=<min>"` already installs something newer when the
+  installed copy fails the spec, so `--upgrade` is never the right flag here.
 
 ## The Pico4 client SDK comes from the `.deb`, not from a submodule
 
