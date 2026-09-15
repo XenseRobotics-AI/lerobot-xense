@@ -70,9 +70,7 @@ TACCAP_ADVANCED_CONTROLLER_FIELDS = {
     "startup_guard_ms",
     "status_timeout_ms",
 }
-TACCAP_CONTROLLER_REFERENCE = (
-    REPO_ROOT / "recipes/teleop/bi_flexiv_rizon4_rt/forward-01-taccap.yaml"
-)
+TACCAP_CONTROLLER_REFERENCE = REPO_ROOT / "recipes/teleop/bi_flexiv_rizon4_rt/forward-01-taccap.yaml"
 
 # `# <name>: <value>` inside a gripper block, ignoring any trailing `# comment`.
 COMMENTED = re.compile(r"^\s*#\s*([a-z_]+):\s*([^#\n]+?)\s*(?:#.*)?$")

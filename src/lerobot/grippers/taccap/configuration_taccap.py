@@ -168,8 +168,7 @@ class TaccapFollowerConfig(GripperConfig):
             raise ValueError(f"TaccapFollowerConfig: side must be 'left' or 'right', got {self.side!r}.")
         if self.controller not in TACCAP_CONTROLLERS:
             raise ValueError(
-                f"TaccapFollowerConfig: controller must be one of {TACCAP_CONTROLLERS}, "
-                f"got {self.controller!r}."
+                f"TaccapFollowerConfig: controller must be one of {TACCAP_CONTROLLERS}, got {self.controller!r}."
             )
         if not self.kp > 0.0:
             raise ValueError(f"TaccapFollowerConfig: kp must be positive, got {self.kp}.")
@@ -198,18 +197,14 @@ class TaccapFollowerConfig(GripperConfig):
             )
         if self.submit_phase not in TACCAP_SUBMIT_PHASES:
             raise ValueError(
-                f"TaccapFollowerConfig: submit_phase must be one of {TACCAP_SUBMIT_PHASES}, "
-                f"got {self.submit_phase!r}."
+                f"TaccapFollowerConfig: submit_phase must be one of {TACCAP_SUBMIT_PHASES}, got {self.submit_phase!r}."
             )
         if self.stall_action not in TACCAP_STALL_ACTIONS:
             raise ValueError(
-                f"TaccapFollowerConfig: stall_action must be one of {TACCAP_STALL_ACTIONS}, "
-                f"got {self.stall_action!r}."
+                f"TaccapFollowerConfig: stall_action must be one of {TACCAP_STALL_ACTIONS}, got {self.stall_action!r}."
             )
         if not 0 < self.motor_stream_hz <= 100:
-            raise ValueError(
-                f"TaccapFollowerConfig: motor_stream_hz must be in [1, 100], got {self.motor_stream_hz}."
-            )
+            raise ValueError(f"TaccapFollowerConfig: motor_stream_hz must be in [1, 100], got {self.motor_stream_hz}.")
 
         non_negative = {
             "max_position_torque_nm": self.max_position_torque_nm,
@@ -224,9 +219,7 @@ class TaccapFollowerConfig(GripperConfig):
         }
         for name, value in non_negative.items():
             if not math.isfinite(value) or value < 0.0:
-                raise ValueError(
-                    f"TaccapFollowerConfig: {name} must be finite and >= 0, got {value}."
-                )
+                raise ValueError(f"TaccapFollowerConfig: {name} must be finite and >= 0, got {value}.")
         for name, value in {
             "rated_hold_ms": self.rated_hold_ms,
             "stall_hold_ms": self.stall_hold_ms,
@@ -236,9 +229,7 @@ class TaccapFollowerConfig(GripperConfig):
                 raise ValueError(f"TaccapFollowerConfig: {name} must be >= 0, got {value}.")
 
         if not math.isfinite(self.close_position) or not 0.0 <= self.close_position <= 1.0:
-            raise ValueError(
-                f"TaccapFollowerConfig: close_position must be in [0, 1], got {self.close_position}."
-            )
+            raise ValueError(f"TaccapFollowerConfig: close_position must be in [0, 1], got {self.close_position}.")
         positive = {
             "close_speed_radps": self.close_speed_radps,
             "grasp_torque_nm": self.grasp_torque_nm,
@@ -248,27 +239,19 @@ class TaccapFollowerConfig(GripperConfig):
         }
         for name, value in positive.items():
             if not math.isfinite(value) or value <= 0.0:
-                raise ValueError(
-                    f"TaccapFollowerConfig: {name} must be finite and > 0, got {value}."
-                )
+                raise ValueError(f"TaccapFollowerConfig: {name} must be finite and > 0, got {value}.")
         if not 0.0 < self.hold_torque_limit_nm <= FORCE_POSITION_MAX_HOLD_TORQUE_NM:
             raise ValueError(
-                "TaccapFollowerConfig: hold_torque_limit_nm must be in (0, 1.8], "
-                f"got {self.hold_torque_limit_nm}."
+                f"TaccapFollowerConfig: hold_torque_limit_nm must be in (0, 1.8], got {self.hold_torque_limit_nm}."
             )
         if not 0.0 < self.motion_torque_limit_nm <= FORCE_POSITION_MAX_MOTION_TORQUE_NM:
             raise ValueError(
-                "TaccapFollowerConfig: motion_torque_limit_nm must be in (0, 6.0], "
-                f"got {self.motion_torque_limit_nm}."
+                f"TaccapFollowerConfig: motion_torque_limit_nm must be in (0, 6.0], got {self.motion_torque_limit_nm}."
             )
         if self.hold_torque_limit_nm > self.motion_torque_limit_nm:
-            raise ValueError(
-                "TaccapFollowerConfig: hold_torque_limit_nm must not exceed motion_torque_limit_nm."
-            )
+            raise ValueError("TaccapFollowerConfig: hold_torque_limit_nm must not exceed motion_torque_limit_nm.")
         if self.grasp_torque_nm > self.hold_torque_limit_nm:
-            raise ValueError(
-                "TaccapFollowerConfig: grasp_torque_nm must not exceed hold_torque_limit_nm."
-            )
+            raise ValueError("TaccapFollowerConfig: grasp_torque_nm must not exceed hold_torque_limit_nm.")
         if self.contact_torque_nm > self.grasp_torque_nm:
             raise ValueError(
                 "TaccapFollowerConfig: contact_torque_nm must not exceed grasp_torque_nm; "
@@ -279,17 +262,12 @@ class TaccapFollowerConfig(GripperConfig):
                 f"TaccapFollowerConfig: contact_vel_ratio must be in (0, 1], got {self.contact_vel_ratio}."
             )
         if self.contact_samples <= 0:
-            raise ValueError(
-                f"TaccapFollowerConfig: contact_samples must be > 0, got {self.contact_samples}."
-            )
+            raise ValueError(f"TaccapFollowerConfig: contact_samples must be > 0, got {self.contact_samples}.")
         if self.status_timeout_ms <= 0:
-            raise ValueError(
-                f"TaccapFollowerConfig: status_timeout_ms must be > 0, got {self.status_timeout_ms}."
-            )
+            raise ValueError(f"TaccapFollowerConfig: status_timeout_ms must be > 0, got {self.status_timeout_ms}.")
         if not math.isfinite(self.status_print_hz) or self.status_print_hz <= 0.0:
             raise ValueError(
-                "TaccapFollowerConfig: status_print_hz must be finite and > 0, "
-                f"got {self.status_print_hz}."
+                f"TaccapFollowerConfig: status_print_hz must be finite and > 0, got {self.status_print_hz}."
             )
         if not 0.0 <= self.fisheye_balance <= 1.0:
             raise ValueError(f"TaccapFollowerConfig: fisheye_balance must be in [0, 1], got {self.fisheye_balance}.")
