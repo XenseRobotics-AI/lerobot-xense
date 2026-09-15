@@ -219,7 +219,7 @@ class TaccapFollower(Gripper):
             else:
                 missing_fields.append(name)
         if missing_fields:
-            self.logger.warning(
+            self.logger.warn(
                 "Installed xense.taccap native extension lacks ForcePositionConfig "
                 f"fields {missing_fields}; using SDK defaults for them. Reinstall "
                 "third_party/taccap-gripper to enable the configured endpoint "

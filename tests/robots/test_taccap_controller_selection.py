@@ -194,9 +194,7 @@ def test_control_loop_status_print_is_rate_limited_and_uses_cached_observation(m
         reads.append(True)
         return observation
 
-    follower = _follower(
-        TaccapFollowerConfig(controller="control_loop", print_status=True, status_print_hz=5.0)
-    )
+    follower = _follower(TaccapFollowerConfig(controller="control_loop", print_status=True, status_print_hz=5.0))
     follower._is_connected = True
     follower._loop = SimpleNamespace(
         observation=read_observation,
@@ -212,10 +210,7 @@ def test_control_loop_status_print_is_rate_limited_and_uses_cached_observation(m
     follower.get_gripper_position()
 
     assert len(reads) == 3
-    expected = (
-        "L pos=0.250 raw=-0.3000rad vel=-1.20rad/s "
-        "tq=-0.70Nm temp=41C age=3.0ms hz=99.8"
-    )
+    expected = "L pos=0.250 raw=-0.3000rad vel=-1.20rad/s tq=-0.70Nm temp=41C age=3.0ms hz=99.8"
     assert updates == [("left", expected), ("left", expected)]
     follower._is_connected = False
 
@@ -251,10 +246,7 @@ def test_force_position_status_print_reuses_one_snapshot(monkeypatch):
     assert follower.get_gripper_position() == 0.15
 
     assert len(reads) == 1
-    expected = (
-        "L pos=0.150 raw=-0.1800rad vel=-0.02rad/s "
-        "tq=-1.00Nm temp=43C age=4.0ms state=holding_force cmd=+1.10Nm"
-    )
+    expected = "L pos=0.150 raw=-0.1800rad vel=-0.02rad/s tq=-1.00Nm temp=43C age=4.0ms state=holding_force cmd=+1.10Nm"
     assert updates == [("left", expected)]
     follower._is_connected = False
 

@@ -232,9 +232,7 @@ def _obs_ms(timing: dict, key: str) -> str:
     return f"{value:.1f}" if isinstance(value, (int, float)) else "--"
 
 
-def _print_obs_state(
-    obs: dict, display_len: int, status: str, *, extra_lines: tuple[str, ...] = ()
-) -> None:
+def _print_obs_state(obs: dict, display_len: int, status: str, *, extra_lines: tuple[str, ...] = ()) -> None:
     """Print scalar observation values with a status tag (used during reset/moving)."""
     scalar_keys = [k for k, v in obs.items() if not isinstance(v, np.ndarray)]
     col = max((len(k) for k in scalar_keys), default=display_len)
