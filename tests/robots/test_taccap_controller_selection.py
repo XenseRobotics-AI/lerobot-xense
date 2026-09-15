@@ -25,7 +25,30 @@ from lerobot.grippers.taccap import taccap_follower as driver
 
 
 class _FakeForcePositionConfig:
-    pass
+    """Mirror the pybind ForcePositionConfig, which declares every field up front.
+
+    `_make_sdk_controller` skips any field the installed native extension does
+    not expose, so a fake without these attributes would silently drop the whole
+    configuration instead of forwarding it.
+    """
+
+    close_position = None
+    close_speed_radps = None
+    grasp_torque_nm = None
+    hold_torque_limit_nm = None
+    motion_torque_limit_nm = None
+    contact_torque_nm = None
+    contact_vel_radps = None
+    contact_vel_ratio = None
+    contact_moved_rad = None
+    position_kp = None
+    position_kd = None
+    brake_distance_rad = None
+    close_endpoint_tolerance_rad = None
+    contact_samples = None
+    startup_guard_ms = None
+    status_timeout_ms = None
+    motor_stream_hz = None
 
 
 class _FakeControlLoop:
@@ -40,12 +63,12 @@ class _FakeForcePositionController:
         self.config = config
 
 
-def _install_fake_sdk(monkeypatch):
+def _install_fake_sdk(monkeypatch, force_position_config=_FakeForcePositionConfig):
     fake = SimpleNamespace(
         SubmitPhase=SimpleNamespace(STREAM_LOCKED="stream_locked_enum", FREE_RUNNING="free_running_enum"),
         StallAction=SimpleNamespace(HOLD_POSITION="hold_position_enum", NONE="none_enum"),
         ControlLoop=_FakeControlLoop,
-        ForcePositionConfig=_FakeForcePositionConfig,
+        ForcePositionConfig=force_position_config,
         ForcePositionController=_FakeForcePositionController,
     )
     monkeypatch.setattr(driver, "taccap", fake)
@@ -123,6 +146,23 @@ def test_force_position_receives_every_exposed_sdk_parameter(monkeypatch):
 
     assert isinstance(controller, _FakeForcePositionController)
     assert {name: getattr(controller.config, name) for name in values} == values
+
+
+def test_force_position_skips_fields_the_installed_sdk_lacks(monkeypatch):
+    """An older native extension missing a field must not abort controller setup."""
+
+    class _OldForcePositionConfig:
+        close_position = None
+        grasp_torque_nm = None
+
+    _install_fake_sdk(monkeypatch, force_position_config=_OldForcePositionConfig)
+    config = TaccapFollowerConfig(controller="force_position", close_position=0.02, grasp_torque_nm=1.1)
+
+    controller = _follower(config)._make_sdk_controller()
+
+    assert controller.config.close_position == 0.02
+    assert controller.config.grasp_torque_nm == 1.1
+    assert not hasattr(controller.config, "close_endpoint_tolerance_rad")
 
 
 def test_control_loop_flips_normalized_feedforward_for_reversed_map(monkeypatch):
