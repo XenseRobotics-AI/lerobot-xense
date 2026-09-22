@@ -41,12 +41,41 @@ class _FakeControlLoop:
     def __init__(self, gripper, **kwargs):
         self.gripper = gripper
         self.kwargs = kwargs
+        self.started = False
+
+    # start/stop 记到**夹爪的同一条时间线**上,这样 connect() 里「使能与启动
+    # 谁先谁后」是真的被断言了,而不是分别检查两个计数器。
+    def _rec(self, name):
+        motor = getattr(getattr(self, "gripper", None), "motor", None)
+        if motor is not None and hasattr(motor, "calls"):
+            motor.calls.append(name)
+
+    def start(self):
+        self.started = True
+        self._rec("loop.start")
+
+    def stop(self):
+        self.started = False
+        self._rec("loop.stop")
 
 
 class _FakeForcePositionController:
     def __init__(self, gripper, config):
         self.gripper = gripper
         self.config = config
+
+    def start(self):
+        self.started = True
+        self._rec("loop.start")
+
+    def stop(self):
+        self.started = False
+        self._rec("loop.stop")
+
+    def _rec(self, name):
+        motor = getattr(getattr(self, "gripper", None), "motor", None)
+        if motor is not None and hasattr(motor, "calls"):
+            motor.calls.append(name)
 
 
 def _install_fake_sdk(monkeypatch, force_position_config=_FakeForcePositionConfig):
@@ -56,6 +85,10 @@ def _install_fake_sdk(monkeypatch, force_position_config=_FakeForcePositionConfi
         ControlLoop=_FakeControlLoop,
         ForcePositionConfig=force_position_config,
         ForcePositionController=_FakeForcePositionController,
+        # SDK 的主入口。没有它这个 fake 就不完整 —— connect() 第一件事就是
+        # taccap.FollowerGripper(device),而在补 connect 测试之前没人走到这里。
+        # 惰性引用:_FakeGripper 定义在本文件更下面。
+        FollowerGripper=lambda *a, **k: _FakeGripper(),
     )
     monkeypatch.setattr(driver, "taccap", fake)
 
@@ -303,3 +336,164 @@ def test_every_config_attribute_referenced_in_the_follower_exists():
     assert not missing, (
         f"taccap_follower.py reads {missing} off the config, but TaccapFollowerConfig does not declare them."
     )
+
+
+# ---- connect() ------------------------------------------------------------
+#
+# 这条路径此前**一条测试都没有** —— 它要真硬件,所以从来没人测。代价已经付过:
+# 删配置字段之后 connect() 的 info 日志还在读 self._config.grasp_torque_nm,
+# 那是每次连接必抛的 AttributeError,而全量 830 项照样全绿。
+#
+# 下面几条把 connect() 里**真正有判断的**部分钉住:使能与 start 的先后、失败时
+# 的回滚、未标定时的拒绝。纯日志和纯转发不测,那是噪音。
+
+
+class _FakeMotor:
+    def __init__(self, fail_on=None):
+        self.calls = []
+        self._fail_on = fail_on
+
+    def _rec(self, name):
+        self.calls.append(name)
+        if self._fail_on == name:
+            raise RuntimeError(f"injected failure in {name}")
+
+    def clear_fault(self):
+        self._rec("clear_fault")
+
+    def enable(self):
+        self._rec("enable")
+
+    def disable(self):
+        self._rec("disable")
+
+
+class _FakeGripper:
+    def __init__(self, calibrated=True, motor=None):
+        self.motor = motor or _FakeMotor()
+        self._calibrated = calibrated
+
+    def get_gripper_config(self):
+        return SimpleNamespace(flags=0x0001 if self._calibrated else 0x0000)
+
+    def position_map(self):
+        return SimpleNamespace(reverse=False)
+
+
+def _connectable(monkeypatch, config, gripper=None, start_fails=False):
+    """A TaccapFollower whose every外部依赖 is faked, ready for connect()."""
+    gripper = gripper or _FakeGripper()
+
+    class _Loop(_FakeForcePositionController):
+        def start(self):
+            if start_fails:
+                raise RuntimeError("injected failure in start")
+            super().start()
+
+        def snapshot(self):
+            return SimpleNamespace(
+                observation=SimpleNamespace(position=0.5),
+                grasp_torque_nm=1.1,
+                hold_torque_limit_nm=1.8,
+            )
+
+    _install_fake_sdk(monkeypatch)
+    monkeypatch.setattr(driver.taccap, "FollowerGripper", lambda *a, **k: gripper)
+    monkeypatch.setattr(driver.taccap, "ForcePositionController", lambda g, cfg: _Loop(g, cfg))
+    follower = driver.TaccapFollower(config)
+    monkeypatch.setattr(follower, "_resolve_device", lambda: "/dev/fake")
+    # init-open drives real motion in the base class; connect() already treats a
+    # failure here as non-fatal, so neutralise it rather than fake a whole move.
+    monkeypatch.setattr(follower, "initialize_gripper_position", lambda *a, **k: None)
+    return follower, gripper
+
+
+def test_connect_force_position_starts_the_loop_before_enabling_the_motor():
+    """Ordering is load-bearing, and it differs per controller.
+
+    ForcePositionController.start() validates the motor's persisted torque limit
+    (0x700B) before any motion, so the SDK wants start-before-enable. ControlLoop
+    keeps the older enable-before-start. Getting this backwards does not fail
+    loudly — it just skips the check — which is exactly why it needs a test.
+    """
+    import pytest
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        follower, gripper = _connectable(monkeypatch, TaccapFollowerConfig(controller="force_position"))
+        follower.connect()
+        assert gripper.motor.calls == ["clear_fault", "loop.start", "enable"]
+        assert follower._loop.started
+    finally:
+        monkeypatch.undo()
+
+
+def test_connect_control_loop_enables_the_motor_before_starting_the_loop():
+    import pytest
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        follower, gripper = _connectable(monkeypatch, TaccapFollowerConfig(controller="control_loop"))
+        monkeypatch.setattr(driver.taccap, "ControlLoop", lambda *a, **k: _FakeControlLoop(*a, **k))
+        follower.connect()
+        assert gripper.motor.calls == ["clear_fault", "enable", "loop.start"]
+    finally:
+        monkeypatch.undo()
+
+
+def test_connect_reads_the_torque_budget_off_the_snapshot_not_the_config():
+    """The regression that motivated all of this.
+
+    connect() logs the grasp torque actually in force. It used to read it from
+    the config; once that field was removed the log raised AttributeError on
+    every single connect, and no test noticed because connect() had none.
+    """
+    import pytest
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        follower, _ = _connectable(monkeypatch, TaccapFollowerConfig(controller="force_position"))
+        follower.connect()  # would raise AttributeError before the fix
+        assert follower.is_connected
+    finally:
+        monkeypatch.undo()
+
+
+def test_connect_releases_the_handle_when_the_loop_fails_to_start():
+    """A half-open device must not be stranded.
+
+    _is_connected stays False on this path, so disconnect() would refuse to run
+    and the handle would live until GC — with the motor still enabled.
+    """
+    import pytest
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        follower, gripper = _connectable(
+            monkeypatch, TaccapFollowerConfig(controller="force_position"), start_fails=True
+        )
+        with pytest.raises(RuntimeError, match="injected failure in start"):
+            follower.connect()
+        assert "disable" in gripper.motor.calls
+        assert follower._gripper is None
+        assert not follower.is_connected
+    finally:
+        monkeypatch.undo()
+
+
+def test_connect_refuses_an_uncalibrated_gripper_and_releases_it():
+    """Normalized [0,1] control is meaningless without the travel span."""
+    import pytest
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        gripper = _FakeGripper(calibrated=False)
+        follower, _ = _connectable(
+            monkeypatch, TaccapFollowerConfig(controller="force_position", require_calibrated=True), gripper=gripper
+        )
+        with pytest.raises(RuntimeError, match="not calibrated"):
+            follower.connect()
+        assert follower._gripper is None
+        assert not follower.is_connected
+    finally:
+        monkeypatch.undo()
