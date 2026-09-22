@@ -86,21 +86,15 @@ robot:
     status_print_hz: 5.0            # row-content rate; teleop stays 30 Hz, SDK stream 100 Hz
 
     # ── ForcePositionController parameters (used only for force_position) ─────
-    close_position: 0.0             # normalized [0,1], 0 = fully closed
+    # SDK 0.2.0 cut this surface from sixteen knobs to six: contact detection
+    # and the position gains live in the C++ detail:: tuning struct now, since
+    # the MCU runs the same stall test at 500 Hz and is the authority.
+    # close_preload_nm (0.25 Nm, seats the jaw on its closed stop) is an SDK
+    # default and is not plumbed through this config.
     close_speed_radps: 3.0           # lower impact speed reduces zero-stop rebound
     grasp_torque_nm: 1.8            # target torque after contact (positive magnitude)
     hold_torque_limit_nm: 1.8       # ceiling only; motor continuous/rated limit
     motion_torque_limit_nm: 6.0     # peak/transient ceiling, not holding torque
-    contact_torque_nm: 0.08         # contact detector floor, not grasp target
-    contact_vel_radps: 0.035
-    contact_vel_ratio: 0.25
-    contact_moved_rad: 0.01
-    position_kp: 20.0
-    position_kd: 1.0
-    brake_distance_rad: 0.10
-    close_endpoint_tolerance_rad: 0.03
-    contact_samples: 3
-    startup_guard_ms: 250
     status_timeout_ms: 350
 
     auto_discover_cameras: true

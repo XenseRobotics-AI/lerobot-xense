@@ -53,21 +53,10 @@ TACCAP_ADVANCED_CONTROLLER_FIELDS = {
     "motor_stream_hz",
     "print_status",
     "status_print_hz",
-    "close_position",
     "close_speed_radps",
     "grasp_torque_nm",
     "hold_torque_limit_nm",
     "motion_torque_limit_nm",
-    "contact_torque_nm",
-    "contact_vel_radps",
-    "contact_vel_ratio",
-    "contact_moved_rad",
-    "position_kp",
-    "position_kd",
-    "brake_distance_rad",
-    "close_endpoint_tolerance_rad",
-    "contact_samples",
-    "startup_guard_ms",
     "status_timeout_ms",
 }
 TACCAP_CONTROLLER_REFERENCE = REPO_ROOT / "recipes/teleop/bi_flexiv_rizon4_rt/forward-01-taccap.yaml"
@@ -109,10 +98,17 @@ def test_forward_01_is_the_complete_taccap_controller_reference():
 
 
 def test_forward_01_force_position_holds_configured_torque_at_zero():
+    """The reference recipe must still ask for a real grasp, within the ceiling.
+
+    `close_position` used to be asserted here as "0.0 means fully closed". SDK
+    0.2.0 removed it: the closed endpoint is normalized 0.0 by construction, and
+    firmware 1.2.5 puts that at the mechanical stop itself, so there is nothing
+    left to configure. The torque budget is what still has to be right.
+    """
+
     block = yaml.safe_load(TACCAP_CONTROLLER_REFERENCE.read_text())["robot"]["gripper"]
 
     assert block["controller"] == "force_position"
-    assert block["close_position"] == pytest.approx(0.0)
     assert block["grasp_torque_nm"] == pytest.approx(1.8)
     assert block["hold_torque_limit_nm"] >= block["grasp_torque_nm"]
 

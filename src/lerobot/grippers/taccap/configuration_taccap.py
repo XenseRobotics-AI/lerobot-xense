@@ -75,10 +75,17 @@ class TaccapFollowerConfig(GripperConfig):
                      at ``motor_stream_hz``.
 
     ForcePositionController:
-        grasp_torque_nm: Positive target torque magnitude used after contact.
-        contact_torque_nm: Contact detector floor, not the grasp target.
+        grasp_torque_nm: The control law's torque budget for the whole move —
+                     the PD request is error-clamped against it, so a blocked
+                     jaw settles at exactly this torque. Not a contact
+                     threshold; SDK 0.2.0 removed contact detection from the
+                     host, the MCU already runs it at 500 Hz.
         hold_torque_limit_nm: Long-term torque ceiling (SDK maximum 1.8 Nm).
         motion_torque_limit_nm: Transient motion ceiling (SDK maximum 6.0 Nm).
+
+        The closed-endpoint preload (``close_preload_nm``, 0.25 Nm) is left at
+        the SDK default and not exposed here. Add it to this dataclass and to
+        the field list in ``taccap_follower.py`` if it ever needs to differ.
 
     Behavior:
         init_open:       If True, drive fully open on ``connect()``.
@@ -113,22 +120,25 @@ class TaccapFollowerConfig(GripperConfig):
     # transport is hardware-validated at no more than 100 Hz.
     motor_stream_hz: int = 100
 
-    # ── ForcePositionController (contact-aware force/position) ─────────────────
-    close_position: float = 0.0
+    # ── ForcePositionController (single bounded-torque control law) ────────────
+    #
+    # SDK 0.2.0 cut ForcePositionConfig from sixteen fields to six (0.2.1 added
+    # a seventh). The contact-detection constants and the position gains became
+    # detail::ForcePositionTuning on the C++ side, which a caller cannot reach:
+    # the MCU already runs the same stall test at 500 Hz and is the authority,
+    # so the host was keeping a second copy of one physical event.
+    #
+    # The eleven knobs that used to live here (close_position,
+    # contact_torque_nm, contact_vel_radps, contact_vel_ratio,
+    # contact_moved_rad, position_kp, position_kd, brake_distance_rad,
+    # close_endpoint_tolerance_rad, contact_samples, startup_guard_ms) were
+    # kept past that change and silently stopped doing anything — the setter
+    # loop skips fields the SDK no longer declares. Removed rather than left
+    # looking tunable.
     close_speed_radps: float = 0.5
     grasp_torque_nm: float = 0.35
     hold_torque_limit_nm: float = FORCE_POSITION_MAX_HOLD_TORQUE_NM
     motion_torque_limit_nm: float = FORCE_POSITION_MAX_MOTION_TORQUE_NM
-    contact_torque_nm: float = 0.080
-    contact_vel_radps: float = 0.035
-    contact_vel_ratio: float = 0.25
-    contact_moved_rad: float = 0.010
-    position_kp: float = 20.0
-    position_kd: float = 1.0
-    brake_distance_rad: float = 0.10
-    close_endpoint_tolerance_rad: float = 0.03
-    contact_samples: int = 3
-    startup_guard_ms: int = 250
     status_timeout_ms: int = 350
 
     # ── Behavior ───────────────────────────────────────────────────────────────
@@ -212,10 +222,6 @@ class TaccapFollowerConfig(GripperConfig):
             "rated_release_rad": self.rated_release_rad,
             "stall_torque_nm": self.stall_torque_nm,
             "stall_vel_radps": self.stall_vel_radps,
-            "contact_moved_rad": self.contact_moved_rad,
-            "position_kd": self.position_kd,
-            "brake_distance_rad": self.brake_distance_rad,
-            "close_endpoint_tolerance_rad": self.close_endpoint_tolerance_rad,
         }
         for name, value in non_negative.items():
             if not math.isfinite(value) or value < 0.0:
@@ -223,19 +229,13 @@ class TaccapFollowerConfig(GripperConfig):
         for name, value in {
             "rated_hold_ms": self.rated_hold_ms,
             "stall_hold_ms": self.stall_hold_ms,
-            "startup_guard_ms": self.startup_guard_ms,
         }.items():
             if value < 0:
                 raise ValueError(f"TaccapFollowerConfig: {name} must be >= 0, got {value}.")
 
-        if not math.isfinite(self.close_position) or not 0.0 <= self.close_position <= 1.0:
-            raise ValueError(f"TaccapFollowerConfig: close_position must be in [0, 1], got {self.close_position}.")
         positive = {
             "close_speed_radps": self.close_speed_radps,
             "grasp_torque_nm": self.grasp_torque_nm,
-            "contact_torque_nm": self.contact_torque_nm,
-            "contact_vel_radps": self.contact_vel_radps,
-            "position_kp": self.position_kp,
         }
         for name, value in positive.items():
             if not math.isfinite(value) or value <= 0.0:
@@ -252,17 +252,6 @@ class TaccapFollowerConfig(GripperConfig):
             raise ValueError("TaccapFollowerConfig: hold_torque_limit_nm must not exceed motion_torque_limit_nm.")
         if self.grasp_torque_nm > self.hold_torque_limit_nm:
             raise ValueError("TaccapFollowerConfig: grasp_torque_nm must not exceed hold_torque_limit_nm.")
-        if self.contact_torque_nm > self.grasp_torque_nm:
-            raise ValueError(
-                "TaccapFollowerConfig: contact_torque_nm must not exceed grasp_torque_nm; "
-                "otherwise contact can never latch."
-            )
-        if not math.isfinite(self.contact_vel_ratio) or not 0.0 < self.contact_vel_ratio <= 1.0:
-            raise ValueError(
-                f"TaccapFollowerConfig: contact_vel_ratio must be in (0, 1], got {self.contact_vel_ratio}."
-            )
-        if self.contact_samples <= 0:
-            raise ValueError(f"TaccapFollowerConfig: contact_samples must be > 0, got {self.contact_samples}.")
         if self.status_timeout_ms <= 0:
             raise ValueError(f"TaccapFollowerConfig: status_timeout_ms must be > 0, got {self.status_timeout_ms}.")
         if not math.isfinite(self.status_print_hz) or self.status_print_hz <= 0.0:

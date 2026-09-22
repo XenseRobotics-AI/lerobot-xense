@@ -190,40 +190,41 @@ class TaccapFollower(Gripper):
         force_cfg = taccap.ForcePositionConfig()
         missing_fields = []
         for name in (
-            "close_position",
             "close_speed_radps",
             "grasp_torque_nm",
             "hold_torque_limit_nm",
             "motion_torque_limit_nm",
-            "contact_torque_nm",
-            "contact_vel_radps",
-            "contact_vel_ratio",
-            "contact_moved_rad",
-            "position_kp",
-            "position_kd",
-            "brake_distance_rad",
-            "close_endpoint_tolerance_rad",
-            "contact_samples",
-            "startup_guard_ms",
             "status_timeout_ms",
             "motor_stream_hz",
         ):
-            # Keep an older installed native extension usable while it is being
-            # rebuilt.  Newer SDKs expose every field; an old .so may not yet
-            # expose fields added after its wheel was installed.  Passing such
-            # a field raises AttributeError during connect and aborts both
-            # grippers before the robot can start.  Skip only the unavailable
-            # field and make the required SDK upgrade explicit in the log.
+            # Tolerate a native extension older than this checkout expects.
+            # Setting a field the installed .so does not declare raises
+            # AttributeError during connect and aborts both grippers before the
+            # robot can start, so skip it and say so instead.
+            #
+            # Every name above exists in the paired SDK, so reaching the warning
+            # means the installed extension is genuinely stale — the editable
+            # install redirects Python sources to the submodule but keeps
+            # serving _taccap_native from site-packages, so a submodule bump
+            # alone does not rebuild it. Reinstalling is the fix, and that is
+            # what the message says.
+            #
+            # It did not always say something true: the list used to carry
+            # eleven fields that SDK 0.2.0 deleted on purpose, so a correct,
+            # up-to-date install still warned and still told the operator to
+            # reinstall — advice that could not work. Keep this list to what the
+            # paired SDK actually declares.
             if hasattr(force_cfg, name):
                 setattr(force_cfg, name, getattr(cfg, name))
             else:
                 missing_fields.append(name)
         if missing_fields:
             self.logger.warn(
-                "Installed xense.taccap native extension lacks ForcePositionConfig "
-                f"fields {missing_fields}; using SDK defaults for them. Reinstall "
-                "third_party/taccap-gripper to enable the configured endpoint "
-                "tolerance and other new safety parameters."
+                "Installed xense.taccap native extension is older than this "
+                f"checkout: ForcePositionConfig has no {missing_fields}, so the "
+                "SDK defaults apply for them. Rebuild it with "
+                "`pip install -e third_party/taccap-gripper --no-build-isolation` "
+                "in this environment."
             )
         return taccap.ForcePositionController(self._gripper, force_cfg)
 

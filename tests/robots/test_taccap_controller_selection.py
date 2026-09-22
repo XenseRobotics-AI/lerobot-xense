@@ -32,21 +32,10 @@ class _FakeForcePositionConfig:
     configuration instead of forwarding it.
     """
 
-    close_position = None
     close_speed_radps = None
     grasp_torque_nm = None
     hold_torque_limit_nm = None
     motion_torque_limit_nm = None
-    contact_torque_nm = None
-    contact_vel_radps = None
-    contact_vel_ratio = None
-    contact_moved_rad = None
-    position_kp = None
-    position_kd = None
-    brake_distance_rad = None
-    close_endpoint_tolerance_rad = None
-    contact_samples = None
-    startup_guard_ms = None
     status_timeout_ms = None
     motor_stream_hz = None
 
@@ -122,21 +111,15 @@ def test_control_loop_receives_every_exposed_sdk_parameter(monkeypatch):
 
 def test_force_position_receives_every_exposed_sdk_parameter(monkeypatch):
     _install_fake_sdk(monkeypatch)
+    # The whole surface the SDK still exposes. SDK 0.2.0 cut ForcePositionConfig
+    # from sixteen fields to six: contact detection and the position gains moved
+    # to detail::ForcePositionTuning, out of a caller's reach, because the MCU
+    # already runs the same stall test at 500 Hz.
     values = {
-        "close_position": 0.02,
         "close_speed_radps": 0.45,
         "grasp_torque_nm": 1.1,
         "hold_torque_limit_nm": 1.7,
         "motion_torque_limit_nm": 5.5,
-        "contact_torque_nm": 0.09,
-        "contact_vel_radps": 0.03,
-        "contact_vel_ratio": 0.2,
-        "contact_moved_rad": 0.02,
-        "position_kp": 18.0,
-        "position_kd": 0.9,
-        "brake_distance_rad": 0.08,
-        "contact_samples": 4,
-        "startup_guard_ms": 275,
         "status_timeout_ms": 400,
         "motor_stream_hz": 90,
     }
@@ -152,17 +135,19 @@ def test_force_position_skips_fields_the_installed_sdk_lacks(monkeypatch):
     """An older native extension missing a field must not abort controller setup."""
 
     class _OldForcePositionConfig:
-        close_position = None
         grasp_torque_nm = None
+        close_speed_radps = None
 
     _install_fake_sdk(monkeypatch, force_position_config=_OldForcePositionConfig)
-    config = TaccapFollowerConfig(controller="force_position", close_position=0.02, grasp_torque_nm=1.1)
+    config = TaccapFollowerConfig(controller="force_position", grasp_torque_nm=1.1, close_speed_radps=0.45)
 
     controller = _follower(config)._make_sdk_controller()
 
-    assert controller.config.close_position == 0.02
     assert controller.config.grasp_torque_nm == 1.1
-    assert not hasattr(controller.config, "close_endpoint_tolerance_rad")
+    assert controller.config.close_speed_radps == 0.45
+    # The fake declares only two of the six, and setup still completes rather
+    # than raising AttributeError and taking both grippers down on connect.
+    assert not hasattr(controller.config, "motion_torque_limit_nm")
 
 
 def test_control_loop_flips_normalized_feedforward_for_reversed_map(monkeypatch):
