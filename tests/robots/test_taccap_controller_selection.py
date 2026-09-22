@@ -33,9 +33,6 @@ class _FakeForcePositionConfig:
     """
 
     close_speed_radps = None
-    grasp_torque_nm = None
-    hold_torque_limit_nm = None
-    motion_torque_limit_nm = None
     status_timeout_ms = None
     motor_stream_hz = None
 
@@ -115,11 +112,10 @@ def test_force_position_receives_every_exposed_sdk_parameter(monkeypatch):
     # from sixteen fields to six: contact detection and the position gains moved
     # to detail::ForcePositionTuning, out of a caller's reach, because the MCU
     # already runs the same stall test at 500 Hz.
+    # 上层只转发这三个。力矩预算及其两个天花板不再由这边配 —— 走 SDK 默认,
+    # 理由见 configuration_taccap.py 里字段旁边那段。
     values = {
         "close_speed_radps": 0.45,
-        "grasp_torque_nm": 1.1,
-        "hold_torque_limit_nm": 1.7,
-        "motion_torque_limit_nm": 5.5,
         "status_timeout_ms": 400,
         "motor_stream_hz": 90,
     }
@@ -135,19 +131,17 @@ def test_force_position_skips_fields_the_installed_sdk_lacks(monkeypatch):
     """An older native extension missing a field must not abort controller setup."""
 
     class _OldForcePositionConfig:
-        grasp_torque_nm = None
         close_speed_radps = None
 
     _install_fake_sdk(monkeypatch, force_position_config=_OldForcePositionConfig)
-    config = TaccapFollowerConfig(controller="force_position", grasp_torque_nm=1.1, close_speed_radps=0.45)
+    config = TaccapFollowerConfig(controller="force_position", close_speed_radps=0.45)
 
     controller = _follower(config)._make_sdk_controller()
 
-    assert controller.config.grasp_torque_nm == 1.1
     assert controller.config.close_speed_radps == 0.45
-    # The fake declares only two of the six, and setup still completes rather
-    # than raising AttributeError and taking both grippers down on connect.
-    assert not hasattr(controller.config, "motion_torque_limit_nm")
+    # The fake declares one of the three we forward, and setup still completes
+    # rather than raising AttributeError and taking both grippers down on connect.
+    assert not hasattr(controller.config, "status_timeout_ms")
 
 
 def test_control_loop_flips_normalized_feedforward_for_reversed_map(monkeypatch):
@@ -285,3 +279,27 @@ def test_disabled_status_print_does_not_touch_controller_diagnostics(monkeypatch
 
     assert follower.get_gripper_position() == 0.4
     follower._is_connected = False
+
+
+def test_every_config_attribute_referenced_in_the_follower_exists():
+    """`self._config.<name>` must name a real TaccapFollowerConfig field.
+
+    This exists because removing config fields broke exactly this and no test
+    noticed: the connect-time log still read `self._config.grasp_torque_nm`
+    after that field was deleted, which is an AttributeError on every
+    connect — and TacCap's connect() has no test coverage at all (it needs
+    hardware), so the suite stayed green. Found by grep, not by tests.
+
+    A dataclass attribute access cannot be caught by ruff, so scan for it.
+    """
+    import dataclasses
+    import re
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[2] / "src/lerobot/grippers/taccap/taccap_follower.py").read_text()
+    referenced = set(re.findall(r"self\._config\.([a-z_][a-z0-9_]*)", source))
+    declared = {f.name for f in dataclasses.fields(TaccapFollowerConfig)}
+    missing = sorted(referenced - declared)
+    assert not missing, (
+        f"taccap_follower.py reads {missing} off the config, but TaccapFollowerConfig does not declare them."
+    )

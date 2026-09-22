@@ -191,9 +191,6 @@ class TaccapFollower(Gripper):
         missing_fields = []
         for name in (
             "close_speed_radps",
-            "grasp_torque_nm",
-            "hold_torque_limit_nm",
-            "motion_torque_limit_nm",
             "status_timeout_ms",
             "motor_stream_hz",
         ):
@@ -325,10 +322,15 @@ class TaccapFollower(Gripper):
             if self._controller_name == "force_position":
                 self._loop.start()
                 self._gripper.motor.enable()
+                # 力矩预算不再由本配置决定,所以从**控制器实际生效的值**里读,
+                # 不要从 self._config 读 —— 那两个字段已经不在了,照旧写会在
+                # 连接时抛 AttributeError,而这条是 info 日志、测试碰不到。
+                snap = self._loop.snapshot()
                 self.logger.info(
                     "TacCap controller=force_position "
-                    f"(grasp={self._config.grasp_torque_nm:.3f} Nm, "
-                    f"hold_limit={self._config.hold_torque_limit_nm:.3f} Nm)."
+                    f"(grasp={snap.grasp_torque_nm:.3f} Nm, "
+                    f"hold_limit={snap.hold_torque_limit_nm:.3f} Nm, "
+                    f"close_speed={self._config.close_speed_radps:.2f} rad/s)."
                 )
             else:
                 self._gripper.motor.enable()

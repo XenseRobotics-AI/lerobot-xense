@@ -55,7 +55,7 @@ robot:
     # The SDK exposes these two background controllers. Motor.set_position /
     # set_velocity / set_torque / set_impedance are low-level one-shot commands
     # and must not run concurrently with either controller.
-    controller: force_position
+    controller: force_position   # 也是默认值
 
     # ── ControlLoop parameters (used only when controller: control_loop) ──────
     kp: 20.0                         # Nm/rad, position stiffness
@@ -86,15 +86,15 @@ robot:
     status_print_hz: 5.0            # row-content rate; teleop stays 30 Hz, SDK stream 100 Hz
 
     # ── ForcePositionController parameters (used only for force_position) ─────
-    # SDK 0.2.0 cut this surface from sixteen knobs to six: contact detection
-    # and the position gains live in the C++ detail:: tuning struct now, since
-    # the MCU runs the same stall test at 500 Hz and is the authority.
-    # close_preload_nm (0.25 Nm, seats the jaw on its closed stop) is an SDK
-    # default and is not plumbed through this config.
-    close_speed_radps: 3.0           # lower impact speed reduces zero-stop rebound
-    grasp_torque_nm: 1.8            # target torque after contact (positive magnitude)
-    hold_torque_limit_nm: 1.8       # ceiling only; motor continuous/rated limit
-    motion_torque_limit_nm: 6.0     # peak/transient ceiling, not holding torque
+    # 只剩一个旋钮。力矩预算(grasp_torque_nm)和它的两个天花板都不再由上层配 ——
+    # 固件把超过包络 cont(本机 1.1Nm)的一律削回去,配 1.8 拿到的还是 1.1,只多换
+    # 来 I2t 累积和掉电风险(SDK 注释记着 1.5Nm 对 1.6Nm 包络就把板子拉到欠压的
+    # 现场事故)。close_preload_nm(0.25Nm,把爪子坐死在闭合止点)同样走 SDK 默认。
+    # 接触检测和位置增益在 SDK 0.2.0 就移进 C++ 的 detail:: 了,MCU 以 500Hz 跑
+    # 同一个堵转判据并且是权威。
+    # 行进段**设定点斜坡**的推进速率,不是发给电机的速度命令。实测能跑满
+    # (均速/命令 102%),全行程 1.2rad 约 0.4 秒。SDK 默认是 0.5,这里刻意调高。
+    close_speed_radps: 3.0
     status_timeout_ms: 350
 
     auto_discover_cameras: true

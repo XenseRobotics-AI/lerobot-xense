@@ -38,8 +38,9 @@ MAX_FEEDFORWARD_TORQUE_NM = 3.5
 TACCAP_CONTROLLERS = ("control_loop", "force_position")
 TACCAP_SUBMIT_PHASES = ("stream_locked", "free_running")
 TACCAP_STALL_ACTIONS = ("hold_position", "none")
-FORCE_POSITION_MAX_HOLD_TORQUE_NM = 1.8
-FORCE_POSITION_MAX_MOTION_TORQUE_NM = 6.0
+# 力矩上限的两个常数(1.8 / 6.0)删了:它们只服务于 hold_torque_limit_nm 和
+# motion_torque_limit_nm 的校验,而那两个字段已不在本配置里 —— SDK 自己有同样
+# 的边界校验,在这边再留一份只会和 SDK 漂开。
 
 
 @GripperConfig.register_subclass("taccap_follower")
@@ -59,11 +60,17 @@ class TaccapFollowerConfig(GripperConfig):
 
     Controller:
         controller: Selects the SDK background controller at connect time.
-                     ``control_loop`` is normalized position impedance;
-                     ``force_position`` closes with bounded velocity/damping,
-                     detects contact, then holds ``grasp_torque_nm`` using pure
-                     feed-forward torque. Switching requires restarting the
-                     LeRobot command; YAML is not hot-reloaded.
+                     Defaults to ``force_position``: one bounded-torque control
+                     law for the whole move, with the PD request error-clamped
+                     against the SDK's grasp budget. It does NOT detect contact
+                     — saturation is contact; SDK 0.2.0 deleted the host-side
+                     contact state machine because the MCU already runs the
+                     same stall test at 500 Hz and is the authority.
+                     ``control_loop`` is the lower-level normalized position
+                     impedance loop; note it has no fault semantics — a failed
+                     submit just stops the loop with nothing saying why.
+                     Switching requires restarting the LeRobot command; YAML is
+                     not hot-reloaded.
 
     ControlLoop:
         kp/kd:       Position stiffness and velocity damping.
@@ -74,14 +81,15 @@ class TaccapFollowerConfig(GripperConfig):
                      ``stream_locked`` phase submits once per motor-status frame,
                      at ``motor_stream_hz``.
 
-    ForcePositionController:
-        grasp_torque_nm: The control law's torque budget for the whole move —
-                     the PD request is error-clamped against it, so a blocked
-                     jaw settles at exactly this torque. Not a contact
-                     threshold; SDK 0.2.0 removed contact detection from the
-                     host, the MCU already runs it at 500 Hz.
-        hold_torque_limit_nm: Long-term torque ceiling (SDK maximum 1.8 Nm).
-        motion_torque_limit_nm: Transient motion ceiling (SDK maximum 6.0 Nm).
+    ForcePositionController (the default controller):
+        close_speed_radps: Rate of the time-based SETPOINT RAMP during travel —
+                     not a velocity command to the motor. Only this controller
+                     reads it; ControlLoop's approach speed comes from
+                     peak/kd instead.
+
+        Nothing else is exposed. The torque budget, its two ceilings and the
+        closed-end preload are all SDK defaults; see the block next to the
+        fields below for why each one is better left there.
 
         The closed-endpoint preload (``close_preload_nm``, 0.25 Nm) is left at
         the SDK default and not exposed here. Add it to this dataclass and to
@@ -99,7 +107,11 @@ class TaccapFollowerConfig(GripperConfig):
     mcu_device: str | None = None  # optional explicit device path override
 
     # ── SDK controller selection ───────────────────────────────────────────────
-    controller: str = "control_loop"  # "control_loop" | "force_position"
+    # 默认 force_position:唯一在用的 recipe 就是它,而且它是受监督的那个 ——
+    # ControlLoop 把 stalled / torque_capped 当成两个独立锁下的标志位,调用方
+    # 轮询两者可能读到一个从没同时存在过的组合;更要命的是**它没有故障语义**,
+    # 提交失败只会让循环断掉、running 变 false,不告诉你为什么。
+    controller: str = "force_position"  # "control_loop" | "force_position"
 
     # ── ControlLoop (position impedance) ───────────────────────────────────────
     kp: float = 8.0  # Nm/rad
@@ -135,10 +147,24 @@ class TaccapFollowerConfig(GripperConfig):
     # kept past that change and silently stopped doing anything — the setter
     # loop skips fields the SDK no longer declares. Removed rather than left
     # looking tunable.
-    close_speed_radps: float = 0.5
-    grasp_torque_nm: float = 0.35
-    hold_torque_limit_nm: float = FORCE_POSITION_MAX_HOLD_TORQUE_NM
-    motion_torque_limit_nm: float = FORCE_POSITION_MAX_MOTION_TORQUE_NM
+    #
+    # 力矩三兄弟也不在这里了,一律走 SDK 默认:
+    #
+    #   grasp_torque_nm (SDK 1.1) —— 暴露它只会让人配出得不到的值。固件的
+    #     clamp_torque 上限是 min(cont, effective_peak),本机包络 cont=1.1,
+    #     所以配 1.8 实际拿到的还是 1.1,只多换来 I2t 累积和掉电风险。SDK 那段
+    #     注释记着一次现场事故:1.5Nm 夹持对 1.6Nm 包络就把板子拉到欠压、连
+    #     USB 一起断。(我们的 recipe 之前配的正是 1.8 对 1.1。)
+    #     注意 1.1 不等于"永远安全":实测持续 1.1Nm 十分钟,电机 33->58°C 且
+    #     未收敛。它是厂商的连续额定,不是无限期保证。
+    #
+    #   hold_torque_limit_nm —— 在当前控制律里**已经不钳任何输出**,只用来
+    #     校验 grasp 的上界并在超过电机额定时告警。grasp 不可配之后它无事可做。
+    #
+    #   motion_torque_limit_nm —— 仍有实功能(预算外钳位 + 反馈超限跳故障),
+    #     但 SDK 默认 6.0 就是器件上限,且启动时会和电机的 0x700B 交叉核对、
+    #     以设备值为准。上层调低它属于刻意收紧安全边界,没人在做。
+    close_speed_radps: float = 3.0
     status_timeout_ms: int = 350
 
     # ── Behavior ───────────────────────────────────────────────────────────────
@@ -235,23 +261,10 @@ class TaccapFollowerConfig(GripperConfig):
 
         positive = {
             "close_speed_radps": self.close_speed_radps,
-            "grasp_torque_nm": self.grasp_torque_nm,
         }
         for name, value in positive.items():
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"TaccapFollowerConfig: {name} must be finite and > 0, got {value}.")
-        if not 0.0 < self.hold_torque_limit_nm <= FORCE_POSITION_MAX_HOLD_TORQUE_NM:
-            raise ValueError(
-                f"TaccapFollowerConfig: hold_torque_limit_nm must be in (0, 1.8], got {self.hold_torque_limit_nm}."
-            )
-        if not 0.0 < self.motion_torque_limit_nm <= FORCE_POSITION_MAX_MOTION_TORQUE_NM:
-            raise ValueError(
-                f"TaccapFollowerConfig: motion_torque_limit_nm must be in (0, 6.0], got {self.motion_torque_limit_nm}."
-            )
-        if self.hold_torque_limit_nm > self.motion_torque_limit_nm:
-            raise ValueError("TaccapFollowerConfig: hold_torque_limit_nm must not exceed motion_torque_limit_nm.")
-        if self.grasp_torque_nm > self.hold_torque_limit_nm:
-            raise ValueError("TaccapFollowerConfig: grasp_torque_nm must not exceed hold_torque_limit_nm.")
         if self.status_timeout_ms <= 0:
             raise ValueError(f"TaccapFollowerConfig: status_timeout_ms must be > 0, got {self.status_timeout_ms}.")
         if not math.isfinite(self.status_print_hz) or self.status_print_hz <= 0.0:

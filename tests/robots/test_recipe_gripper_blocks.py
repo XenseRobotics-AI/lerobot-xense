@@ -54,9 +54,6 @@ TACCAP_ADVANCED_CONTROLLER_FIELDS = {
     "print_status",
     "status_print_hz",
     "close_speed_radps",
-    "grasp_torque_nm",
-    "hold_torque_limit_nm",
-    "motion_torque_limit_nm",
     "status_timeout_ms",
 }
 TACCAP_CONTROLLER_REFERENCE = REPO_ROOT / "recipes/teleop/bi_flexiv_rizon4_rt/forward-01-taccap.yaml"
@@ -97,20 +94,27 @@ def test_forward_01_is_the_complete_taccap_controller_reference():
     assert set(block) >= TACCAP_ADVANCED_CONTROLLER_FIELDS
 
 
-def test_forward_01_force_position_holds_configured_torque_at_zero():
-    """The reference recipe must still ask for a real grasp, within the ceiling.
+def test_forward_01_leaves_the_torque_budget_to_the_sdk():
+    """The recipe must not configure grasp torque or its ceilings at all.
 
-    `close_position` used to be asserted here as "0.0 means fully closed". SDK
-    0.2.0 removed it: the closed endpoint is normalized 0.0 by construction, and
-    firmware 1.2.5 puts that at the mechanical stop itself, so there is nothing
-    left to configure. The torque budget is what still has to be right.
+    It used to pin grasp_torque_nm=1.8 against a 1.1 Nm continuous envelope —
+    a value the firmware clamps straight back to 1.1, so the configured grip
+    was never the delivered one, and the only thing the setting bought was I2t
+    accumulation and brown-out risk. The SDK warns twice about it on every
+    connect. The knob is gone rather than merely retuned: there is no value
+    above the envelope worth allowing, and below it the SDK default is already
+    the motor's continuous rating.
+
+    `close_position` was asserted here before that. SDK 0.2.0 removed it too:
+    the closed endpoint is normalized 0.0 by construction, and firmware 1.2.5
+    puts that at the mechanical stop itself.
     """
 
     block = yaml.safe_load(TACCAP_CONTROLLER_REFERENCE.read_text())["robot"]["gripper"]
 
     assert block["controller"] == "force_position"
-    assert block["grasp_torque_nm"] == pytest.approx(1.8)
-    assert block["hold_torque_limit_nm"] >= block["grasp_torque_nm"]
+    for gone in ("grasp_torque_nm", "hold_torque_limit_nm", "motion_torque_limit_nm", "close_position"):
+        assert gone not in block, f"{gone} is back in the reference recipe"
 
 
 @pytest.mark.parametrize(("path", "block"), CASES)
