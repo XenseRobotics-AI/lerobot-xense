@@ -36,6 +36,10 @@ repos:
       - id: end-of-file-fixer
       - id: trailing-whitespace
 
+  # Keep this rev equal to the `ruff==` pin in pyproject.toml's dev extras, so a
+  # developer's ruff and the one the hook runs are the same build. Ruff's
+  # defaults change between minor releases, so a drift here surfaces as CI
+  # failing on files that pass locally.
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.16.3
     hooks:

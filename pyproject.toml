@@ -168,7 +168,20 @@ phone = [
 ]
 
 # Development
-dev = ["pre-commit>=3.7.0,<5.0.0", "debugpy>=1.8.1,<1.9.0", "mypy>=1.19.1"]
+#
+# ruff is pinned EXACTLY, and must match the `rev:` of the ruff-pre-commit hook
+# in .pre-commit-config.yaml. The two were the same version only by accident
+# until now — nothing declared ruff at all, so the copy in a developer's env was
+# whatever they happened to install. Ruff's defaults move between minor
+# releases (0.16 pulled I001 and friends into the default rule set, 0.16.8 began
+# formatting Python inside Markdown fences), so a mismatch shows up as a CI
+# failure on files that were clean locally. Bump both together.
+dev = [
+    "pre-commit>=3.7.0,<5.0.0",
+    "ruff==0.16.3",
+    "debugpy>=1.8.1,<1.9.0",
+    "mypy>=1.19.1",
+]
 test = [
     "pytest>=8.1.0,<9.0.0",
     "pytest-timeout>=2.4.0,<3.0.0",
