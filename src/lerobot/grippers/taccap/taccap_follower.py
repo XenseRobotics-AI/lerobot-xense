@@ -53,9 +53,15 @@ except Exception as e:  # pragma: no cover - depends on native build being prese
 # GripperConfig.flags bit 0 = calibrated (see SDK gripper_control_test.py).
 _CALIBRATED_FLAG = 0x0001
 
-# ForcePositionController::set_target resets its contact guard and contact
-# counter. Teleop repeats the latest action every frame, so identical targets
-# must be coalesced or the controller can never latch contact.
+# 重复目标的合并阈值。**SDK 内部已经在做同样的事,用的还是同一个 1e-4** ——
+# ForcePositionPolicy::set_target 里 `if (|target - target_| > 1e-4f)`。所以这层
+# 是保险,不是必需的:省掉 teleop 每帧一次的 FFI 调用而已。
+#
+# 原注释写的是"set_target 会重置接触保护和计数器,不合并就永远 latch 不到接触"。
+# 那个理由已经不成立:接触状态机在 SDK 0.2.0 整个删掉了,而 SDK 自己的注释说得
+# 很清楚 —— "Commands only move the setpoint. There is no motion state to disturb
+# and no confirmation window to restart, which is what made the old version
+# fragile for a caller that streams its target."
 _FORCE_POSITION_TARGET_EPS = 1e-4
 
 # The teleop UI owns terminal cursor movement. Gripper reads only publish their

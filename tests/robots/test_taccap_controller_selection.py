@@ -22,6 +22,7 @@ import pytest
 
 from lerobot.grippers import TaccapFollowerConfig
 from lerobot.grippers.taccap import taccap_follower as driver
+from lerobot.utils.errors import DeviceNotConnectedError
 
 
 class _FakeForcePositionConfig:
@@ -416,7 +417,6 @@ def test_connect_force_position_starts_the_loop_before_enabling_the_motor():
     keeps the older enable-before-start. Getting this backwards does not fail
     loudly — it just skips the check — which is exactly why it needs a test.
     """
-    import pytest
 
     monkeypatch = pytest.MonkeyPatch()
     try:
@@ -429,7 +429,6 @@ def test_connect_force_position_starts_the_loop_before_enabling_the_motor():
 
 
 def test_connect_control_loop_enables_the_motor_before_starting_the_loop():
-    import pytest
 
     monkeypatch = pytest.MonkeyPatch()
     try:
@@ -448,7 +447,6 @@ def test_connect_reads_the_torque_budget_off_the_snapshot_not_the_config():
     the config; once that field was removed the log raised AttributeError on
     every single connect, and no test noticed because connect() had none.
     """
-    import pytest
 
     monkeypatch = pytest.MonkeyPatch()
     try:
@@ -465,7 +463,6 @@ def test_connect_releases_the_handle_when_the_loop_fails_to_start():
     _is_connected stays False on this path, so disconnect() would refuse to run
     and the handle would live until GC — with the motor still enabled.
     """
-    import pytest
 
     monkeypatch = pytest.MonkeyPatch()
     try:
@@ -483,7 +480,6 @@ def test_connect_releases_the_handle_when_the_loop_fails_to_start():
 
 def test_connect_refuses_an_uncalibrated_gripper_and_releases_it():
     """Normalized [0,1] control is meaningless without the travel span."""
-    import pytest
 
     monkeypatch = pytest.MonkeyPatch()
     try:
@@ -495,5 +491,147 @@ def test_connect_refuses_an_uncalibrated_gripper_and_releases_it():
             follower.connect()
         assert follower._gripper is None
         assert not follower.is_connected
+    finally:
+        monkeypatch.undo()
+
+
+# ---- disconnect() ---------------------------------------------------------
+
+
+def _connected(monkeypatch, config=None, **kw):
+    """A follower that has been through connect(), ready for teardown tests."""
+    follower, gripper = _connectable(monkeypatch, config or TaccapFollowerConfig(controller="force_position"), **kw)
+    follower.connect()
+    gripper.motor.calls.clear()
+    return follower, gripper
+
+
+def test_disconnect_stops_the_loop_before_disabling_the_motor():
+    """Order matters here too: a motor disabled while the loop is still
+    submitting gets frames it can only reject, and the loop's own error path
+    then reports a failure that was self-inflicted."""
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        follower, gripper = _connected(monkeypatch)
+        follower.disconnect()
+        assert gripper.motor.calls == ["loop.stop", "disable"]
+        assert follower._loop is None
+        assert follower._gripper is None
+        assert not follower.is_connected
+    finally:
+        monkeypatch.undo()
+
+
+def test_disconnect_on_a_disconnected_follower_raises():
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        follower, _ = _connectable(monkeypatch, TaccapFollowerConfig(controller="force_position"))
+        with pytest.raises(DeviceNotConnectedError):
+            follower.disconnect()
+    finally:
+        monkeypatch.undo()
+
+
+def test_disconnect_releases_everything_even_when_stop_throws():
+    """Teardown is best-effort by design, and that is load-bearing.
+
+    If a throwing stop() aborted disconnect(), `_is_connected` would stay True
+    with a dead loop behind it, and the motor would be left enabled — the exact
+    state disconnect() exists to prevent.
+    """
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        follower, gripper = _connected(monkeypatch)
+
+        def _boom():
+            gripper.motor.calls.append("loop.stop")
+            raise RuntimeError("injected failure in stop")
+
+        follower._loop.stop = _boom
+        follower.disconnect()
+        assert gripper.motor.calls == ["loop.stop", "disable"]
+        assert follower._gripper is None
+        assert not follower.is_connected
+    finally:
+        monkeypatch.undo()
+
+
+# ---- the control loop: read / command -------------------------------------
+
+
+def test_reading_a_disconnected_gripper_raises_rather_than_reading_closed():
+    """It used to return 0.0, which every caller reads as "fully closed".
+
+    A disconnected gripper and a shut one are not the same thing, and the
+    difference decides whether an arm keeps squeezing.
+    """
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        follower, _ = _connectable(monkeypatch, TaccapFollowerConfig(controller="force_position"))
+        with pytest.raises(DeviceNotConnectedError):
+            follower.get_gripper_position()
+        with pytest.raises(DeviceNotConnectedError):
+            follower.set_gripper_position(0.5)
+    finally:
+        monkeypatch.undo()
+
+
+def test_position_is_clamped_into_the_unit_range():
+    """The SDK clamps too, but this layer is what teleop reads; a value outside
+    [0,1] leaking out here becomes an out-of-range action downstream."""
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        follower, _ = _connected(monkeypatch)
+        for raw, want in ((1.4, 1.0), (-0.3, 0.0), (0.42, 0.42)):
+            follower._loop.snapshot = lambda raw=raw: SimpleNamespace(
+                observation=SimpleNamespace(position=raw),
+                state="HOLDING_POSITION",
+                commanded_torque_nm=0.1,
+            )
+            assert follower.get_gripper_position() == pytest.approx(want)
+    finally:
+        monkeypatch.undo()
+
+
+def test_a_failed_read_returns_the_last_good_position():
+    """A dropped frame must not look like motion.
+
+    Propagating would abort the teleop step; returning 0.0 would read as a
+    closed jaw. The cached value is the only answer that does not invent
+    something.
+    """
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        follower, _ = _connected(monkeypatch)
+        follower._loop.snapshot = lambda: SimpleNamespace(
+            observation=SimpleNamespace(position=0.73),
+            state="HOLDING_POSITION",
+            commanded_torque_nm=0.1,
+        )
+        assert follower.get_gripper_position() == pytest.approx(0.73)
+
+        def _boom():
+            raise RuntimeError("stream dropped")
+
+        follower._loop.snapshot = _boom
+        assert follower.get_gripper_position() == pytest.approx(0.73)
+    finally:
+        monkeypatch.undo()
+
+
+def test_out_of_range_targets_are_rejected():
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        follower, _ = _connected(monkeypatch)
+        for bad in (-0.01, 1.01):
+            with pytest.raises(ValueError, match=r"\[0, 1\]"):
+                follower.set_gripper_position(bad)
     finally:
         monkeypatch.undo()
