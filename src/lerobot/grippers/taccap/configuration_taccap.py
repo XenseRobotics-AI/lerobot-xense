@@ -120,7 +120,11 @@ class TaccapFollowerConfig(GripperConfig):
     control_hz: int = 100  # ControlLoop resubmit rate (ignored while phase-locked)
     submit_phase: str = "stream_locked"  # "stream_locked" | "free_running"
     max_position_torque_nm: float = 1.5
-    rated_torque_nm: float = 2.0
+    # 上限是电机额定 xense.taccap.MOTOR_RATED_TORQUE_NM (EL05 = 1.8 Nm),不是峰值
+    # 6.0 —— 这个天花板一旦顶住就无限期保持,按额定封顶。此处写字面量是因为本模块
+    # 刻意不依赖 SDK;改 EL05 之外的电机时要跟着常量走。ControlLoop 不校验这个字段
+    # (它是底层原语),越界不会报错,只会静默把保持力矩顶到额定之上。
+    rated_torque_nm: float = 1.8
     rated_hold_ms: int = 20
     rated_release_rad: float = 0.05
     stall_torque_nm: float = 1.2
