@@ -17,13 +17,13 @@ grippers/
 
 ## The two backends
 
-|                  | `serial`                            | `taccap_follower`                      |
-| ---------------- | ----------------------------------- | -------------------------------------- |
-| Hardware         | parallel jaw, USB serial (XGripper) | centric TacCap gripper, FDCAN motor    |
+|                  | `serial`                            | `taccap_follower`                            |
+| ---------------- | ----------------------------------- | -------------------------------------------- |
+| Hardware         | parallel jaw, USB serial (XGripper) | centric TacCap gripper, FDCAN motor          |
 | Control          | position + force/velocity limits    | SDK ForcePositionController (bounded torque) |
-| Side resolved by | board-SN parity (odd → left)        | firmware-burned SN                     |
-| On its USB hub   | wrist cam + 2 tactile               | wrist cam + 2 GSPS                     |
-| SDK              | `xgripper`                          | `xense.taccap`                         |
+| Side resolved by | board-SN parity (odd → left)        | firmware-burned SN                           |
+| On its USB hub   | wrist cam + 2 tactile               | wrist cam + 2 GSPS                           |
+| SDK              | `xgripper`                          | `xense.taccap`                               |
 
 Both SDKs are optional builds. `make_gripper_from_config` imports only the branch
 it selects, so this package stays importable on a host with neither installed;
