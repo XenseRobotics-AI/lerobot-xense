@@ -43,15 +43,6 @@ robot:
   # USB hub at connect, which is why only the head camera is pinned above.
   gripper:
     type: taccap_follower
-    kp: 8.0                 # MIT impedance stiffness (Nm/rad)
-    kd: 1.0                 # MIT impedance damping (Nm·s/rad)
-    # ⚠️ HIGH GRIP FORCE — constant closing feed-forward torque. NEGATIVE = clamp.
-    # -3.0 Nm is ~10x the SDK gentle-grasp abort (0.30 Nm) and near the motor's
-    # ceiling: it is a hard crush. Being a CONSTANT bias, the jaw also settles
-    # ~3/kp≈0.375 rad short of full open and holds the closed stop under load even
-    # empty (runs hot). Back off toward -0.3 if it stalls / can't open / overheats.
-    feedforward_torque: -3.0    # Nm, negative = closing
-    control_hz: 200         # ControlLoop resubmit rate
     auto_discover_cameras: true
     enable_tactile: true
     # ── Wrist fisheye rectification ── the intrinsics live in THIS gripper's MCU

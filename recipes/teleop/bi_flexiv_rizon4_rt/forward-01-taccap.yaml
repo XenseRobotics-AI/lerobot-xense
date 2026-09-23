@@ -49,43 +49,26 @@ robot:
   gripper:
     type: taccap_follower
 
-    # Change this one value, then restart lerobot-teleoperate:
-    #   control_loop   = normalized position impedance (ControlLoop)
-    #   force_position = contact-aware close, then pure-torque hold
-    # The SDK exposes these two background controllers. Motor.set_position /
-    # set_velocity / set_torque / set_impedance are low-level one-shot commands
-    # and must not run concurrently with either controller.
+    # force_position 是唯一的值。`control_loop`(以及它带的
+    # kp/kd/feedforward_torque/control_hz/submit_phase/rated_*/stall_* 一整组)
+    # 随 SDK 删掉 ControlLoop 一起去掉了 —— 那是阻抗控制律的第二份拷贝,带一个
+    # 会把夹持力打塌的失速守卫。此前那些字段在本 recipe 里就已经是死值:
+    # controller 是 force_position,没有任何一条被读过。
+    # Motor.set_position / set_velocity / set_torque / set_impedance 是低层
+    # 一次性命令,不能和控制器并发。
     controller: force_position   # 也是默认值
 
-    # ── ControlLoop parameters (used only when controller: control_loop) ──────
-    kp: 20.0                         # Nm/rad, position stiffness
-    kd: 0.3                         # Nm·s/rad, velocity damping
-    # A small constant closing bias remains active when target=0 and the
-    # calibrated position error has vanished, so the jaw stays seated/loaded.
-    feedforward_torque: -0.20       # Nm; negative closes, positive opens
-    control_hz: 100                 # used only by free_running; stream_locked ignores it
-    submit_phase: stream_locked     # stream_locked | free_running
-    # 0.9 position + 0.2 closing bias keeps the nominal closing demand at 1.1 Nm.
-    max_position_torque_nm: 0.9     # kp*position-error contribution limit; 0 disables
-    rated_torque_nm: 1.1            # measured-torque backstop; 0 disables
-    rated_hold_ms: 20
-    rated_release_rad: 0.05
-    stall_torque_nm: 1.2
-    stall_vel_radps: 0.15
-    stall_hold_ms: 60
-    stall_action: hold_position     # hold_position | none
-
-    # Shared motor-status stream rate for both controllers.
+    # Motor-status stream rate; the controller submits one frame per status frame.
     motor_stream_hz: 100            # valid range: 1..100 Hz
 
-    # ── Runtime status print (both controllers) ───────────────────────────────
-    # Uses each controller's in-memory stream snapshot: no extra motor polling,
+    # ── Runtime status print ──────────────────────────────────────────────────
+    # Uses the controller's in-memory stream snapshot: no extra motor polling,
     # ACK traffic, or background thread. L/R occupy two fixed live-panel rows.
-    # ControlLoop ends in measured hz; ForcePosition ends in state + commanded torque.
+    # Each row ends in the controller state + its commanded torque.
     print_status: true              # one-click switch: true | false
     status_print_hz: 5.0            # row-content rate; teleop stays 30 Hz, SDK stream 100 Hz
 
-    # ── ForcePositionController parameters (used only for force_position) ─────
+    # ── ForcePositionController parameters ────────────────────────────────────
     # 只剩一个旋钮。力矩预算(grasp_torque_nm)和它的两个天花板都不再由上层配 ——
     # 固件把超过包络 cont(本机 1.1Nm)的一律削回去,配 1.8 拿到的还是 1.1,只多换
     # 来 I2t 累积和掉电风险(SDK 注释记着 1.5Nm 对 1.6Nm 包络就把板子拉到欠压的

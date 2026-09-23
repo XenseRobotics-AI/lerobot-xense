@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""No-hardware coverage for TacCap SDK controller selection and YAML mapping."""
+"""No-hardware coverage for the TacCap SDK controller wiring and YAML mapping."""
 
 from types import SimpleNamespace
 
@@ -38,28 +38,6 @@ class _FakeForcePositionConfig:
     motor_stream_hz = None
 
 
-class _FakeControlLoop:
-    def __init__(self, gripper, **kwargs):
-        self.gripper = gripper
-        self.kwargs = kwargs
-        self.started = False
-
-    # start/stop 记到**夹爪的同一条时间线**上,这样 connect() 里「使能与启动
-    # 谁先谁后」是真的被断言了,而不是分别检查两个计数器。
-    def _rec(self, name):
-        motor = getattr(getattr(self, "gripper", None), "motor", None)
-        if motor is not None and hasattr(motor, "calls"):
-            motor.calls.append(name)
-
-    def start(self):
-        self.started = True
-        self._rec("loop.start")
-
-    def stop(self):
-        self.started = False
-        self._rec("loop.stop")
-
-
 class _FakeForcePositionController:
     def __init__(self, gripper, config):
         self.gripper = gripper
@@ -73,6 +51,8 @@ class _FakeForcePositionController:
         self.started = False
         self._rec("loop.stop")
 
+    # start/stop 记到**夹爪的同一条时间线**上,这样 connect() 里「使能与启动
+    # 谁先谁后」是真的被断言了,而不是分别检查两个计数器。
     def _rec(self, name):
         motor = getattr(getattr(self, "gripper", None), "motor", None)
         if motor is not None and hasattr(motor, "calls"):
@@ -81,9 +61,6 @@ class _FakeForcePositionController:
 
 def _install_fake_sdk(monkeypatch, force_position_config=_FakeForcePositionConfig):
     fake = SimpleNamespace(
-        SubmitPhase=SimpleNamespace(STREAM_LOCKED="stream_locked_enum", FREE_RUNNING="free_running_enum"),
-        StallAction=SimpleNamespace(HOLD_POSITION="hold_position_enum", NONE="none_enum"),
-        ControlLoop=_FakeControlLoop,
         ForcePositionConfig=force_position_config,
         ForcePositionController=_FakeForcePositionController,
         # SDK 的主入口。没有它这个 fake 就不完整 —— connect() 第一件事就是
@@ -100,44 +77,25 @@ def _follower(config):
     return follower
 
 
-def test_control_loop_receives_every_exposed_sdk_parameter(monkeypatch):
-    _install_fake_sdk(monkeypatch)
-    config = TaccapFollowerConfig(
-        controller="control_loop",
-        control_hz=87,
-        kp=9.0,
-        kd=0.8,
-        feedforward_torque=-0.2,
-        motor_stream_hz=73,
-        submit_phase="free_running",
-        max_position_torque_nm=1.1,
-        rated_torque_nm=1.2,
-        rated_hold_ms=31,
-        rated_release_rad=0.07,
-        stall_torque_nm=0.9,
-        stall_vel_radps=0.12,
-        stall_hold_ms=44,
-        stall_action="none",
-    )
+@pytest.mark.parametrize("name", ["control_loop", "impedance", ""])
+def test_only_force_position_is_selectable(name):
+    """`control_loop` selected the SDK's ControlLoop, which the SDK removed.
 
-    controller = _follower(config)._make_sdk_controller()
+    It carried a second copy of the impedance law that had drifted from
+    ImpedanceController's — a different torque budget, plus a stall guard that
+    clamped the effective target onto the jaw's own position and so collapsed
+    the grip (measured: letting go 60 ms after contact, at 0.35 Nm). A recipe
+    that still names it must fail at parse: silently falling back to
+    force_position would change the control law under a bench that thought it
+    had pinned one.
 
-    assert controller.kwargs == {
-        "hz": 87,
-        "kp": 9.0,
-        "kd": 0.8,
-        "feedforward_torque": -0.2,
-        "motor_stream_hz": 73,
-        "phase": "free_running_enum",
-        "max_position_torque_nm": 1.1,
-        "rated_torque_nm": 1.2,
-        "rated_hold_ms": 31,
-        "rated_release_rad": 0.07,
-        "stall_torque_nm": 0.9,
-        "stall_vel_radps": 0.12,
-        "stall_hold_ms": 44,
-        "stall_action": "none_enum",
-    }
+    `impedance` is not wired up either: the SDK's ImpedanceController would be
+    the natural replacement, but nothing here builds one yet, so naming it must
+    fail rather than look supported.
+    """
+
+    with pytest.raises(ValueError, match="controller must be one of"):
+        TaccapFollowerConfig(controller=name)
 
 
 def test_force_position_receives_every_exposed_sdk_parameter(monkeypatch):
@@ -178,23 +136,9 @@ def test_force_position_skips_fields_the_installed_sdk_lacks(monkeypatch):
     assert not hasattr(controller.config, "status_timeout_ms")
 
 
-def test_control_loop_flips_normalized_feedforward_for_reversed_map(monkeypatch):
-    _install_fake_sdk(monkeypatch)
-    follower = _follower(TaccapFollowerConfig(controller="control_loop", feedforward_torque=-0.2))
-    follower._gripper = SimpleNamespace(position_map=lambda: SimpleNamespace(reverse=True))
-
-    controller = follower._make_sdk_controller()
-
-    assert controller.kwargs["feedforward_torque"] == pytest.approx(0.2)
-
-
-def test_each_controller_exposes_a_common_position_observation(monkeypatch):
+def test_the_controller_exposes_a_common_position_observation(monkeypatch):
     _install_fake_sdk(monkeypatch)
     observation = SimpleNamespace(position=0.42)
-
-    control_loop = _follower(TaccapFollowerConfig(controller="control_loop"))
-    control_loop._loop = SimpleNamespace(observation=lambda: observation)
-    assert control_loop._latest_observation() is observation
 
     force_position = _follower(TaccapFollowerConfig(controller="force_position"))
     force_position._loop = SimpleNamespace(snapshot=lambda: SimpleNamespace(observation=observation))
@@ -217,42 +161,35 @@ def test_force_position_coalesces_repeated_teleop_targets(monkeypatch):
     follower._is_connected = False
 
 
-def test_control_loop_keeps_accepting_repeated_targets(monkeypatch):
+def test_status_print_is_rate_limited_but_the_position_read_is_not(monkeypatch):
+    """The live panel updates at status_print_hz; teleop still reads every step.
+
+    Rate-limiting the read instead would hand teleop a stale position between
+    panel updates, which is a control input, not a display.
+    """
+
     _install_fake_sdk(monkeypatch)
-    calls = []
-    follower = _follower(TaccapFollowerConfig(controller="control_loop"))
-    follower._is_connected = True
-    follower._loop = SimpleNamespace(set_target=calls.append)
-
-    follower.set_gripper_position(0.25)
-    follower.set_gripper_position(0.25)
-
-    assert calls == [0.25, 0.25]
-    follower._is_connected = False
-
-
-def test_control_loop_status_print_is_rate_limited_and_uses_cached_observation(monkeypatch):
-    _install_fake_sdk(monkeypatch)
-    observation = SimpleNamespace(
-        position=0.25,
-        raw_pos=-0.3,
-        velocity=-1.2,
-        torque=-0.7,
-        motor_temp_c=41.0,
-        age_ms=3.0,
+    snapshot = SimpleNamespace(
+        observation=SimpleNamespace(
+            position=0.25,
+            raw_pos=-0.3,
+            velocity=-1.2,
+            torque=-0.7,
+            motor_temp_c=41.0,
+            age_ms=3.0,
+        ),
+        state="CLOSING",
+        commanded_torque_nm=-0.4,
     )
     reads = []
 
-    def read_observation():
+    def read_snapshot():
         reads.append(True)
-        return observation
+        return snapshot
 
-    follower = _follower(TaccapFollowerConfig(controller="control_loop", print_status=True, status_print_hz=5.0))
+    follower = _follower(TaccapFollowerConfig(print_status=True, status_print_hz=5.0))
     follower._is_connected = True
-    follower._loop = SimpleNamespace(
-        observation=read_observation,
-        submit_hz=99.8,
-    )
+    follower._loop = SimpleNamespace(snapshot=read_snapshot)
     updates = []
     monkeypatch.setattr(driver, "_set_taccap_status_line", lambda side, line: updates.append((side, line)))
     times = iter((10.0, 10.1, 10.21))
@@ -263,7 +200,8 @@ def test_control_loop_status_print_is_rate_limited_and_uses_cached_observation(m
     follower.get_gripper_position()
 
     assert len(reads) == 3
-    expected = "L pos=0.250 raw=-0.3000rad vel=-1.20rad/s tq=-0.70Nm temp=41C age=3.0ms hz=99.8"
+    expected = "L pos=0.250 raw=-0.3000rad vel=-1.20rad/s tq=-0.70Nm temp=41C age=3.0ms state=CLOSING cmd=-0.40Nm"
+    # 10.0 prints, 10.1 is inside the 0.2 s period and is skipped, 10.21 prints.
     assert updates == [("left", expected), ("left", expected)]
     follower._is_connected = False
 
@@ -307,9 +245,11 @@ def test_force_position_status_print_reuses_one_snapshot(monkeypatch):
 def test_disabled_status_print_does_not_touch_controller_diagnostics(monkeypatch):
     _install_fake_sdk(monkeypatch)
     observation = SimpleNamespace(position=0.4)
-    follower = _follower(TaccapFollowerConfig(controller="control_loop", print_status=False))
+    follower = _follower(TaccapFollowerConfig(print_status=False))
     follower._is_connected = True
-    follower._loop = SimpleNamespace(observation=lambda: observation)
+    follower._loop = SimpleNamespace(
+        snapshot=lambda: SimpleNamespace(observation=observation, state="IDLE", commanded_torque_nm=0.0)
+    )
 
     assert follower.get_gripper_position() == 0.4
     follower._is_connected = False
@@ -410,12 +350,12 @@ def _connectable(monkeypatch, config, gripper=None, start_fails=False):
 
 
 def test_connect_force_position_starts_the_loop_before_enabling_the_motor():
-    """Ordering is load-bearing, and it differs per controller.
+    """Ordering is load-bearing.
 
     ForcePositionController.start() validates the motor's persisted torque limit
-    (0x700B) before any motion, so the SDK wants start-before-enable. ControlLoop
-    keeps the older enable-before-start. Getting this backwards does not fail
-    loudly — it just skips the check — which is exactly why it needs a test.
+    (0x700B) before any motion, so the SDK wants start-before-enable. Getting
+    this backwards does not fail loudly — it just skips the check — which is
+    exactly why it needs a test.
     """
 
     monkeypatch = pytest.MonkeyPatch()
@@ -424,18 +364,6 @@ def test_connect_force_position_starts_the_loop_before_enabling_the_motor():
         follower.connect()
         assert gripper.motor.calls == ["clear_fault", "loop.start", "enable"]
         assert follower._loop.started
-    finally:
-        monkeypatch.undo()
-
-
-def test_connect_control_loop_enables_the_motor_before_starting_the_loop():
-
-    monkeypatch = pytest.MonkeyPatch()
-    try:
-        follower, gripper = _connectable(monkeypatch, TaccapFollowerConfig(controller="control_loop"))
-        monkeypatch.setattr(driver.taccap, "ControlLoop", lambda *a, **k: _FakeControlLoop(*a, **k))
-        follower.connect()
-        assert gripper.motor.calls == ["clear_fault", "enable", "loop.start"]
     finally:
         monkeypatch.undo()
 

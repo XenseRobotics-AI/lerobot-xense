@@ -234,8 +234,7 @@ a matched pair). Two backends:
 robot:
   gripper:
     type: taccap_follower
-    kp: 8.0
-    feedforward_torque: -3.0 # negative = clamp harder
+    close_speed_radps: 3.0 # setpoint-ramp rate during travel (rad/s)
     auto_discover_cameras: true # sniff wrist + tactile off this gripper's hub
     enable_tactile: true
     undistort_wrist: true # rectify the wrist fisheye from the MCU's intrinsics

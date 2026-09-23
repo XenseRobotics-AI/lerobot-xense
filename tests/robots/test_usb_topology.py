@@ -252,10 +252,10 @@ def test_no_gripper_means_no_autodiscovery(robot_type):
 def test_shared_block_is_cloned_per_side(robot_type):
     """One block in the recipe, one config per arm, each stamped with its side —
     that stamp is what lets each backend resolve which physical unit is which."""
-    cfg = _config(robot_type)(gripper=TaccapFollowerConfig(kp=9.5))
+    cfg = _config(robot_type)(gripper=TaccapFollowerConfig(close_speed_radps=2.5))
     assert cfg.left_gripper.side == "left"
     assert cfg.right_gripper.side == "right"
-    assert cfg.left_gripper.kp == cfg.right_gripper.kp == 9.5
+    assert cfg.left_gripper.close_speed_radps == cfg.right_gripper.close_speed_radps == 2.5
     assert cfg.left_gripper is not cfg.right_gripper
 
 

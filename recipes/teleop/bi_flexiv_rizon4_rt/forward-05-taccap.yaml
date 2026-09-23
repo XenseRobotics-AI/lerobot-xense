@@ -20,8 +20,9 @@
 # with the other gripper family — the two differ only in `gripper:`.
 #
 # NOT yet run on this bench with TacCap followers — the arm block is inherited
-# from the forward-05-xgripper.yaml recipe, the gripper block is the fleet default. Grip tuning
-# (feedforward_torque) is bench work; start gentle.
+# from the forward-05-xgripper.yaml recipe, the gripper block is the fleet default. Grip force is no
+# longer a recipe knob: the SDK's ForcePositionController holds at the motor's
+# continuous rating (1.1 Nm) and the firmware envelope clamps above that.
 
 robot:
   type: bi_flexiv_rizon4_rt
@@ -65,10 +66,6 @@ robot:
   # USB hub at connect, which is why only the head camera is pinned above.
   gripper:
     type: taccap_follower
-    kp: 8.0                 # MIT impedance stiffness (Nm/rad)
-    kd: 1.0                 # MIT impedance damping (Nm·s/rad)
-    feedforward_torque: 0.0     # Nm; negative = clamp harder. |ff| <= 3.5
-    control_hz: 200         # ControlLoop resubmit rate
     auto_discover_cameras: true
     enable_tactile: true
     # ── Wrist fisheye rectification ── the intrinsics live in THIS gripper's MCU

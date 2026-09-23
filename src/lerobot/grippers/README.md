@@ -20,7 +20,7 @@ grippers/
 |                  | `serial`                            | `taccap_follower`                      |
 | ---------------- | ----------------------------------- | -------------------------------------- |
 | Hardware         | parallel jaw, USB serial (XGripper) | centric TacCap gripper, FDCAN motor    |
-| Control          | position + force/velocity limits    | MIT impedance (kp / kd / feed-forward) |
+| Control          | position + force/velocity limits    | SDK ForcePositionController (bounded torque) |
 | Side resolved by | board-SN parity (odd → left)        | firmware-burned SN                     |
 | On its USB hub   | wrist cam + 2 tactile               | wrist cam + 2 GSPS                     |
 | SDK              | `xgripper`                          | `xense.taccap`                         |
@@ -37,10 +37,8 @@ A robot takes a single typed `gripper:` block:
 robot:
   gripper:
     type: taccap_follower
-    kp: 8.0 # MIT impedance stiffness (Nm/rad)
-    kd: 1.0 # damping (Nm·s/rad)
-    feedforward_torque: -3.0 # constant bias; NEGATIVE = clamp harder, |ff| <= 3.5
-    control_hz: 100
+    close_speed_radps: 3.0 # setpoint-ramp rate during travel (rad/s)
+    print_status: true # one live-panel row per gripper
     auto_discover_cameras: true
 ```
 
@@ -60,7 +58,7 @@ what makes a wrong knob **fail loudly**:
 ```yaml
 gripper:
   type: serial
-  feedforward_torque: -3.0 # -> DecodingError: unknown field
+  undistort_wrist: true # -> DecodingError: unknown field
 ```
 
 Before this was a typed block the same line was accepted and silently ignored,

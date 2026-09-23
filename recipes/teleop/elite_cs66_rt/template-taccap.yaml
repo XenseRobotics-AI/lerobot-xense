@@ -54,10 +54,6 @@ robot:
   gripper:
     type: taccap_follower
     side: left
-    kp: 8.0 # MIT impedance stiffness (Nm/rad)
-    kd: 1.0 # MIT impedance damping (Nm·s/rad)
-    feedforward_torque: 0.0 # Nm; negative = clamp harder. |ff| <= 3.5
-    control_hz: 200 # ControlLoop resubmit rate
     auto_discover_cameras: true
     enable_tactile: true
     # ── Wrist fisheye rectification ── the intrinsics live in THIS gripper's MCU

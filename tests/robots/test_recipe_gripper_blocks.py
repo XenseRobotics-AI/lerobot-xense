@@ -34,22 +34,18 @@ CLS: dict[str, type[GripperConfig]] = {
     "taccap_follower": TaccapFollowerConfig,
 }
 
-# Most TacCap recipes intentionally keep their historical ControlLoop block and
-# inherit the newly exposed SDK safety/controller defaults. A recipe becomes a
-# full controller reference by advertising any field in this set; from then on
-# the ordinary completeness check requires the whole set. forward-01-taccap.yaml
-# is the bilateral platform's canonical full reference.
+# Most TacCap recipes pin only the bench hardware and inherit every controller
+# default. A recipe becomes a full controller reference by advertising any field
+# in this set; from then on the ordinary completeness check requires the whole
+# set. forward-01-taccap.yaml is the bilateral platform's canonical full
+# reference.
+#
+# This set shrank with the SDK's ControlLoop: kp, kd, feedforward_torque,
+# control_hz, submit_phase, the rated_* backstop and the stall_* guard are no
+# longer fields of TaccapFollowerConfig at all, so a recipe carrying one is
+# refused at parse rather than measured against this set.
 TACCAP_ADVANCED_CONTROLLER_FIELDS = {
     "controller",
-    "submit_phase",
-    "max_position_torque_nm",
-    "rated_torque_nm",
-    "rated_hold_ms",
-    "rated_release_rad",
-    "stall_torque_nm",
-    "stall_vel_radps",
-    "stall_hold_ms",
-    "stall_action",
     "motor_stream_hz",
     "print_status",
     "status_print_hz",
@@ -90,7 +86,7 @@ def test_forward_01_is_the_complete_taccap_controller_reference():
     block = doc["robot"]["gripper"]
 
     assert block["type"] == "taccap_follower"
-    assert block["controller"] in {"control_loop", "force_position"}
+    assert block["controller"] == "force_position"
     assert set(block) >= TACCAP_ADVANCED_CONTROLLER_FIELDS
 
 
