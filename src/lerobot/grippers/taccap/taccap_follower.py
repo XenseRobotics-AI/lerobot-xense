@@ -390,6 +390,17 @@ class TaccapFollower(Gripper):
                 self._gripper.motor.disable()
             except Exception as e:
                 self.logger.debug(f"Error disabling follower motor: {e}")
+            # Release the serial port NOW. The SDK opens it exclusively, and
+            # dropping the reference frees it only when the object is garbage-
+            # collected -- a lingering reference (the control loop, a callback)
+            # would leave a reconnect in this process failing with EBUSY.
+            # close() arrived in SDK 0.3.6; older extensions free on GC as before.
+            close = getattr(self._gripper, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except Exception as e:
+                    self.logger.debug(f"Error closing follower gripper: {e}")
             self._gripper = None
 
         self._is_connected = False
