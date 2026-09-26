@@ -160,7 +160,16 @@ class TaccapFollower(Gripper):
                 "The installed xense.taccap SDK does not expose ForcePositionController. "
                 "Reinstall third_party/taccap-gripper in the active LeRobot environment."
             )
-        force_cfg = taccap.ForcePositionConfig()
+        # Build from the motor actually fitted. A bare ForcePositionConfig()
+        # carries the EL05's numbers (grasp 1.1 / motion 6.0): on an RS00 that
+        # caps the grip at a third of its 3.6 N·m stall rating, and once the
+        # RS00's 0x700B limit is 14 N·m the SDK refuses to start at all (device
+        # limit above the config's motion limit). for_spec() arrived in SDK 0.3.0;
+        # fall back to the bare config on an older native extension.
+        if hasattr(taccap.ForcePositionConfig, "for_spec"):
+            force_cfg = taccap.ForcePositionConfig.for_spec(self._gripper.motor.get_spec())
+        else:
+            force_cfg = taccap.ForcePositionConfig()
         missing_fields = []
         for name in (
             "close_speed_radps",

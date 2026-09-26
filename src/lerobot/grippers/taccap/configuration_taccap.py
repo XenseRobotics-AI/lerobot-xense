@@ -118,22 +118,20 @@ class TaccapFollowerConfig(GripperConfig):
     # loop skips fields the SDK no longer declares. Removed rather than left
     # looking tunable.
     #
-    # 力矩三兄弟也不在这里了,一律走 SDK 默认:
+    # 力矩三兄弟也不在这里了,一律由 SDK 按设备装的电机给出
+    #   (ForcePositionConfig.for_spec(motor.get_spec()),见 taccap_follower.py):
     #
-    #   grasp_torque_nm (SDK 1.1) —— 暴露它只会让人配出得不到的值。固件的
-    #     clamp_torque 上限是 min(cont, effective_peak),本机包络 cont=1.1,
-    #     所以配 1.8 实际拿到的还是 1.1,只多换来 I2t 累积和掉电风险。SDK 那段
-    #     注释记着一次现场事故:1.5Nm 夹持对 1.6Nm 包络就把板子拉到欠压、连
-    #     USB 一起断。(我们的 recipe 之前配的正是 1.8 对 1.1。)
-    #     注意 1.1 不等于"永远安全":实测持续 1.1Nm 十分钟,电机 33->58°C 且
-    #     未收敛。它是厂商的连续额定,不是无限期保证。
+    #   grasp_torque_nm = 电机的**连续堵转额定**:EL05 1.1 Nm、RS00 3.6 Nm。这是
+    #     硬要求 —— 被挡住的爪子无限期坐在它上面,超过它 SDK 的 start() 直接拒绝。
+    #     固件包络 cont 也严格等于它。暴露它只会让人配出得不到或不能长期维持的值。
+    #     SDK 注释记着一次现场事故:EL05 上 1.5Nm 夹持对 1.6Nm 包络把板子拉到欠压、
+    #     连 USB 一起断。
     #
-    #   hold_torque_limit_nm —— 在当前控制律里**已经不钳任何输出**,只用来
-    #     校验 grasp 的上界并在超过电机额定时告警。grasp 不可配之后它无事可做。
+    #   hold_torque_limit_nm = 电机旋转额定(EL05 1.8 / RS00 5.0),校验 grasp 上界。
     #
-    #   motion_torque_limit_nm —— 仍有实功能(预算外钳位 + 反馈超限跳故障),
-    #     但 SDK 默认 6.0 就是器件上限,且启动时会和电机的 0x700B 交叉核对、
-    #     以设备值为准。上层调低它属于刻意收紧安全边界,没人在做。
+    #   motion_torque_limit_nm = 电机力矩量程 t_max(EL05 6.0 / RS00 14.0)。启动时
+    #     和电机的 0x700B 交叉核对:0x700B 高于它 SDK 拒绝启动 —— 所以不能用裸的
+    #     ForcePositionConfig()(EL05 的 6.0),RS00 上 0x700B 是 14。
     close_speed_radps: float = 3.0
     status_timeout_ms: int = 350
 
