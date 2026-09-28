@@ -49,13 +49,15 @@ from lerobot.robots.bi_elite_cs66_rt.config_bi_elite_cs66_rt import (
 )
 from lerobot.robots.elite_cs66_rt import elite_cs66_rt as _elite_mod
 from lerobot.robots.elite_cs66_rt.elite_cs66_rt import (
-    _clamp_tcp_velocity,
+    _configure_native_driver,
+    _controller_tcp_to_pose6,
     _import_elite_sdk,
+    _matrix_to_pose6,
+    _pose6_to_matrix,
     _quaternion_to_rotvec,
     _reach_exceeded,
     _rotvec_continuity_shift,
     _rotvec_to_quaternion,
-    _slerp_quaternion_wxyz,
 )
 from lerobot.robots.elite_cs66_rt.manipulability import (
     SELFCHECK_POS_TOL_M,
@@ -128,19 +130,8 @@ class BiEliteCS66RT(Robot):
         }
 
         self._last_tcp_command: dict[str, np.ndarray | None] = dict.fromkeys(_SIDES)
-        self._target_tcp_command: dict[str, np.ndarray | None] = dict.fromkeys(_SIDES)
-        self._servo_thread: dict[str, threading.Thread | None] = dict.fromkeys(_SIDES)
-        self._servo_stop_event: dict[str, threading.Event] = {s: threading.Event() for s in _SIDES}
         self._servo_lock: dict[str, threading.Lock] = {s: threading.Lock() for s in _SIDES}
-        self._servo_error: dict[str, BaseException | None] = dict.fromkeys(_SIDES)
-        self._last_action_time: dict[str, float] = dict.fromkeys(_SIDES, 0.0)
         self._start_tcp_pose: dict[str, np.ndarray | None] = dict.fromkeys(_SIDES)
-        self._reset_start_tcp_pose: dict[str, np.ndarray | None] = dict.fromkeys(_SIDES)
-        self._reset_target_tcp_pose: dict[str, np.ndarray | None] = dict.fromkeys(_SIDES)
-        self._reset_start_time: dict[str, float] = dict.fromkeys(_SIDES, 0.0)
-        self._reset_end_time: dict[str, float] = dict.fromkeys(_SIDES, 0.0)
-        self._reset_moving: dict[str, bool] = dict.fromkeys(_SIDES, False)
-        self._external_command_received: dict[str, bool] = dict.fromkeys(_SIDES, False)
         self._reach_warn_time: dict[str, float] = dict.fromkeys(_SIDES, 0.0)  # workspace-guard warn throttle
         # Singularity damping, per arm (set up at connect; disabled unless DH + self-check pass).
         self._dh: dict[str, tuple[list[float], list[float], list[float]] | None] = dict.fromkeys(_SIDES)
@@ -162,7 +153,25 @@ class BiEliteCS66RT(Robot):
         # only); world_yaw γ aligns each arm's heading into ONE shared gravity-
         # aligned world frame (x=facing, y=left, z=up). Used at the get_observation
         # / send_action boundaries; all internal servo state stays in base frame.
-        self._R_wb: dict[str, np.ndarray] = {side: self._resolve_world_rotation(config, side) for side in _SIDES}
+        self._R_wb: dict[str, np.ndarray] = {
+            side: np.eye(3) if config.native_assembly is not None else self._resolve_world_rotation(config, side)
+            for side in _SIDES
+        }
+        self._p_wb = {side: np.zeros(3, dtype=np.float64) for side in _SIDES}
+        self._assembly = None
+        if config.native_assembly is not None:
+            from libpyelite.assembly import Assembly
+
+            self._assembly = Assembly(config.native_assembly)
+            for side in _SIDES:
+                transform = self._assembly.world_from_base(side)
+                self._R_wb[side] = transform[:3, :3]
+                self._p_wb[side] = transform[:3, 3]
+                self.logger.info(
+                    f"{side} assembly={config.native_assembly}: "
+                    f"world<-base xyz(m)={self._p_wb[side].tolist()}, "
+                    f"control_model={self._assembly.control_model_path(side)}"
+                )
 
         # In taccap_follower + auto-discover mode the wrist + GSPS tactile cameras belong
         # to the gripper hardware, so sniff them now and add to config.cameras before the
@@ -252,7 +261,7 @@ class BiEliteCS66RT(Robot):
         """Lift a base-frame ``[x,y,z,rx,ry,rz]`` (rotvec) pose into world frame."""
         R_wb = self._R_wb[side]
         pose6 = np.asarray(pose6, dtype=np.float64)
-        pos = R_wb @ pose6[:3]
+        pos = R_wb @ pose6[:3] + getattr(self, "_p_wb", {side: np.zeros(3)})[side]
         rot = R_wb @ Rotation.from_rotvec(pose6[3:6]).as_matrix()
         rotvec = Rotation.from_matrix(rot).as_rotvec()
         return np.concatenate([pos, rotvec])
@@ -261,7 +270,8 @@ class BiEliteCS66RT(Robot):
         """Map a world-frame ``[x,y,z,rx,ry,rz]`` (rotvec) pose back to base frame."""
         R_bw = self._R_wb[side].T
         pose6 = np.asarray(pose6, dtype=np.float64)
-        pos = R_bw @ pose6[:3]
+        p_wb = getattr(self, "_p_wb", {side: np.zeros(3)})[side]
+        pos = R_bw @ (pose6[:3] - p_wb)
         rot = R_bw @ Rotation.from_rotvec(pose6[3:6]).as_matrix()
         rotvec = Rotation.from_matrix(rot).as_rotvec()
         return np.concatenate([pos, rotvec])
@@ -425,6 +435,9 @@ class BiEliteCS66RT(Robot):
             cfg.script_file_path = str(Path(self.config.script_file_path).expanduser())
         else:
             cfg.script_file_path = self._resolve_sdk_resource("external_control.script")
+        _configure_native_driver(cfg, self.config, getattr(self.config, f"{side}_tool_transform"))
+        if self._assembly is not None:
+            cfg.model_path = self._assembly.control_model_path(side)
         return cfg
 
     # =========================================================================
@@ -436,14 +449,7 @@ class BiEliteCS66RT(Robot):
             raise DeviceAlreadyConnectedError(f"{self} already connected, do not run connect() twice.")
 
         self._cs = _import_elite_sdk()
-        # RT scheduling is best-effort (needs CAP_SYS_NICE / rtprio). Disable via
-        # servo_fifo_scheduling=False — two FIFO-99 servo threads + the GIL can
-        # priority-invert and stall one arm's feeding (see config docstring).
-        if self.config.servo_fifo_scheduling:
-            try:
-                self._cs.setCurrentThreadFiFoScheduling(self._cs.getThreadFiFoMaxPriority())
-            except Exception as exc:
-                self.logger.warn(f"Failed to enable FIFO scheduling for Bi Elite CS66 control thread: {exc}")
+        # Native workers own the high-rate path; preserve the Python station logic.
 
         try:
             # --- Bring up both controllers (+ their grippers) in parallel ---
@@ -492,20 +498,18 @@ class BiEliteCS66RT(Robot):
                 try:
                     premove = (
                         np.asarray(self._rtsi[side].getActualJointPositions(), dtype=np.float64),
-                        np.asarray(self._rtsi[side].getActualTCPPose(), dtype=np.float64),
+                        _controller_tcp_to_pose6(self._rtsi[side].getActualTCPPose()),
                     )
                 except Exception:
                     premove = None
             if go_to_start:
                 self._move_j_blocking(side, self._arm_start_pose(side), self.config.start_move_duration_s)
             if self.config.control_mode == BiEliteCS66RTControlMode.CARTESIAN_SERVO:
-                current_tcp = np.asarray(self._rtsi[side].getActualTCPPose(), dtype=np.float64)
+                current_tcp = _controller_tcp_to_pose6(self._rtsi[side].getActualTCPPose())
                 self._last_tcp_command[side] = current_tcp.copy()
-                self._target_tcp_command[side] = current_tcp.copy()
                 self._start_tcp_pose[side] = current_tcp.copy()
-                self._last_action_time[side] = time.monotonic()
-                if self.config.use_background_servo_loop:
-                    self._start_servo_loop(side)
+            self._start_servo_loop(side)
+            if self.config.control_mode == BiEliteCS66RTControlMode.CARTESIAN_SERVO:
                 if self.config.singularity_w_high is not None or self.config.joint_vel_limits_rad_s is not None:
                     self._setup_singularity_damping(side, premove)
 
@@ -692,219 +696,30 @@ class BiEliteCS66RT(Robot):
     # =========================================================================
 
     def _start_servo_loop(self, side: str) -> None:
-        if self._servo_thread[side] is not None and self._servo_thread[side].is_alive():
-            return
-        self._servo_error[side] = None
-        self._servo_stop_event[side].clear()
-        thread = threading.Thread(
-            target=self._servo_loop,
-            args=(side,),
-            name=f"BiEliteCS66RTServoLoop-{side}-{self.config.id or hex(id(self))}",
-            daemon=True,
-        )
-        self._servo_thread[side] = thread
-        thread.start()
+        assert self._driver[side] is not None and self._rtsi[side] is not None
+        self._driver[side].startServo(self._rtsi[side])
 
     def _stop_servo_loop(self, side: str) -> None:
-        self._servo_stop_event[side].set()
-        thread = self._servo_thread[side]
-        if thread is not None:
-            thread.join(timeout=2.0)
-            self._servo_thread[side] = None
-
-    def _servo_loop(self, side: str) -> None:
-        driver = self._driver[side]
-        assert driver is not None
-        assert self._cs is not None
-
-        if self.config.servo_fifo_scheduling:
-            try:
-                self._cs.setCurrentThreadFiFoScheduling(self._cs.getThreadFiFoMaxPriority())
-            except Exception as exc:
-                self.logger.warn(f"Failed to enable FIFO scheduling for {side} servo loop: {exc}")
-
-        lock = self._servo_lock[side]
-        stop_event = self._servo_stop_event[side]
-        next_tick = time.monotonic()
-        consecutive_failures = 0
-        max_consecutive_failures = self.config.servo_failure_tolerance_ticks
-        while not stop_event.is_set():
-            try:
-                now = time.monotonic()
-                with lock:
-                    target, reset_active = self._get_servo_target_locked(side, now)
-                    last_action_time = self._last_action_time[side]
-
-                if target is None or not reset_active and not self._external_command_received[side]:
-                    driver.writeIdle(self.config.command_timeout_ms)
-                else:
-                    if not reset_active and now - last_action_time > self.config.command_stale_timeout_s:
-                        driver.writeIdle(self.config.command_timeout_ms)
-                    else:
-                        ok = driver.writeServoj(target.tolist(), self.config.command_timeout_ms, True)
-                        if not ok:
-                            consecutive_failures += 1
-                            if consecutive_failures == 1:
-                                self._log_servoj_failure(side, target)
-                            if consecutive_failures > max_consecutive_failures:
-                                raise RuntimeError(
-                                    f"Elite writeServoj(cartesian=True) failed "
-                                    f"{consecutive_failures} ticks in a row ({side})."
-                                )
-                        else:
-                            consecutive_failures = 0
-                            with lock:
-                                self._last_tcp_command[side] = target
-
-                next_tick += self.config.servoj_time
-                sleep_s = next_tick - time.monotonic()
-                if sleep_s > 0:
-                    time.sleep(sleep_s)
-                else:
-                    next_tick = time.monotonic()
-            except BaseException as exc:
-                self._servo_error[side] = exc
-                stop_event.set()
-                break
-
-    def _get_servo_target_locked(self, side: str, now: float) -> tuple[np.ndarray | None, bool]:
-        if self._reset_moving[side]:
-            if self._reset_start_tcp_pose[side] is None or self._reset_target_tcp_pose[side] is None:
-                self._reset_moving[side] = False
-            elif now >= self._reset_end_time[side]:
-                target = self._reset_target_tcp_pose[side].copy()
-                self._target_tcp_command[side] = target.copy()
-                self._last_action_time[side] = now
-                self._last_tcp_command[side] = target.copy()
-                self._reset_moving[side] = False
-                return target, True
-            else:
-                duration = max(self._reset_end_time[side] - self._reset_start_time[side], self.config.servoj_time)
-                alpha = self._min_jerk((now - self._reset_start_time[side]) / duration)
-                target = self._interpolate_tcp_pose(
-                    self._reset_start_tcp_pose[side], self._reset_target_tcp_pose[side], alpha
-                )
-                self._last_action_time[side] = now
-                return target, True
-
-        target = None if self._target_tcp_command[side] is None else self._target_tcp_command[side].copy()
-        # Opt-in velocity ceiling (per arm): slew the commanded TCP toward the
-        # latest target at <= max_*_speed (per servoj_time tick), so a jumpy target
-        # ramps smoothly instead of stepping past the controller's joint-speed
-        # bound. No-op (and no cost) when both caps are None.
-        last = self._last_tcp_command[side]
-        if (
-            target is not None
-            and last is not None
-            and (self.config.max_lin_speed is not None or self.config.max_ang_speed is not None)
-        ):
-            target = _clamp_tcp_velocity(
-                last,
-                target,
-                self.config.servoj_time,
-                self.config.max_lin_speed,
-                self.config.max_ang_speed,
-            )
-        return target, False
+        if self._driver[side] is not None:
+            self._driver[side].stopServo()
 
     def _is_reset_moving_locked(self, side: str, now: float) -> bool:
-        if not self._reset_moving[side]:
-            return False
-        if now < self._reset_end_time[side]:
-            return True
-        if self._reset_target_tcp_pose[side] is not None:
-            self._target_tcp_command[side] = self._reset_target_tcp_pose[side].copy()
-            self._last_tcp_command[side] = self._reset_target_tcp_pose[side].copy()
-            self._last_action_time[side] = now
-        self._reset_moving[side] = False
-        return False
+        return self._driver[side] is not None and self._driver[side].status().reset_active
 
     def _raise_servo_error_if_any(self, side: str) -> None:
-        if self._servo_error[side] is not None:
-            raise RuntimeError(
-                f"Bi Elite CS66 background servo loop failed ({side}): {self._servo_error[side]}"
-            ) from self._servo_error[side]
+        if self._driver[side] is not None:
+            self._driver[side].check_error()
 
-    # =========================================================================
-    # MoveJ trajectory primitive (per arm)
-    # =========================================================================
+    _interpolate_tcp_pose = staticmethod(_elite_mod.EliteCS66RT._interpolate_tcp_pose)
 
     def _move_j_blocking(self, side: str, target_joints: list[float], duration_s: float) -> None:
         driver = self._driver[side]
         assert driver is not None
-        if len(target_joints) != 6:
-            raise ValueError(f"_move_j_blocking expects 6 joint angles, got {len(target_joints)}")
-
-        servo_was_running = self._servo_thread[side] is not None and self._servo_thread[side].is_alive()
-        if servo_was_running:
-            self._stop_servo_loop(side)
-
-        done_event = threading.Event()
-        result_box: dict[str, Any] = {}
-
-        def _on_done(result):
-            result_box["result"] = result
-            done_event.set()
-
-        driver.setTrajectoryResultCallback(_on_done)
-        timeout_ms = self.config.move_j_timeout_ms
-
-        try:
-            if not driver.writeTrajectoryControlAction(self._cs.TrajectoryControlAction.START, 1, timeout_ms):
-                raise RuntimeError("writeTrajectoryControlAction(START) failed")
-            if not driver.writeTrajectoryPoint(list(target_joints), float(duration_s), 0.0, False):
-                raise RuntimeError("writeTrajectoryPoint failed")
-
-            deadline = time.monotonic() + duration_s + 5.0
-            while not done_event.is_set():
-                if not driver.writeTrajectoryControlAction(self._cs.TrajectoryControlAction.NOOP, 0, timeout_ms):
-                    raise RuntimeError("writeTrajectoryControlAction(NOOP) failed")
-                if time.monotonic() > deadline:
-                    raise TimeoutError(
-                        f"MoveJ ({side}) to {target_joints} did not complete within {duration_s + 5.0:.1f} s"
-                    )
-                time.sleep(0.02)
-
-            result = result_box.get("result")
-            if result is not None and result != self._cs.TrajectoryMotionResult.SUCCESS:
-                raise RuntimeError(f"MoveJ ({side}) finished with non-success result: {result}")
-        finally:
-            with contextlib.suppress(Exception):
-                driver.writeIdle(timeout_ms)
-            if servo_was_running:
-                with best_effort(self.logger, f"resyncing servo targets to the actual TCP ({side})", level="warn"):
-                    current_tcp = np.asarray(self._rtsi[side].getActualTCPPose(), dtype=np.float64)
-                    with self._servo_lock[side]:
-                        self._last_tcp_command[side] = current_tcp.copy()
-                        self._target_tcp_command[side] = current_tcp.copy()
-                        self._last_action_time[side] = time.monotonic()
-                        self._external_command_received[side] = False
-                self._start_servo_loop(side)
-
-    # =========================================================================
-    # Interpolation helpers (translated from the single-arm driver)
-    # =========================================================================
-
-    @staticmethod
-    def _min_jerk(alpha: float) -> float:
-        alpha = min(max(alpha, 0.0), 1.0)
-        return alpha * alpha * alpha * (10.0 + alpha * (-15.0 + 6.0 * alpha))
-
-    @staticmethod
-    def _interpolate_tcp_pose(start: np.ndarray, target: np.ndarray, alpha: float) -> np.ndarray:
-        pose = np.asarray(start, dtype=np.float64).copy()
-        target = np.asarray(target, dtype=np.float64)
-        pose[:3] = start[:3] + alpha * (target[:3] - start[:3])
-
-        start_quat = _rotvec_to_quaternion(start[3:6])
-        target_quat = _rotvec_to_quaternion(target[3:6])
-        interp_principal = _quaternion_to_rotvec(_slerp_quaternion_wxyz(start_quat, target_quat, alpha))
-        pose[3:6] = _rotvec_continuity_shift(interp_principal, start[3:6])
-        return pose
-
-    # =========================================================================
-    # Observation
-    # =========================================================================
+        was_running = driver.status().running
+        self._stop_servo_loop(side)
+        driver.moveJ(list(target_joints), float(duration_s), self.config.move_j_timeout_ms)
+        if was_running:
+            self._start_servo_loop(side)
 
     def _tcp_rotvec_to_feature_values(self, side: str, tcp_pose: np.ndarray) -> dict[str, float]:
         pos_keys = self._tcp_pos_keys[side]
@@ -946,7 +761,7 @@ class BiEliteCS66RT(Robot):
             if self.config.observe_tcp:
                 # RTSI reports the TCP pose in the (tilted) base frame; lift it
                 # into the gravity-aligned world frame before publishing.
-                tcp_pose = np.asarray(rtsi.getActualTCPPose(), dtype=np.float64)
+                tcp_pose = _controller_tcp_to_pose6(rtsi.getActualTCPPose())
                 tcp_world = self._base_pose6_to_world(side, tcp_pose)
                 obs.update(self._tcp_rotvec_to_feature_values(side, tcp_world))
             if self.config.observe_joints:
@@ -1037,7 +852,7 @@ class BiEliteCS66RT(Robot):
             q0, t0 = premove_sample
             q0 = np.asarray(q0, dtype=np.float64)
             if int(np.sum(np.abs(q0 - q1) >= 0.3)) >= 3:  # well-separated configs
-                t1 = np.asarray(self._rtsi[side].getActualTCPPose(), dtype=np.float64)
+                t1 = _controller_tcp_to_pose6(self._rtsi[side].getActualTCPPose())
                 pos_drift_m, rot_drift_deg = tool_consistency(dh, q0, t0, q1, t1)
                 # Gate on POSITION drift only (validates the DH for the Jacobian); a large ROTATION
                 # drift is a benign about-flange-Z TCP-convention artifact not in det(J) — log, don't
@@ -1230,16 +1045,19 @@ class BiEliteCS66RT(Robot):
         with self._servo_lock[side]:
             last_tcp = None if self._last_tcp_command[side] is None else self._last_tcp_command[side].copy()
 
+        if self._driver[side] is not None and self._driver[side].status().running:
+            last_tcp = _matrix_to_pose6(self._driver[side].commanded_pose())
+
         if last_tcp is not None:
             last_base = last_tcp
         else:
             assert self._rtsi[side] is not None
-            last_base = np.asarray(self._rtsi[side].getActualTCPPose(), dtype=np.float64)
+            last_base = _controller_tcp_to_pose6(self._rtsi[side].getActualTCPPose())
 
         # The incoming action is in the world frame; merge it against the last
         # commanded pose expressed in world so partial (position-only) actions
         # keep the same per-axis semantics as the single-arm driver, then map the
-        # merged target back into base for the servo loop / SDK IK.
+        # merged target back into base for native interpolation / Pink-style IK.
         target_world = self._base_pose6_to_world(side, last_base)
 
         pos_keys = self._tcp_pos_keys[side]
@@ -1282,7 +1100,7 @@ class BiEliteCS66RT(Robot):
         if not self.config.trace_servoj:
             return
         try:
-            current = np.asarray(self._rtsi[side].getActualTCPPose(), dtype=np.float64)
+            current = _controller_tcp_to_pose6(self._rtsi[side].getActualTCPPose())
         except Exception:
             return
         last = self._last_tcp_command[side].copy() if self._last_tcp_command[side] is not None else current.copy()
@@ -1337,28 +1155,16 @@ class BiEliteCS66RT(Robot):
         gripper_key = self._gripper_key[side]
 
         if self.config.control_mode == BiEliteCS66RTControlMode.CARTESIAN_SERVO:
-            if self.config.use_background_servo_loop:
-                with self._servo_lock[side]:
-                    reset_moving = self._is_reset_moving_locked(side, time.monotonic())
-                if reset_moving:
-                    if gripper is not None and gripper_key in action:
-                        gripper.set_gripper_position(float(action[gripper_key]))
-                        sent[gripper_key] = float(action[gripper_key])
-                    return
+            if driver.status().reset_active:
+                if gripper is not None and gripper_key in action:
+                    gripper.set_gripper_position(float(action[gripper_key]))
+                    sent[gripper_key] = float(action[gripper_key])
+                return
 
             target_tcp = self._cartesian_action_to_tcp_pose(side, action)
             self._trace_send_action(side, action, target_tcp)
-            if self.config.use_background_servo_loop:
-                with self._servo_lock[side]:
-                    self._target_tcp_command[side] = target_tcp.copy()
-                    self._last_action_time[side] = time.monotonic()
-                    self._external_command_received[side] = True
-            else:
-                ok = driver.writeServoj(target_tcp.tolist(), self.config.command_timeout_ms, True)
-                if not ok:
-                    raise RuntimeError(f"Elite writeServoj(cartesian=True) failed ({side}).")
-                self._last_tcp_command[side] = target_tcp
-                self._external_command_received[side] = True
+            driver.submit_target(_pose6_to_matrix(target_tcp))
+            self._last_tcp_command[side] = target_tcp.copy()
             # Report the sent pose back in the world frame so callers (display /
             # replay) stay consistent with get_observation. The dataset action is
             # recorded from the teleop/policy action, not this return value.
@@ -1372,9 +1178,7 @@ class BiEliteCS66RT(Robot):
             assert self._rtsi[side] is not None
             current_joints = list(self._rtsi[side].getActualJointPositions())
             self._trace_send_action_joint(side, target_joints, current_joints)
-            ok = driver.writeServoj(target_joints, self.config.command_timeout_ms, False)
-            if not ok:
-                raise RuntimeError(f"Elite writeServoj(cartesian=False) failed ({side}).")
+            driver.submit_joints(target_joints)
             sent.update(dict(zip(joint_keys, target_joints, strict=True)))
 
         if gripper is not None and gripper_key in action:
@@ -1395,68 +1199,27 @@ class BiEliteCS66RT(Robot):
                 futs[side].result()
 
     def _reset_arm(self, side: str) -> None:
+        self._raise_servo_error_if_any(side)
         if self.config.control_mode != BiEliteCS66RTControlMode.CARTESIAN_SERVO:
             self._move_j_blocking(side, self._arm_start_pose(side), self.config.reset_duration_s)
-            return
-
-        if self._start_tcp_pose[side] is None:
-            return
-
-        if self.config.use_background_servo_loop:
-            assert self._rtsi[side] is not None
-            now = time.monotonic()
-            with self._servo_lock[side]:
-                if self._is_reset_moving_locked(side, now):
-                    return
-                if self._last_tcp_command[side] is not None:
-                    self._reset_start_tcp_pose[side] = self._last_tcp_command[side].copy()
-                else:
-                    self._reset_start_tcp_pose[side] = np.asarray(self._rtsi[side].getActualTCPPose(), dtype=np.float64)
-                target_pose = self._start_tcp_pose[side].copy()
-                target_principal = _quaternion_to_rotvec(_rotvec_to_quaternion(target_pose[3:6]))
-                target_pose[3:6] = _rotvec_continuity_shift(target_principal, self._reset_start_tcp_pose[side][3:6])
-                self._reset_target_tcp_pose[side] = target_pose
-                self._reset_start_time[side] = now
-                self._reset_end_time[side] = now + self.config.reset_duration_s
-                self._reset_moving[side] = True
-                self._last_action_time[side] = now
-            return
-
-        driver = self._driver[side]
-        assert driver is not None
-        assert self._rtsi[side] is not None
-        if self._last_tcp_command[side] is not None:
-            start_pose = self._last_tcp_command[side].copy()
-        else:
-            start_pose = np.asarray(self._rtsi[side].getActualTCPPose(), dtype=np.float64)
-        target_pose = self._start_tcp_pose[side].copy()
-        target_principal = _quaternion_to_rotvec(_rotvec_to_quaternion(target_pose[3:6]))
-        target_pose[3:6] = _rotvec_continuity_shift(target_principal, start_pose[3:6])
-        start_time = time.monotonic()
-        duration = max(self.config.reset_duration_s, self.config.servoj_time)
-
-        while True:
-            now = time.monotonic()
-            alpha = (now - start_time) / duration
-            if alpha >= 1.0:
-                pose = target_pose
-            else:
-                pose = self._interpolate_tcp_pose(start_pose, target_pose, self._min_jerk(alpha))
-            ok = driver.writeServoj(pose.tolist(), self.config.command_timeout_ms, True)
-            if not ok:
-                raise RuntimeError(f"Elite writeServoj(cartesian=True) failed during reset ({side}).")
-            self._last_tcp_command[side] = pose
-            if alpha >= 1.0:
-                break
-            time.sleep(self.config.servoj_time)
+        elif self._start_tcp_pose[side] is not None and not self._driver[side].status().reset_active:
+            self._driver[side].submit_target(_pose6_to_matrix(self._start_tcp_pose[side]), self.config.reset_duration_s)
+            if not self.config.use_background_servo_loop:
+                while self._driver[side].status().reset_active:
+                    self._raise_servo_error_if_any(side)
+                    time.sleep(0.01)
 
     # =========================================================================
     # RT status + pose getters
     # =========================================================================
 
+    def get_native_status(self) -> dict[str, Any]:
+        """Per-arm native IK diagnostics, watchdog errors and planner overruns."""
+        return {side: self._driver[side].status() if self._driver[side] else None for side in _SIDES}
+
     @property
     def rt_running(self) -> bool:
-        return all(self._servo_thread[s] is not None and self._servo_thread[s].is_alive() for s in _SIDES)
+        return all(self._driver[s] is not None and self._driver[s].status().running for s in _SIDES)
 
     @property
     def rt_moving(self) -> bool:
@@ -1471,7 +1234,7 @@ class BiEliteCS66RT(Robot):
         assert rtsi is not None
         # Return the pose in the gravity-aligned world frame, consistent with
         # get_observation (RTSI reports it in the tilted base frame).
-        tcp_pose = self._base_pose6_to_world(side, np.asarray(rtsi.getActualTCPPose(), dtype=np.float64))
+        tcp_pose = self._base_pose6_to_world(side, _controller_tcp_to_pose6(rtsi.getActualTCPPose()))
         quat = _rotvec_to_quaternion(tcp_pose[3:6])
         gripper = self._gripper[side]
         gripper_pos = gripper.get_gripper_position() if gripper is not None else 0.0
@@ -1484,7 +1247,7 @@ class BiEliteCS66RT(Robot):
         if tcp_pose is None:
             rtsi = self._rtsi[side]
             assert rtsi is not None
-            tcp_pose = np.asarray(rtsi.getActualTCPPose(), dtype=np.float64)
+            tcp_pose = _controller_tcp_to_pose6(rtsi.getActualTCPPose())
         # ``tcp_pose`` (whether from RTSI or a passed-in _last_tcp_command) is in
         # the tilted base frame; lift it into world for a consistent report.
         tcp_pose = self._base_pose6_to_world(side, np.asarray(tcp_pose, dtype=np.float64))
@@ -1518,7 +1281,7 @@ class BiEliteCS66RT(Robot):
             raise DeviceNotConnectedError(f"{self} is not connected.")
         poses = []
         for side in _SIDES:
-            last = self._last_tcp_command[side]
+            last = _matrix_to_pose6(self._driver[side].commanded_pose()) if self._driver[side] is not None else None
             if last is None:
                 poses.append(self._arm_tcp_pose_euler(side))
             else:

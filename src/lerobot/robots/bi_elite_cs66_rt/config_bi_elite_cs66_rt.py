@@ -19,6 +19,7 @@ connect, so no gripper SN is configured. Action / observation keys are
 ``left_``/``right_`` prefixed.
 """
 
+import math
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
@@ -39,7 +40,7 @@ class BiEliteCS66RTControlMode(str, Enum):
 @RobotConfig.register_subclass("bi_elite_cs66_rt")
 @dataclass
 class BiEliteCS66RTConfig(RobotConfig):
-    """Configuration for two Elite CS66 arms via elite_cs_sdk.
+    """Configuration for two Elite CS66 arms via libpyelite.
 
     Each arm runs its own EliteDriver + RTSI stream + (optional) background
     Cartesian servo loop. ``send_action``/``get_observation`` use the same TCP /
@@ -97,27 +98,15 @@ class BiEliteCS66RTConfig(RobotConfig):
     servoj_time: float = 0.004
     servoj_lookahead_time: float = 0.1
     servoj_gain: int = 300
-    # Larger reverse-socket read timeout than the single-arm driver (200ms): the
-    # bimanual station runs 2 servo loops + 7 camera read threads + VR + the main
-    # loop, so a servo-loop thread can occasionally be GIL-starved >200ms, and the
-    # Elite controller would then drop external control ("socket timed out waiting
-    # for command on reverse_socket") -> writeServoj fails -> teleop crash. 500ms
-    # tolerance absorbs those intermittent stalls; the arm holds its last servoj
-    # target meanwhile (RT thread priority does not help — the GIL is the limiter).
+    # Preserve the station's reverse-socket receive timeout.
     command_timeout_ms: int = 500
+    # Native streaming always runs; this flag selects async vs blocking reset.
     use_background_servo_loop: bool = True
     # Host-side stale threshold; validated as command_stale_timeout_s*1000 >=
     # command_timeout_ms so the host keeps feeding (idle) before the controller times out.
     command_stale_timeout_s: float = 1.0
-    # SCHED_FIFO(99) on the per-arm servo threads. The bimanual driver runs TWO
-    # servo threads (vs one single-arm). Two FIFO-99 threads + the Python GIL can
-    # priority-invert: one servo thread waits on the GIL held by a normal-priority
-    # camera/VR thread that the OTHER FIFO-99 servo thread keeps preempting, so one
-    # arm stops feeding >command_timeout_ms and its controller drops external
-    # control ("socket timed out waiting for command on reverse_socket"). RT
-    # priority does not help GIL-bound Python anyway — set False to run the servo
-    # loops at normal priority (recommended for the camera-heavy bimanual station).
-    servo_fifo_scheduling: bool = True
+    # Deprecated compatibility field; no Python FIFO threads are created.
+    servo_fifo_scheduling: bool = False
     reset_duration_s: float = 3.0
     # Opt-in Cartesian velocity ceiling for the background servo loops (per arm).
     # Both None by default -> no PC-side clamp (controller envelope only). Set when
@@ -170,6 +159,19 @@ class BiEliteCS66RTConfig(RobotConfig):
     # 1e-2 silently under-predicts near a wrist singularity and lets the trip through — do NOT raise.
     # See config_elite_cs66_rt.py and manipulability.py.joint_velocity_scale.
     joint_vel_dls_lambda: float = 1e-4
+
+    # Native libpyelite planner; coordinates are still converted by this adapter.
+    native_model_path: str | Path | None = None
+    # Packaged assembly supplies arm chains and full world<-base transforms.
+    # None retains the legacy single-arm model and rotation-only mapping.
+    native_assembly: str | None = None
+    native_ik_max_iterations: int = 500
+    native_max_tcp_linear_velocity: float = 1.0  # m/s, planning cap
+    native_max_tcp_angular_velocity: float = 3.14  # rad/s, planning cap
+    native_joint_velocity_scale: float = 1.0  # fraction of official URDF limit
+    # Row-major tool0 <- TCP SE(3). None means identity; must match controller TCP.
+    left_tool_transform: list[float] | None = None
+    right_tool_transform: list[float] | None = None
 
     # ── Shared RTSI state stream ──
     rtsi_frequency: float = 250.0
@@ -295,8 +297,31 @@ class BiEliteCS66RTConfig(RobotConfig):
                 raise ValueError(f"payload_mass must be in [0, 10] kg when set, got {self.payload_mass}")
             if len(self.payload_cog) != 3:
                 raise ValueError(f"payload_cog must have 3 elements [x, y, z] (m), got {self.payload_cog}")
-        if not 0.002 <= self.servoj_time <= 0.01:
-            raise ValueError(f"servoj_time must be in [0.002, 0.01] s (CS-series RT envelope), got {self.servoj_time}")
+        if self.native_assembly is not None:
+            if self.native_assembly not in ("diagonal-07", "diagonal-08"):
+                raise ValueError("native_assembly must be diagonal-07 or diagonal-08")
+            if self.native_model_path is not None:
+                raise ValueError("native_model_path and native_assembly are mutually exclusive")
+        if self.native_ik_max_iterations < 1:
+            raise ValueError("native_ik_max_iterations must be positive")
+        for name in (
+            "native_max_tcp_linear_velocity",
+            "native_max_tcp_angular_velocity",
+            "native_joint_velocity_scale",
+        ):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        if self.native_joint_velocity_scale > 1:
+            raise ValueError("native_joint_velocity_scale must not exceed 1")
+        for name in ("left_tool_transform", "right_tool_transform"):
+            tool = getattr(self, name)
+            if tool is not None and (len(tool) != 16 or not all(math.isfinite(v) for v in tool)):
+                raise ValueError(f"{name} must be a finite row-major 4x4 transform")
+        if not 0.004 <= self.servoj_time <= 0.01:
+            raise ValueError(
+                f"servoj_time must be in [0.004, 0.01] s (native migration envelope), got {self.servoj_time}"
+            )
         if not 0.03 <= self.servoj_lookahead_time <= 0.2:
             raise ValueError(
                 "servoj_lookahead_time must be in [0.03, 0.2] (Elite SDK requirement), "
@@ -360,11 +385,6 @@ class BiEliteCS66RTConfig(RobotConfig):
                 "two arms' EliteDriver port blocks (reverse/sender/trajectory/script_command) do "
                 f"not overlap; got left={self.left_driver_port_offset}, "
                 f"right={self.right_driver_port_offset}"
-            )
-        if self.use_background_servo_loop and self.control_mode != BiEliteCS66RTControlMode.CARTESIAN_SERVO:
-            raise ValueError(
-                "use_background_servo_loop=True is only supported with control_mode=CARTESIAN_SERVO. "
-                "Set use_background_servo_loop=False for joint servo mode."
             )
 
     def _side_gripper(self, side: str, use_gripper: bool) -> GripperConfig | None:

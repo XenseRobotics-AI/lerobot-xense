@@ -8,8 +8,9 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-"""Configuration for Elite Robots CS66 arms via elite_cs_sdk."""
+"""Configuration for Elite Robots CS66 arms via libpyelite."""
 
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -77,7 +78,7 @@ class EliteCS66RTConfig(RobotConfig):
     The default mode follows the LeRobot Cartesian convention:
     actions/observations use tcp.x/y/z plus 6D rotation tcp.r1..tcp.r6, and the
     driver converts that pose to Elite's native [x, y, z, rx, ry, rz] rotvec
-    format before calling writeServoj(..., cartesian=True).
+    format at the SDK boundary; native IK takes SE(3) and sends joint servoJ.
     """
 
     robot_ip: str = "192.168.1.200"
@@ -94,7 +95,7 @@ class EliteCS66RTConfig(RobotConfig):
     observe_joints: bool = False
 
     # Elite external control script. When unset, connect() resolves
-    # elite_cs_sdk/external_control.script from the installed SDK package.
+    # libpyelite/external_control.script from the installed SDK package.
     script_file_path: str | Path | None = None
 
     # Servo streaming parameters. servoj_time is the controller's inner
@@ -117,9 +118,19 @@ class EliteCS66RTConfig(RobotConfig):
     servoj_lookahead_time: float = 0.1
     servoj_gain: int = 300
     command_timeout_ms: int = 200
+    # Native streaming always runs; this flag selects async vs blocking reset.
     use_background_servo_loop: bool = True
     command_stale_timeout_s: float = 0.5
     reset_duration_s: float = 3.0
+
+    # Native libpyelite planner; coordinates are still converted by this adapter.
+    native_model_path: str | Path | None = None
+    native_ik_max_iterations: int = 500
+    native_max_tcp_linear_velocity: float = 0.5  # m/s, planning cap
+    native_max_tcp_angular_velocity: float = 1.0  # rad/s, planning cap
+    native_joint_velocity_scale: float = 1.0  # fraction of official URDF limit
+    # Row-major tool0 <- TCP SE(3). None means identity; must match controller TCP.
+    tool_transform: list[float] | None = None
 
     # RTSI state stream.
     rtsi_frequency: float = 250.0
@@ -157,13 +168,7 @@ class EliteCS66RTConfig(RobotConfig):
     # fast handshakes don't pay the full sleep.
     external_control_settle_s: float = 1.0
 
-    # Number of consecutive writeServoj() failures the background servo
-    # loop tolerates before declaring itself dead. SDK reverse-socket writes
-    # can fail transiently right after the script comes up. Decoupled from
-    # external_control_settle_s so shrinking the connect-time settle doesn't
-    # also shrink the failure tolerance.
-    # 250 ticks * 0.004 s = 1 s of failure tolerance, matching the original
-    # tied-to-settle behavior.
+    # Deprecated compatibility field. Native write failures fault immediately.
     servo_failure_tolerance_ticks: int = 250
 
     # Trace every send_action and large per-step deltas to the spdlog file
@@ -277,14 +282,29 @@ class EliteCS66RTConfig(RobotConfig):
     _serial_autodiscover: bool = field(default=False, init=False)
 
     def __post_init__(self):
+        if self.native_ik_max_iterations < 1:
+            raise ValueError("native_ik_max_iterations must be positive")
+        for name in (
+            "native_max_tcp_linear_velocity",
+            "native_max_tcp_angular_velocity",
+            "native_joint_velocity_scale",
+        ):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        if self.native_joint_velocity_scale > 1:
+            raise ValueError("native_joint_velocity_scale must not exceed 1")
+        for name in ("tool_transform",):
+            tool = getattr(self, name)
+            if tool is not None and (len(tool) != 16 or not all(math.isfinite(v) for v in tool)):
+                raise ValueError(f"{name} must be a finite row-major 4x4 transform")
         super().__post_init__()
 
-        if not 0.002 <= self.servoj_time <= 0.01:
-            # Below 2 ms the controller's inner servo loop can't keep up; above
-            # 10 ms the script's per-tick extrapolation window grows large and
-            # target updates feel laggy. Default 4 ms matches the SDK example
-            # (250 Hz, the CS-series RT controller's native rate).
-            raise ValueError(f"servoj_time must be in [0.002, 0.01] s (CS-series RT envelope), got {self.servoj_time}")
+        if not 0.004 <= self.servoj_time <= 0.01:
+            # Migration baseline: >=4 ms, not a claim about hardware maximum rate.
+            raise ValueError(
+                f"servoj_time must be in [0.004, 0.01] s (native migration envelope), got {self.servoj_time}"
+            )
         if not 0.03 <= self.servoj_lookahead_time <= 0.2:
             # Elite SDK EliteDriver.hpp says lookahead time must lie in [0.03, 0.2];
             # values outside this range cause the external_control script to abort
@@ -350,11 +370,6 @@ class EliteCS66RTConfig(RobotConfig):
             raise ValueError(f"external_control_settle_s must be >= 0, got {self.external_control_settle_s}")
         if self.servo_failure_tolerance_ticks < 1:
             raise ValueError(f"servo_failure_tolerance_ticks must be >= 1, got {self.servo_failure_tolerance_ticks}")
-        if self.use_background_servo_loop and self.control_mode != EliteCS66RTControlMode.CARTESIAN_SERVO:
-            raise ValueError(
-                "use_background_servo_loop=True is only supported with control_mode=CARTESIAN_SERVO. "
-                "Set use_background_servo_loop=False for joint servo mode."
-            )
 
         # ── Cameras ── With auto-discovery on, the wrist + tactile cameras travel
         # with the gripper, so the robot sniffs them at connect (see
