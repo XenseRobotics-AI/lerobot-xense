@@ -1,11 +1,18 @@
 """Offline adapter contract: model selection, TCP passthrough, world/base SE(3)."""
 
 import unittest
+from importlib.util import find_spec
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-import libpyelite
 import numpy as np
+import pytest
+
+# Skip only an absent SDK; broken installations must still fail collection.
+if find_spec("libpyelite") is None:
+    pytest.skip("libpyelite SDK not installed", allow_module_level=True)
+
+import libpyelite
 from libpyelite.assembly import Assembly
 
 from lerobot.robots.bi_elite_cs66_rt.bi_elite_cs66_rt import BiEliteCS66RT

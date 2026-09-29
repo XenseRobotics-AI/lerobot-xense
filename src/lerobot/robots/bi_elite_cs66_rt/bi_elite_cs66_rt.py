@@ -509,9 +509,10 @@ class BiEliteCS66RT(Robot):
                 self._last_tcp_command[side] = current_tcp.copy()
                 self._start_tcp_pose[side] = current_tcp.copy()
             self._start_servo_loop(side)
-            if self.config.control_mode == BiEliteCS66RTControlMode.CARTESIAN_SERVO:
-                if self.config.singularity_w_high is not None or self.config.joint_vel_limits_rad_s is not None:
-                    self._setup_singularity_damping(side, premove)
+            if self.config.control_mode == BiEliteCS66RTControlMode.CARTESIAN_SERVO and (
+                self.config.singularity_w_high is not None or self.config.joint_vel_limits_rad_s is not None
+            ):
+                self._setup_singularity_damping(side, premove)
 
         try:
             if go_to_start:

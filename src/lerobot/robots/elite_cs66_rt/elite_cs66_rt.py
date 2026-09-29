@@ -583,9 +583,10 @@ class EliteCS66RT(Robot):
             self._start_tcp_pose = current_tcp.copy()
         try:
             self._start_servo_loop()
-            if self.config.control_mode == EliteCS66RTControlMode.CARTESIAN_SERVO:
-                if self.config.singularity_w_high is not None or self.config.joint_vel_limits_rad_s is not None:
-                    self._setup_singularity_damping(premove_sample)
+            if self.config.control_mode == EliteCS66RTControlMode.CARTESIAN_SERVO and (
+                self.config.singularity_w_high is not None or self.config.joint_vel_limits_rad_s is not None
+            ):
+                self._setup_singularity_damping(premove_sample)
         except BaseException:
             self._is_connected = False
             self._cleanup_after_failed_connect()
