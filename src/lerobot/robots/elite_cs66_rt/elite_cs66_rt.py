@@ -62,12 +62,46 @@ JOINT_EFFORT_KEYS = tuple(f"joint_{i}.effort" for i in range(1, 7))
 
 def _import_elite_sdk():
     try:
-        return importlib.import_module("elite_cs_sdk")
+        return importlib.import_module("libpyelite")
     except ImportError as exc:
         raise ImportError(
-            "elite_cs_sdk is not installed in this environment. Install/build the Elite CS SDK "
+            "libpyelite is not installed in this environment. Build/install its wheel "
             "inside the active LeRobot environment before connecting an Elite CS66 robot."
         ) from exc
+
+
+def _pose6_to_matrix(pose: np.ndarray) -> np.ndarray:
+    """Convert the existing controller pose boundary to native SE(3)."""
+    pose = np.asarray(pose, dtype=np.float64)
+    if pose.shape != (6,) or not np.isfinite(pose).all():
+        raise ValueError("Expected finite six-element controller pose")
+    matrix = np.eye(4)
+    matrix[:3, :3] = Rotation.from_rotvec(pose[3:]).as_matrix()
+    matrix[:3, 3] = pose[:3]
+    return matrix
+
+
+def _matrix_to_pose6(matrix: np.ndarray) -> np.ndarray:
+    matrix = np.asarray(matrix, dtype=np.float64)
+    return np.concatenate((matrix[:3, 3], Rotation.from_matrix(matrix[:3, :3]).as_rotvec()))
+
+
+def _configure_native_driver(cfg, config, tool) -> None:
+    cfg.ik.max_iterations = config.native_ik_max_iterations
+    cfg.planner.stale_timeout = config.command_stale_timeout_s
+    cfg.planner.max_linear_velocity = config.native_max_tcp_linear_velocity
+    cfg.planner.max_angular_velocity = config.native_max_tcp_angular_velocity
+    # Keep existing recipe caps effective after moving the servo loop to C++.
+    if config.max_lin_speed is not None:
+        cfg.planner.max_linear_velocity = min(cfg.planner.max_linear_velocity, config.max_lin_speed)
+    if config.max_ang_speed is not None:
+        cfg.planner.max_angular_velocity = min(cfg.planner.max_angular_velocity, config.max_ang_speed)
+    cfg.planner.velocity_scale = config.native_joint_velocity_scale
+    cfg.command_timeout_ms = config.command_timeout_ms
+    if config.native_model_path is not None:
+        cfg.model_path = str(Path(config.native_model_path).expanduser())
+    if tool is not None:
+        cfg.tool = list(tool)
 
 
 def _rotvec_to_quaternion(rotvec: np.ndarray) -> np.ndarray:
@@ -80,6 +114,22 @@ def _quaternion_to_rotvec(quat_wxyz: np.ndarray) -> np.ndarray:
     if quat.shape != (4,):
         raise ValueError(f"Expected quaternion [qw, qx, qy, qz], got shape {quat.shape}")
     return Rotation.from_quat(np.array([quat[1], quat[2], quat[3], quat[0]])).as_rotvec()
+
+
+def _controller_tcp_to_pose6(tcp_pose: np.ndarray) -> np.ndarray:
+    """Convert Elite RTSI [x,y,z,roll,pitch,yaw] feedback to rotvec."""
+    tcp_pose = np.asarray(tcp_pose, dtype=np.float64)
+    if tcp_pose.shape != (6,) or not np.isfinite(tcp_pose).all():
+        raise ValueError("Expected finite six-element Elite TCP feedback")
+    roll, pitch, yaw = tcp_pose[3:]
+    matrix = np.eye(4)
+    matrix[:3, :3] = (
+        Rotation.from_rotvec([0.0, 0.0, yaw]).as_matrix()
+        @ Rotation.from_rotvec([0.0, pitch, 0.0]).as_matrix()
+        @ Rotation.from_rotvec([roll, 0.0, 0.0]).as_matrix()
+    )
+    matrix[:3, 3] = tcp_pose[:3]
+    return _matrix_to_pose6(matrix)
 
 
 def _rotvec_continuity_shift(target_rotvec: np.ndarray, reference_rotvec: np.ndarray) -> np.ndarray:
@@ -196,7 +246,7 @@ def _slerp_quaternion_wxyz(q0: np.ndarray, q1: np.ndarray, alpha: float) -> np.n
 
 
 class EliteCS66RT(Robot):
-    """Single Elite CS66 arm using elite_cs_sdk external control.
+    """Single Elite CS66 arm using libpyelite external control.
 
     Cartesian mode:
         action/observation features are tcp.x/y/z plus tcp.r1..tcp.r6.
@@ -218,6 +268,7 @@ class EliteCS66RT(Robot):
     # (see RtsiRecipe.hpp::getValue), which would otherwise let the robot
     # MoveJ toward the world origin on the first reset.
     _REQUIRED_RTSI_OUTPUT_FIELDS = (
+        "timestamp",
         "actual_TCP_pose",
         "actual_joint_positions",
         "actual_joint_speeds",
@@ -237,24 +288,13 @@ class EliteCS66RT(Robot):
         self._is_connected = False
         self._gripper: Gripper | None = make_gripper_from_config(config.gripper)
         self._last_tcp_command: np.ndarray | None = None
-        self._target_tcp_command: np.ndarray | None = None
         self._reach_warn_time: float = 0.0  # throttle for the workspace-guard warning
         # Singularity damping (set up at connect; stays disabled unless DH + self-check pass).
         self._dh: tuple[list[float], list[float], list[float]] | None = None
         self._damping_enabled: bool = False
         self._w_log_time: float = 0.0
-        self._servo_thread: threading.Thread | None = None
-        self._servo_stop_event = threading.Event()
         self._servo_lock = threading.Lock()
-        self._servo_error: BaseException | None = None
-        self._last_action_time = 0.0
         self._start_tcp_pose: np.ndarray | None = None
-        self._reset_start_tcp_pose: np.ndarray | None = None
-        self._reset_target_tcp_pose: np.ndarray | None = None
-        self._reset_start_time = 0.0
-        self._reset_end_time = 0.0
-        self._reset_moving = False
-        self._external_command_received = False
 
         # External cameras — with the gripper's cameras auto-discovered, resolve
         # the wrist camera + GSPS tactile SNs from hardware and inject them into
@@ -357,7 +397,7 @@ class EliteCS66RT(Robot):
         assert self._cs is not None
         module_file = getattr(self._cs, "__file__", None)
         if not module_file:
-            raise RuntimeError("Cannot resolve elite_cs_sdk package path.")
+            raise RuntimeError("Cannot resolve libpyelite package path.")
         path = Path(module_file).resolve().parent / filename
         if not path.exists():
             raise FileNotFoundError(f"Elite SDK resource not found: {path}")
@@ -418,6 +458,7 @@ class EliteCS66RT(Robot):
             cfg.script_file_path = str(Path(self.config.script_file_path).expanduser())
         else:
             cfg.script_file_path = self._resolve_sdk_resource("external_control.script")
+        _configure_native_driver(cfg, self.config, self.config.tool_transform)
         return cfg
 
     def connect(self, calibrate: bool = False, go_to_start: bool = True) -> None:
@@ -425,13 +466,7 @@ class EliteCS66RT(Robot):
             raise DeviceAlreadyConnectedError(f"{self} already connected, do not run connect() twice.")
 
         self._cs = _import_elite_sdk()
-        # RT scheduling is best-effort: SCHED_FIFO needs CAP_SYS_NICE /
-        # rtprio in /etc/security/limits.conf; dev machines without it fall
-        # back to default scheduling silently.
-        try:
-            self._cs.setCurrentThreadFiFoScheduling(self._cs.getThreadFiFoMaxPriority())
-        except Exception as exc:
-            self.logger.warn(f"Failed to enable FIFO scheduling for Elite CS66 control thread: {exc}")
+        # No Python real-time scheduling; native workers own the servo path.
 
         try:
             output_recipe = self._resolve_recipe(self.config.rtsi_output_recipe, "output_recipe.txt")
@@ -519,7 +554,7 @@ class EliteCS66RT(Robot):
             try:
                 premove_sample = (
                     np.asarray(self._rtsi.getActualJointPositions(), dtype=np.float64),
-                    np.asarray(self._rtsi.getActualTCPPose(), dtype=np.float64),
+                    _controller_tcp_to_pose6(self._rtsi.getActualTCPPose()),
                 )
             except Exception:
                 premove_sample = None
@@ -543,15 +578,19 @@ class EliteCS66RT(Robot):
                 raise
 
         if self.config.control_mode == EliteCS66RTControlMode.CARTESIAN_SERVO:
-            current_tcp = np.asarray(self._rtsi.getActualTCPPose(), dtype=np.float64)
+            current_tcp = _controller_tcp_to_pose6(self._rtsi.getActualTCPPose())
             self._last_tcp_command = current_tcp.copy()
-            self._target_tcp_command = current_tcp.copy()
             self._start_tcp_pose = current_tcp.copy()
-            self._last_action_time = time.monotonic()
-            if self.config.use_background_servo_loop:
-                self._start_servo_loop()
-            if self.config.singularity_w_high is not None or self.config.joint_vel_limits_rad_s is not None:
+        try:
+            self._start_servo_loop()
+            if self.config.control_mode == EliteCS66RTControlMode.CARTESIAN_SERVO and (
+                self.config.singularity_w_high is not None or self.config.joint_vel_limits_rad_s is not None
+            ):
                 self._setup_singularity_damping(premove_sample)
+        except BaseException:
+            self._is_connected = False
+            self._cleanup_after_failed_connect()
+            raise
 
     def _cleanup_after_failed_connect(self) -> None:
         # Drop the driver / dashboard / RTSI handles first.
@@ -581,220 +620,37 @@ class EliteCS66RT(Robot):
         self._is_connected = False
 
     def _start_servo_loop(self) -> None:
-        if self._servo_thread is not None and self._servo_thread.is_alive():
-            return
-        self._servo_error = None
-        self._servo_stop_event.clear()
-        self._servo_thread = threading.Thread(
-            target=self._servo_loop,
-            name=f"EliteCS66RTServoLoop-{self.config.id or hex(id(self))}",
-            daemon=True,
-        )
-        self._servo_thread.start()
+        assert self._driver is not None and self._rtsi is not None
+        self._driver.startServo(self._rtsi)
 
     def _stop_servo_loop(self) -> None:
-        self._servo_stop_event.set()
-        if self._servo_thread is not None:
-            self._servo_thread.join(timeout=2.0)
-            self._servo_thread = None
+        if self._driver is not None:
+            self._driver.stopServo()
 
     def _move_j_blocking(self, target_joints: list[float], duration_s: float) -> None:
-        """Execute a blocking joint-space move via the SDK trajectory API.
-
-        The external_control script switches control mode automatically when it
-        sees the first ``writeTrajectoryControlAction`` after a servoj stream;
-        we just need to keep the background servo loop out of the way so its
-        idle / servoj writes don't fight the trajectory.
-
-        Use this for connect-time go-to-start and disconnect-time return-to-home,
-        not for streaming teleop.
-        """
         assert self._driver is not None
-        if len(target_joints) != 6:
-            raise ValueError(f"_move_j_blocking expects 6 joint angles, got {len(target_joints)}")
+        was_running = self._driver.status().running
+        self._stop_servo_loop()
+        self._driver.moveJ(list(target_joints), float(duration_s), self.config.move_j_timeout_ms)
+        if was_running:
+            self._start_servo_loop()
 
-        servo_was_running = self._servo_thread is not None and self._servo_thread.is_alive()
-        if servo_was_running:
-            self._stop_servo_loop()
+    def _raise_servo_error_if_any(self) -> None:
+        if self._driver is not None:
+            self._driver.check_error()
 
-        done_event = threading.Event()
-        result_box: dict[str, Any] = {}
-
-        def _on_done(result):
-            result_box["result"] = result
-            done_event.set()
-
-        self._driver.setTrajectoryResultCallback(_on_done)
-        timeout_ms = self.config.move_j_timeout_ms
-
-        try:
-            if not self._driver.writeTrajectoryControlAction(self._cs.TrajectoryControlAction.START, 1, timeout_ms):
-                raise RuntimeError("writeTrajectoryControlAction(START) failed")
-            if not self._driver.writeTrajectoryPoint(list(target_joints), float(duration_s), 0.0, False):
-                raise RuntimeError("writeTrajectoryPoint failed")
-
-            deadline = time.monotonic() + duration_s + 5.0
-            while not done_event.is_set():
-                # Keep the controller alive: NOOP heartbeat so the reverse
-                # socket doesn't time out during the long blocking wait.
-                if not self._driver.writeTrajectoryControlAction(self._cs.TrajectoryControlAction.NOOP, 0, timeout_ms):
-                    raise RuntimeError("writeTrajectoryControlAction(NOOP) failed")
-                if time.monotonic() > deadline:
-                    raise TimeoutError(f"MoveJ to {target_joints} did not complete within {duration_s + 5.0:.1f} s")
-                time.sleep(0.02)
-
-            result = result_box.get("result")
-            if result is not None and result != self._cs.TrajectoryMotionResult.SUCCESS:
-                raise RuntimeError(f"MoveJ finished with non-success result: {result}")
-        finally:
-            # Restore servo loop ownership of the reverse socket.
-            with suppress(Exception):
-                self._driver.writeIdle(timeout_ms)
-            if servo_was_running:
-                # Re-seed the servo target so the loop holds the current pose
-                # rather than replaying the pre-MoveJ snapshot.
-                with best_effort(self.logger, "resyncing servo targets to the actual TCP", level="warn"):
-                    current_tcp = np.asarray(self._rtsi.getActualTCPPose(), dtype=np.float64)
-                    with self._servo_lock:
-                        self._last_tcp_command = current_tcp.copy()
-                        self._target_tcp_command = current_tcp.copy()
-                        self._last_action_time = time.monotonic()
-                        # Reset the gate: outer loop must send a fresh action
-                        # before we resume writeServoj.
-                        self._external_command_received = False
-                self._start_servo_loop()
-
-    @staticmethod
-    def _min_jerk(alpha: float) -> float:
-        alpha = min(max(alpha, 0.0), 1.0)
-        return alpha * alpha * alpha * (10.0 + alpha * (-15.0 + 6.0 * alpha))
+    def _is_reset_moving_locked(self, now: float) -> bool:
+        return self._driver is not None and self._driver.status().reset_active
 
     @staticmethod
     def _interpolate_tcp_pose(start: np.ndarray, target: np.ndarray, alpha: float) -> np.ndarray:
+        """Geodesic pose interpolation retained for the optional kinematic guards."""
         pose = np.asarray(start, dtype=np.float64).copy()
-        target = np.asarray(target, dtype=np.float64)
-        pose[:3] = start[:3] + alpha * (target[:3] - start[:3])
-
-        start_quat = _rotvec_to_quaternion(start[3:6])
-        target_quat = _rotvec_to_quaternion(target[3:6])
-        interp_principal = _quaternion_to_rotvec(_slerp_quaternion_wxyz(start_quat, target_quat, alpha))
-        # Keep every interp step on the same ±2π·axis branch as ``start``,
-        # so consecutive servoj rotvecs along the trajectory are smooth.
-        pose[3:6] = _rotvec_continuity_shift(interp_principal, start[3:6])
+        pose[:3] += alpha * (target[:3] - start[:3])
+        rotation = Rotation.from_rotvec(start[3:6])
+        delta = (Rotation.from_rotvec(target[3:6]) * rotation.inv()).as_rotvec()
+        pose[3:6] = (Rotation.from_rotvec(alpha * delta) * rotation).as_rotvec()
         return pose
-
-    def _get_servo_target_locked(self, now: float) -> tuple[np.ndarray | None, bool]:
-        if self._reset_moving:
-            if self._reset_start_tcp_pose is None or self._reset_target_tcp_pose is None:
-                self._reset_moving = False
-            elif now >= self._reset_end_time:
-                target = self._reset_target_tcp_pose.copy()
-                self._target_tcp_command = target.copy()
-                self._last_action_time = now
-                self._last_tcp_command = target.copy()
-                self._reset_moving = False
-                return target, True
-            else:
-                duration = max(self._reset_end_time - self._reset_start_time, self.config.servoj_time)
-                alpha = self._min_jerk((now - self._reset_start_time) / duration)
-                target = self._interpolate_tcp_pose(
-                    self._reset_start_tcp_pose,
-                    self._reset_target_tcp_pose,
-                    alpha,
-                )
-                self._last_action_time = now
-                return target, True
-
-        target = None if self._target_tcp_command is None else self._target_tcp_command.copy()
-        # Opt-in velocity ceiling: slew the commanded TCP toward the latest target
-        # at <= max_*_speed (per servoj_time tick), so a jumpy target ramps smoothly
-        # instead of stepping past the controller's joint-speed bound. No-op (and no
-        # cost) when both caps are None.
-        if (
-            target is not None
-            and self._last_tcp_command is not None
-            and (self.config.max_lin_speed is not None or self.config.max_ang_speed is not None)
-        ):
-            target = _clamp_tcp_velocity(
-                self._last_tcp_command,
-                target,
-                self.config.servoj_time,
-                self.config.max_lin_speed,
-                self.config.max_ang_speed,
-            )
-        return target, False
-
-    def _servo_loop(self) -> None:
-        assert self._driver is not None
-        assert self._cs is not None
-
-        # Same best-effort RT scheduling as in connect(); dev machines without
-        # rtprio fall back to default scheduling.
-        try:
-            self._cs.setCurrentThreadFiFoScheduling(self._cs.getThreadFiFoMaxPriority())
-        except Exception as exc:
-            self.logger.warn(f"Failed to enable FIFO scheduling for Elite CS66 servo loop: {exc}")
-
-        next_tick = time.monotonic()
-        consecutive_failures = 0
-        # SDK reverse-socket writes can fail transiently right after the script
-        # comes up. Tolerate a short burst before declaring the loop dead.
-        max_consecutive_failures = self.config.servo_failure_tolerance_ticks
-        while not self._servo_stop_event.is_set():
-            try:
-                now = time.monotonic()
-                with self._servo_lock:
-                    target, reset_active = self._get_servo_target_locked(now)
-                    last_action_time = self._last_action_time
-
-                if target is None:
-                    self._driver.writeIdle(self.config.command_timeout_ms)
-                elif not reset_active and not self._external_command_received:
-                    # No external command yet; stay idle so the controller holds
-                    # the current pose instead of replaying connect-time snapshot.
-                    self._driver.writeIdle(self.config.command_timeout_ms)
-                else:
-                    if not reset_active and now - last_action_time > self.config.command_stale_timeout_s:
-                        self._driver.writeIdle(self.config.command_timeout_ms)
-                    else:
-                        ok = self._driver.writeServoj(target.tolist(), self.config.command_timeout_ms, True)
-                        if not ok:
-                            consecutive_failures += 1
-                            if consecutive_failures > max_consecutive_failures:
-                                raise RuntimeError(
-                                    f"Elite writeServoj(cartesian=True) failed {consecutive_failures} ticks in a row."
-                                )
-                        else:
-                            consecutive_failures = 0
-                            with self._servo_lock:
-                                self._last_tcp_command = target
-
-                next_tick += self.config.servoj_time
-                sleep_s = next_tick - time.monotonic()
-                if sleep_s > 0:
-                    time.sleep(sleep_s)
-                else:
-                    next_tick = time.monotonic()
-            except BaseException as exc:
-                self._servo_error = exc
-                self._servo_stop_event.set()
-                break
-
-    def _raise_servo_error_if_any(self) -> None:
-        if self._servo_error is not None:
-            raise RuntimeError(f"Elite CS66 background servo loop failed: {self._servo_error}") from self._servo_error
-
-    def _is_reset_moving_locked(self, now: float) -> bool:
-        if not self._reset_moving:
-            return False
-        if now < self._reset_end_time:
-            return True
-        if self._reset_target_tcp_pose is not None:
-            self._target_tcp_command = self._reset_target_tcp_pose.copy()
-            self._last_tcp_command = self._reset_target_tcp_pose.copy()
-            self._last_action_time = now
-        self._reset_moving = False
-        return False
 
     def _tcp_rotvec_to_feature_values(self, tcp_pose: np.ndarray) -> dict[str, float]:
         values = {
@@ -815,7 +671,7 @@ class EliteCS66RT(Robot):
         obs: dict[str, Any] = {}
 
         if self.config.observe_tcp:
-            tcp_pose = np.asarray(self._rtsi.getActualTCPPose(), dtype=np.float64)
+            tcp_pose = _controller_tcp_to_pose6(self._rtsi.getActualTCPPose())
             obs.update(self._tcp_rotvec_to_feature_values(tcp_pose))
         if self.config.observe_joints:
             joints = self._rtsi.getActualJointPositions()
@@ -881,7 +737,7 @@ class EliteCS66RT(Robot):
             q0, t0 = premove_sample
             q0 = np.asarray(q0, dtype=np.float64)
             if int(np.sum(np.abs(q0 - q1) >= 0.3)) >= 3:  # well-separated configs
-                t1 = np.asarray(self._rtsi.getActualTCPPose(), dtype=np.float64)
+                t1 = _controller_tcp_to_pose6(self._rtsi.getActualTCPPose())
                 pos_drift_m, rot_drift_deg = tool_consistency(dh, q0, t0, q1, t1)
                 # Gate on POSITION drift only: it validates the DH for the geometric Jacobian, which
                 # is all w / the joint-velocity prediction depend on. A large ROTATION drift is a
@@ -993,11 +849,14 @@ class EliteCS66RT(Robot):
         with self._servo_lock:
             last_tcp = None if self._last_tcp_command is None else self._last_tcp_command.copy()
 
+        if self._driver is not None and self._driver.status().running:
+            last_tcp = _matrix_to_pose6(self._driver.commanded_pose())
+
         if last_tcp is not None:
             target = last_tcp
         else:
             assert self._rtsi is not None
-            target = np.asarray(self._rtsi.getActualTCPPose(), dtype=np.float64)
+            target = _controller_tcp_to_pose6(self._rtsi.getActualTCPPose())
 
         # Last in-reach pose (before this action is applied); held if the merged
         # target leaves the workspace, so the arm never chases an unreachable target.
@@ -1054,7 +913,7 @@ class EliteCS66RT(Robot):
         if not self.config.trace_servoj:
             return
         try:
-            current = np.asarray(self._rtsi.getActualTCPPose(), dtype=np.float64)
+            current = _controller_tcp_to_pose6(self._rtsi.getActualTCPPose())
         except Exception:
             return
         last = self._last_tcp_command.copy() if self._last_tcp_command is not None else current.copy()
@@ -1126,28 +985,16 @@ class EliteCS66RT(Robot):
         sent: dict[str, Any] = {}
 
         if self.config.control_mode == EliteCS66RTControlMode.CARTESIAN_SERVO:
-            if self.config.use_background_servo_loop:
-                with self._servo_lock:
-                    reset_moving = self._is_reset_moving_locked(time.monotonic())
-                if reset_moving:
-                    if self._gripper is not None and "gripper.pos" in action:
-                        self._gripper.set_gripper_position(float(action["gripper.pos"]))
-                        sent["gripper.pos"] = float(action["gripper.pos"])
-                    return sent or action
+            if self._driver.status().reset_active:
+                if self._gripper is not None and "gripper.pos" in action:
+                    self._gripper.set_gripper_position(float(action["gripper.pos"]))
+                    sent["gripper.pos"] = float(action["gripper.pos"])
+                return sent or action
 
             target_tcp = self._cartesian_action_to_tcp_pose(action)
             self._trace_send_action(action, target_tcp)
-            if self.config.use_background_servo_loop:
-                with self._servo_lock:
-                    self._target_tcp_command = target_tcp.copy()
-                    self._last_action_time = time.monotonic()
-                    self._external_command_received = True
-            else:
-                ok = self._driver.writeServoj(target_tcp.tolist(), self.config.command_timeout_ms, True)
-                if not ok:
-                    raise RuntimeError("Elite writeServoj(cartesian=True) failed.")
-                self._last_tcp_command = target_tcp
-                self._external_command_received = True
+            self._driver.submit_target(_pose6_to_matrix(target_tcp))
+            self._last_tcp_command = target_tcp.copy()
             sent.update(self._tcp_rotvec_to_feature_values(target_tcp))
         else:
             if not all(key in action for key in JOINT_POSITION_KEYS):
@@ -1157,9 +1004,7 @@ class EliteCS66RT(Robot):
             assert self._rtsi is not None
             current_joints = list(self._rtsi.getActualJointPositions())
             self._trace_send_action_joint(target_joints, current_joints)
-            ok = self._driver.writeServoj(target_joints, self.config.command_timeout_ms, False)
-            if not ok:
-                raise RuntimeError("Elite writeServoj(cartesian=False) failed.")
+            self._driver.submit_joints(target_joints)
             sent.update(dict(zip(JOINT_POSITION_KEYS, target_joints, strict=True)))
 
         if self._gripper is not None and "gripper.pos" in action:
@@ -1230,9 +1075,13 @@ class EliteCS66RT(Robot):
 
         self._is_connected = False
 
+    def get_native_status(self):
+        """Native IK diagnostics, watchdog errors and planner overruns."""
+        return self._driver.status() if self._driver is not None else None
+
     @property
     def rt_running(self) -> bool:
-        return self._servo_thread is not None and self._servo_thread.is_alive()
+        return self._driver is not None and self._driver.status().running
 
     @property
     def rt_moving(self) -> bool:
@@ -1243,7 +1092,7 @@ class EliteCS66RT(Robot):
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
         assert self._rtsi is not None
-        tcp_pose = np.asarray(self._rtsi.getActualTCPPose(), dtype=np.float64)
+        tcp_pose = _controller_tcp_to_pose6(self._rtsi.getActualTCPPose())
         quat = _rotvec_to_quaternion(tcp_pose[3:6])
         gripper_pos = self._gripper.get_gripper_position() if self._gripper is not None else 0.0
         return np.array(
@@ -1255,7 +1104,7 @@ class EliteCS66RT(Robot):
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
         assert self._rtsi is not None
-        tcp_pose = np.asarray(self._rtsi.getActualTCPPose(), dtype=np.float64)
+        tcp_pose = _controller_tcp_to_pose6(self._rtsi.getActualTCPPose())
         quat = _rotvec_to_quaternion(tcp_pose[3:6])
         euler = quaternion_to_euler(float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3]))
         gripper_pos = self._gripper.get_gripper_position() if self._gripper is not None else 0.0
@@ -1265,21 +1114,12 @@ class EliteCS66RT(Robot):
         )
 
     def get_commanded_tcp_pose_euler(self) -> np.ndarray:
-        """Last commanded TCP pose in Euler form, including gripper.
-
-        Use this instead of ``get_current_tcp_pose_euler`` when re-seeding a
-        teleop accumulator: the latter reads RTSI's rotvec which can be in a
-        branch encoding a different physical rotation than the one we've
-        been commanding (RTSI is unstable near orientation singularities).
-        ``_last_tcp_command`` is by construction continuous with our servoj
-        stream, so seeding the teleop from it never introduces a phantom
-        100°+ jump on the next send_action.
-        """
+        """Current native planned TCP pose in Euler form, including gripper."""
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
         if self._last_tcp_command is None:
             return self.get_current_tcp_pose_euler()
-        tcp_pose = np.asarray(self._last_tcp_command, dtype=np.float64)
+        tcp_pose = _matrix_to_pose6(self._driver.commanded_pose())
         quat = _rotvec_to_quaternion(tcp_pose[3:6])
         euler = quaternion_to_euler(float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3]))
         gripper_pos = self._gripper.get_gripper_position() if self._gripper is not None else 0.0
@@ -1291,71 +1131,12 @@ class EliteCS66RT(Robot):
     def reset_to_initial_position(self) -> None:
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
-
+        self._raise_servo_error_if_any()
         if self.config.control_mode != EliteCS66RTControlMode.CARTESIAN_SERVO:
-            # Joint mode: blocking MoveJ via the trajectory port. The outer
-            # loop blocks for ~reset_duration_s, then teleop resumes against
-            # the new joint pose. No background loop / rt_moving signaling
-            # exists in joint mode, so this is intentionally synchronous.
             self._move_j_blocking(list(self.config.start_position_rad), self.config.reset_duration_s)
-            return
-
-        if self._start_tcp_pose is None:
-            return
-
-        if self.config.use_background_servo_loop:
-            assert self._rtsi is not None
-            now = time.monotonic()
-            with self._servo_lock:
-                if self._is_reset_moving_locked(now):
-                    return
-                # Anchor reset interp to our self-consistent commanded pose,
-                # not RTSI: near orientation singularities RTSI's rotvec can
-                # be in a branch encoding a *different* physical rotation
-                # than what we've been commanding, which would make the
-                # interp try to bridge a phantom 110° rotation and trip the
-                # joint velocity limit. Fall back to RTSI only if we never
-                # had a commanded pose yet.
-                if self._last_tcp_command is not None:
-                    self._reset_start_tcp_pose = self._last_tcp_command.copy()
-                else:
-                    self._reset_start_tcp_pose = np.asarray(self._rtsi.getActualTCPPose(), dtype=np.float64)
-                # Express the reset target's rotvec on the same ±2π branch as
-                # the start, so the slerp output stays in a single branch
-                # throughout the trajectory.
-                target_pose = self._start_tcp_pose.copy()
-                target_principal = _quaternion_to_rotvec(_rotvec_to_quaternion(target_pose[3:6]))
-                target_pose[3:6] = _rotvec_continuity_shift(target_principal, self._reset_start_tcp_pose[3:6])
-                self._reset_target_tcp_pose = target_pose
-                self._reset_start_time = now
-                self._reset_end_time = now + self.config.reset_duration_s
-                self._reset_moving = True
-                self._last_action_time = now
-            return
-
-        assert self._driver is not None
-        assert self._rtsi is not None
-        if self._last_tcp_command is not None:
-            start_pose = self._last_tcp_command.copy()
-        else:
-            start_pose = np.asarray(self._rtsi.getActualTCPPose(), dtype=np.float64)
-        target_pose = self._start_tcp_pose.copy()
-        target_principal = _quaternion_to_rotvec(_rotvec_to_quaternion(target_pose[3:6]))
-        target_pose[3:6] = _rotvec_continuity_shift(target_principal, start_pose[3:6])
-        start_time = time.monotonic()
-        duration = max(self.config.reset_duration_s, self.config.servoj_time)
-
-        while True:
-            now = time.monotonic()
-            alpha = (now - start_time) / duration
-            if alpha >= 1.0:
-                pose = target_pose
-            else:
-                pose = self._interpolate_tcp_pose(start_pose, target_pose, self._min_jerk(alpha))
-            ok = self._driver.writeServoj(pose.tolist(), self.config.command_timeout_ms, True)
-            if not ok:
-                raise RuntimeError("Elite writeServoj(cartesian=True) failed during reset.")
-            self._last_tcp_command = pose
-            if alpha >= 1.0:
-                break
-            time.sleep(self.config.servoj_time)
+        elif self._start_tcp_pose is not None and not self.rt_moving:
+            self._driver.submit_target(_pose6_to_matrix(self._start_tcp_pose), self.config.reset_duration_s)
+            if not self.config.use_background_servo_loop:
+                while self.rt_moving:
+                    self._raise_servo_error_if_any()
+                    time.sleep(0.01)

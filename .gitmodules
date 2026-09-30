@@ -16,3 +16,6 @@
 [submodule "third_party/taccap-gripper"]
 	path = third_party/taccap-gripper
 	url = git@github.com:XenseRobotics-AI/TacCap-Gripper.git
+[submodule "third_party/libpyelite"]
+	path = third_party/libpyelite
+	url = git@github.com:XenseRobotics-AI/libpyelite.git

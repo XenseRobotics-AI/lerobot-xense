@@ -11,6 +11,18 @@
 
 robot:
   type: bi_elite_cs66_rt
+  # Validated bench-08 serial-gripper assembly; overrides the legacy mount angles below.
+  native_assembly: diagonal-08
+  # Teach-pendant TCP in metres (tool0 <- TCP); zero TCP rotation on both arms.
+  # These measurements do not apply to bench 07 or to the TacCap gripper variant.
+  left_tool_transform: [1.0, 0.0, 0.0, 0.0068,
+                        0.0, 1.0, 0.0, -0.0063,
+                        0.0, 0.0, 1.0, 0.1941,
+                        0.0, 0.0, 0.0, 1.0]
+  right_tool_transform: [1.0, 0.0, 0.0, -0.0080,
+                         0.0, 1.0, 0.0, -0.0065,
+                         0.0, 0.0, 1.0, 0.1920,
+                         0.0, 0.0, 0.0, 1.0]
 
   # ── Bench hardware (diagonal-08) ────────────────────────────────────────────
   left_robot_ip: "192.168.8.53"

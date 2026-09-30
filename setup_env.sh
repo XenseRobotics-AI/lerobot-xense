@@ -969,65 +969,25 @@ install_taccap() {
 # ── Hardware module: Elite CS (bi_elite_cs66_rt / elite_cs66_rt) ─────────────
 
 install_elite() {
-    echo ""
-    echo "══════════════════════════════════════════"
-    echo " Elite CS SDK (C++ + Python)  →  elite_cs_sdk"
-    echo "══════════════════════════════════════════"
-
-    local CPP_DIR="$PROJECT_ROOT/third_party/elite-robots-cs-sdk"
-    local PY_DIR="$PROJECT_ROOT/third_party/elite-robots-cs-sdk-python"
-
-    if [[ ! -f "$CPP_DIR/CMakeLists.txt" ]]; then
-        echo "ERROR: $CPP_DIR not found."
-        echo "  Run: git submodule update --init third_party/elite-robots-cs-sdk"
+    local elite_dir="$PROJECT_ROOT/third_party/libpyelite"
+    if [[ ! -f "$elite_dir/vendor/elite_cs_sdk/CMakeLists.txt" ]]; then
+        echo "Run: git submodule update --init --recursive third_party/libpyelite"
         return 1
     fi
-    if [[ ! -f "$PY_DIR/CMakeLists.txt" ]]; then
-        echo "ERROR: $PY_DIR not found."
-        echo "  Run: git submodule update --init third_party/elite-robots-cs-sdk-python"
+    echo "Building libpyelite (native Pink IK + Elite SDK)"
+    # Isolated build dependencies must not overwrite conda-owned build tools.
+    # A fresh directory prevents accidentally installing an older cached wheel.
+    local elite_wheel_dir
+    elite_wheel_dir="$(mktemp -d "${TMPDIR:-/tmp}/libpyelite-wheel.XXXXXX")" || return 1
+    python -m pip wheel "$elite_dir" --no-deps -w "$elite_wheel_dir" || return 1
+    local elite_wheels=("$elite_wheel_dir"/libpyelite-*.whl)
+    if [[ ${#elite_wheels[@]} -ne 1 || ! -f "${elite_wheels[0]}" ]]; then
+        echo "[elite] ERROR: expected one wheel under $elite_wheel_dir"
         return 1
     fi
-
-    # C++ build prerequisites (system packages, see Elite BuildGuide):
-    #   sudo apt install -y build-essential cmake libboost-all-dev libssh-dev \
-    #                        libeigen3-dev liborocos-kdl-dev
-    # Python build deps — the python_wheel target builds with --no-build-isolation.
-    # Only the packages conda does NOT provide. pybind11, setuptools and wheel
-    # all come from conda_environment.yaml; `uv pip install --upgrade` on them
-    # overwrites conda's files in place, leaving conda-meta claiming a version
-    # that is no longer on disk. The next `mamba env update` then relinks conda's
-    # copy over uv's and leaves uv's extra files behind -- exactly how pip broke
-    # with `ImportError: cannot import name 'get_runnable_pip'`.
-    #
-    # `--upgrade-package`, not `--upgrade`: uv's `--upgrade` drops the
-    # prefer-installed rule for the WHOLE resolution, not just the named
-    # packages. `--upgrade build` walked build's `packaging>=24.0` dependency
-    # from conda's 26.2 to a 26.3 conda-forge does not ship (2026-09-01). `-P`
-    # upgrades only the named packages and keeps every dependency where it is.
-    uv pip install --upgrade-package pybind11-stubgen --upgrade-package build \
-        pybind11-stubgen build
-
-    # Build the pybind wheel, pointing the Python SDK at our LOCAL C++ SDK
-    # submodule (ELITE_CS_SDK_REPO is required and must be a local path — the
-    # Python build add_subdirectory()s it instead of fetching over the network).
-    local BUILD_DIR="$PY_DIR/build"
-    rm -rf "$BUILD_DIR"
-    cmake -S "$PY_DIR" -B "$BUILD_DIR" \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DELITE_CS_SDK_REPO="$CPP_DIR" \
-        -DELITE_COMPILE_KIN_PLUGIN=ON \
-        -DPython3_EXECUTABLE="$(which python)"
-    cmake --build "$BUILD_DIR" --target python_wheel -j"$(nproc)"
-
-    local WHEEL
-    WHEEL="$(ls -t "$PY_DIR"/dist/elite_cs_sdk-*.whl 2>/dev/null | head -1)"
-    if [[ -z "$WHEEL" ]]; then
-        echo "[elite] ERROR: build did not produce a wheel under $PY_DIR/dist/"
-        return 1
-    fi
-    uv pip install --force-reinstall "$WHEEL"
-
-    echo "[elite] Done. Verify with: python -c 'import elite_cs_sdk; print(elite_cs_sdk.__file__)'"
+    # Reinstall only our wheel, not conda-owned transitive dependencies.
+    uv pip install --reinstall-package libpyelite "${elite_wheels[0]}" || return 1
+    python -c 'import libpyelite; print(libpyelite.__version__, libpyelite.IK_BACKEND)'
 }
 
 # ── Hardware module: SpaceMouse ───────────────────────────────────────────────
@@ -1323,7 +1283,7 @@ USAGE
     if is_sel xense;     then _VERIFY_LINES+=$'\n''xgripper|import importlib.metadata as M, xgripper; print("v"+M.version("xgripper"), "->", xgripper.__file__)'; fi
     if is_sel xense;     then _VERIFY_LINES+=$'\n''xensesdk flash|from xensesdk.flash.linux_backend import LinuxFlashBackend; print("available" if LinuxFlashBackend().available else "NOT available")'; fi
     if is_sel taccap;    then _VERIFY_LINES+=$'\n''taccap-gripper|import importlib.metadata as M, xense.taccap; print("v"+M.version("taccap-gripper"), "->", xense.taccap.__file__)'; fi
-    if is_sel elite;     then _VERIFY_LINES+=$'\n''elite_cs_sdk|import importlib.metadata as M, elite_cs_sdk; print("v"+M.version("elite_cs_sdk"), "->", elite_cs_sdk.__file__)'; fi
+    if is_sel elite;     then _VERIFY_LINES+=$'\n''libpyelite|import libpyelite; print(libpyelite.__version__, libpyelite.IK_BACKEND)'; fi
     if is_sel dynamixel; then _VERIFY_LINES+=$'\n''dynamixel_sdk|import importlib.metadata as M, dynamixel_sdk; print("v"+M.version("dynamixel_sdk"), "->", dynamixel_sdk.__file__)'; fi
 
     _VERIFY_FAIL=0
