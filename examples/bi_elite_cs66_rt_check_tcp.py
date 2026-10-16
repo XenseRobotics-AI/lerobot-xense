@@ -1,129 +1,73 @@
 #!/usr/bin/env python3
-"""Check whether an Elite CS66 controller has an active TCP offset.
+"""Read the TCP offset an Elite CS66 controller is applying, as a tool_transform.
 
 `RtsiIOInterface.getActualTCPPose()` returns the pose of the *active TCP*
-(flange composed with the controller's active TCP offset). `KdlKinematicsPlugin.
-getPositionFK(joints)` returns the *flange* pose (the MDH chain ends at the
-flange and does NOT include any tool offset). Therefore:
+(flange composed with the pendant's TCP offset), while the libpyelite model FK of
+the same joints ends at the flange. The offset between the two is exactly what the
+native planner needs as ``tool_transform``; the driver derives it the same way at
+connect when a recipe leaves ``tool_transform`` unset.
 
-    actual_TCP_pose  ==  FK(joints)   ->  NO tool offset active (TCP == flange)
-    actual_TCP_pose  !=  FK(joints)   ->  a tool offset IS active; the delta is it
-
-Run this with the arm IDLE (no teleop / no EliteDriver control script holding the
-ports) to read the installation/default TCP the controller applies at rest.
+Run this with the arm IDLE (no teleop holding the RTSI input registers). The
+printed row-major matrix can be pasted into a recipe to pin the TCP explicitly.
 
 Usage:
     python examples/bi_elite_cs66_rt_check_tcp.py --ip 192.168.8.53
+    python examples/bi_elite_cs66_rt_check_tcp.py --ip 192.168.8.53 --assembly diagonal-08 --side left
 """
 
 import argparse
-import math
-import platform
 import sys
 from pathlib import Path
 
-import elite_cs_sdk as cs
+import libpyelite
+import numpy as np
 
-try:
-    import elite_cs_sdk.elite_cs_sdk_python as cs_native
-except Exception:
-    cs_native = cs
+from lerobot.robots.elite_cs66_rt.elite_cs66_rt import _derive_controller_tool
+from lerobot.utils.rotation import Rotation
 
-
-def _resolve_plugin_path() -> Path:
-    module_dir = Path(cs_native.__file__).resolve().parent
-    name = {
-        "Linux": "libelite_kdl_kinematics.so",
-        "Windows": "elite_kdl_kinematics.dll",
-        "Darwin": "libelite_kdl_kinematics.dylib",
-    }.get(platform.system())
-    if name and (module_dir / name).exists():
-        return module_dir / name
-    for pat in ("*kdl*kinematics*.so", "*kdl*kinematics*.dll", "*kdl*kinematics*.dylib"):
-        hits = list(module_dir.glob(pat))
-        if hits:
-            return hits[0]
-    raise FileNotFoundError(f"kdl kinematics plugin not found under {module_dir}")
-
-
-def _fmt(v):
-    return "[" + ", ".join(f"{float(x):+.5f}" for x in v) + "]"
+RESOURCE_DIR = Path(__file__).resolve().parents[1] / "src/lerobot/robots/elite_cs66_rt/resource"
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ip", required=True)
     ap.add_argument("--rtsi-frequency", type=float, default=250.0)
+    ap.add_argument("--assembly", help="native_assembly name; selects that station's control model")
+    ap.add_argument("--side", choices=("left", "right"), help="arm within --assembly")
     args = ap.parse_args()
+    if bool(args.assembly) != bool(args.side):
+        ap.error("--assembly and --side go together")
 
-    # examples/resource recipes ship with the SDK and include actual_joint_positions
-    # + actual_TCP_pose.
-    sdk_examples = Path(__file__).resolve()
-    # Prefer the SDK's own example recipes (known-good, include both fields).
-    candidates = [
-        Path.home() / "Elite_Robots_CS_SDK_Python/examples/resource",
-        sdk_examples.parent / "resource",
-    ]
-    resource_dir = next((c for c in candidates if (c / "output_recipe.txt").exists()), None)
-    if resource_dir is None:
-        print(f"[ERROR] no RTSI recipe dir found in {candidates}", file=sys.stderr)
-        return 1
-    output_recipe = str(resource_dir / "output_recipe.txt")
-    input_recipe = str(resource_dir / "input_recipe.txt")
+    if args.assembly:
+        from libpyelite.assembly import Assembly
 
-    print(f"[INFO] {args.ip}: reading MDH (primary) ...")
-    primary = cs.PrimaryClientInterface()
-    if not primary.connect(args.ip):
-        print(f"[ERROR] primary connect failed at {args.ip}", file=sys.stderr)
-        return 1
-    kin = cs.KinematicsInfo()
-    try:
-        if not primary.getPackage(kin, 1000):
-            print("[ERROR] getPackage(KinematicsInfo) failed", file=sys.stderr)
-            return 1
-    finally:
-        primary.disconnect()
+        model = Assembly(args.assembly).control_model_path(args.side)
+    else:
+        model = libpyelite.model_path()
 
-    print(f"[INFO] {args.ip}: reading joints + TCP (rtsi) ...")
-    io = cs.RtsiIOInterface(output_recipe, input_recipe, args.rtsi_frequency)
+    io = libpyelite.RtsiIOInterface(
+        str(RESOURCE_DIR / "output_recipe.txt"), str(RESOURCE_DIR / "input_recipe.txt"), args.rtsi_frequency
+    )
     if not io.connect(args.ip):
         print(f"[ERROR] rtsi connect failed at {args.ip}:30004", file=sys.stderr)
         return 1
     try:
-        joints = io.getActualJointPositions()
-        tcp = list(io.getActualTCPPose())
+        tool = np.asarray(_derive_controller_tool(libpyelite, io, model), dtype=np.float64).reshape(4, 4)
     finally:
         io.disconnect()
 
-    plugin = _resolve_plugin_path()
-    loader = cs_native.ClassLoader(str(plugin))
-    if not loader.loadLib():
-        print("[ERROR] loadLib failed", file=sys.stderr)
-        return 1
-    solver = loader.createKinematicsInstance("ELITE::KdlKinematicsPlugin")
-    solver.setMDH(kin.dh_alpha_, kin.dh_a_, kin.dh_d_)
-    ok, flange = solver.getPositionFK(joints)
-    if not ok:
-        print("[ERROR] FK failed", file=sys.stderr)
-        return 1
-    flange = list(flange)
-
-    dpos = [tcp[i] - flange[i] for i in range(3)]
-    dpos_mm = math.sqrt(sum(d * d for d in dpos)) * 1000.0
-
+    offset_mm = tool[:3, 3] * 1000.0
+    rot_deg = np.degrees(np.linalg.norm(Rotation.from_matrix(tool[:3, :3]).as_rotvec()))
     print("\n================= TCP CHECK =================")
-    print(f"  active TCP  (getActualTCPPose): {_fmt(tcp)}")
-    print(f"  flange      (FK of joints)    : {_fmt(flange)}")
-    print(f"  delta pos (TCP-flange, base)  : {_fmt(dpos)}  |  |delta| = {dpos_mm:.2f} mm")
+    print(f"  model          : {model}")
+    print(f"  offset (mm)    : {np.array2string(offset_mm, precision=2)}  |offset| = {np.linalg.norm(offset_mm):.2f}")
+    print(f"  rotation (deg) : {rot_deg:.2f}")
+    print("  tool_transform :")
+    for row in tool:
+        print("    " + ", ".join(f"{v:.5f}" for v in row) + ",")
     print("============================================")
-    if dpos_mm < 1.0:
-        print(">>> NO tool offset active: getActualTCPPose == flange (within 1 mm).")
-        print(">>> The pendant TCP is NOT being applied (define it AND set it as the")
-        print(">>> active/default TCP, or the control script resets it).")
-    else:
-        print(f">>> A tool offset IS active (~{dpos_mm:.1f} mm from the flange).")
-        print(">>> If teleop still behaves like flange, the headless control script")
-        print(">>> resets the TCP during external control -> use an in-code offset.")
+    if np.linalg.norm(offset_mm) < 1.0:
+        print(">>> No tool offset active: the pendant TCP is the flange (within 1 mm).")
     return 0
 
 

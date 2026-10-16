@@ -2,7 +2,7 @@
 """Dry-run smoke test for Elite CS66 + SpaceMouse teleop.
 
 Stubs out:
-  * elite_cs_sdk (driver + RTSI + dashboard)
+  * libpyelite (native driver + RTSI + dashboard)
   * pyspacemouse + lerobot.teleoperators.spacemouse.peripherals.Spacemouse
 
 so the real EliteCS66RT + SpacemouseTeleop + elite_cs66_rt_spacemouse_teleop_loop
@@ -11,7 +11,7 @@ can be exercised end-to-end without hardware.
 Asserts:
   * connect() takes the success path (RTSI + dashboard + driver + script)
   * action keys produced by convert_to_flexiv_action match what EliteCS66RT expects
-  * send_action accepts and updates the background servo target
+  * send_action submits Cartesian targets to the native planner
   * both-buttons triggers robot.reset_to_initial_position()
   * rt_moving short-circuits send_action and re-syncs teleop after reset finishes
   * disconnect() cleans up driver/dashboard/RTSI
@@ -27,7 +27,7 @@ import types
 import numpy as np
 
 # ---------------------------------------------------------------------------
-# elite_cs_sdk stub: minimal surface the EliteCS66RT driver exercises
+# libpyelite stub: minimal native surface the EliteCS66RT driver exercises
 # ---------------------------------------------------------------------------
 
 
@@ -40,17 +40,27 @@ class _FakeDriverConfig:
         self.servoj_gain = 2000
         self.headless_mode = True
         self.script_file_path = ""
+        self.model_path = ""
+        self.tool = list(np.eye(4).ravel())
+        self.ik = types.SimpleNamespace(max_iterations=500)
+        self.planner = types.SimpleNamespace(
+            stale_timeout=0.5, max_linear_velocity=0.5, max_angular_velocity=1.0, velocity_scale=1.0
+        )
+        self.command_timeout_ms = 500
+        self.max_consecutive_write_failures = 1
 
 
 class _FakeDriver:
+    """Native driver stand-in: records targets instead of planning them."""
+
     def __init__(self, config):
         self.config = config
         self.connected = True
-        self.servo_targets: list[list[float]] = []
-        self.idle_calls = 0
+        self.running = False
+        self.servo_targets: list[np.ndarray] = []
+        self.move_j_targets: list[list[float]] = []
         self.stop_calls = 0
-        self.trajectory_points: list[tuple] = []
-        self._trajectory_cb = None
+        self._pose = np.eye(4)
 
     def isRobotConnected(self):
         return self.connected
@@ -59,43 +69,51 @@ class _FakeDriver:
         self.connected = True
         return True
 
-    def writeServoj(self, pos, timeout_ms, cartesian):
-        assert cartesian is True
-        self.servo_targets.append(list(pos))
-        return True
+    def startServo(self, rtsi):
+        self.running = True
+
+    def stopServo(self):
+        self.running = False
+
+    def status(self):
+        return types.SimpleNamespace(running=self.running, reset_active=False, error="")
+
+    def check_error(self):
+        pass
+
+    def submit_target(self, pose, duration=0.0):
+        self.servo_targets.append(np.asarray(pose))
+        self._pose = np.asarray(pose)
+
+    def submit_joints(self, q):
+        pass
+
+    def commanded_pose(self):
+        return self._pose.copy()
+
+    def moveJ(self, q, duration, timeout_ms):
+        assert not self.running, "MoveJ while the native servo still owns the socket"
+        self.move_j_targets.append(list(q))
 
     def writeIdle(self, timeout_ms):
-        self.idle_calls += 1
         return True
 
     def stopControl(self, wait_ms=1000):
+        self.running = False
         self.stop_calls += 1
         return True
 
-    # Trajectory API used by _move_j_blocking.
-    def setTrajectoryResultCallback(self, cb):
-        self._trajectory_cb = cb
 
-    def writeTrajectoryControlAction(self, action, point_number, timeout_ms):
-        # On NOOP after START with our 1 point, fire the success callback once
-        # we've seen at least one writeTrajectoryPoint.
-        if action == _TrajectoryControlAction.NOOP and self.trajectory_points and self._trajectory_cb is not None:
-            cb, self._trajectory_cb = self._trajectory_cb, None
-            cb(_TrajectoryMotionResult.SUCCESS)
-        return True
+class _FakePinkIKModel:
+    """Flange FK equal to the fake RTSI TCP, so the derived tool is identity."""
 
-    def writeTrajectoryPoint(self, positions, duration_s, blend_radius, cartesian):
-        self.trajectory_points.append((tuple(positions), float(duration_s), float(blend_radius), bool(cartesian)))
-        return True
+    def __init__(self, urdf=None, tool=None, options=None):
+        pass
 
-
-class _TrajectoryControlAction:
-    START = "START"
-    NOOP = "NOOP"
-
-
-class _TrajectoryMotionResult:
-    SUCCESS = "SUCCESS"
+    def fk(self, q):
+        pose = np.eye(4)
+        pose[:3, 3] = _FakeRtsi.POSE[:3]
+        return pose
 
 
 class _FakeDashboard:
@@ -115,16 +133,14 @@ class _FakeDashboard:
     def brakeRelease(self):
         return True
 
-    def playProgram(self):
-        return True
-
 
 class _FakeRtsi:
+    POSE = (0.5, 0.0, 0.3, 0.0, 0.0, 0.0)  # [x, y, z, roll, pitch, yaw]
+
     def __init__(self, output, inp, freq):
         self.output = output
         self.input = inp
         self.freq = freq
-        self.pose = [0.5, 0.0, 0.3, 0.0, 0.0, 0.0]
 
     def connect(self, ip):
         return True
@@ -132,8 +148,11 @@ class _FakeRtsi:
     def disconnect(self):
         return True
 
+    def getTimestamp(self):
+        return 1.0  # constant: every sample reads as coherent
+
     def getActualTCPPose(self):
-        return list(self.pose)
+        return list(self.POSE)
 
     def getActualJointPositions(self):
         return [0.0] * 6
@@ -146,27 +165,18 @@ class _FakeRtsi:
 
 
 def install_elite_sdk_stub():
-    mod = types.ModuleType("elite_cs_sdk")
+    import pathlib
+
+    mod = types.ModuleType("libpyelite")
     mod.EliteDriverConfig = _FakeDriverConfig
     mod.EliteDriver = _FakeDriver
     mod.DashboardClientInterface = _FakeDashboard
     mod.RtsiIOInterface = _FakeRtsi
-    mod.TrajectoryControlAction = _TrajectoryControlAction
-    mod.TrajectoryMotionResult = _TrajectoryMotionResult
-
-    def setCurrentThreadFiFoScheduling(prio):
-        return True
-
-    def getThreadFiFoMaxPriority():
-        return 99
-
-    mod.setCurrentThreadFiFoScheduling = setCurrentThreadFiFoScheduling
-    mod.getThreadFiFoMaxPriority = getThreadFiFoMaxPriority
+    mod.PinkIKModel = _FakePinkIKModel
+    mod.model_path = lambda: "fake.urdf"
 
     # external_control.script lookup uses the package path: fabricate a file beside us.
-    import pathlib
-
-    pkg_dir = pathlib.Path(__file__).resolve().parent / "_fake_elite_cs_sdk"
+    pkg_dir = pathlib.Path(__file__).resolve().parent / "_fake_libpyelite"
     pkg_dir.mkdir(exist_ok=True)
     script = pkg_dir / "external_control.script"
     if not script.exists():
@@ -174,7 +184,7 @@ def install_elite_sdk_stub():
     # Recipes: reuse the ones already shipped with elite_cs66_rt resource/.
     mod.__file__ = str(script)  # _resolve_sdk_resource uses parent dir
 
-    sys.modules["elite_cs_sdk"] = mod
+    sys.modules["libpyelite"] = mod
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +248,7 @@ def main():
 
     cfg = EliteCS66RTConfig(
         robot_ip="127.0.0.1",
-        use_background_servo_loop=False,  # synchronous so the test is deterministic
+        use_background_servo_loop=False,  # blocking reset, so the test is deterministic
     )
     robot = EliteCS66RT(cfg)
     robot.connect()
@@ -295,8 +305,8 @@ def main():
     print("[ok] elite_cs66_rt_spacemouse_teleop_loop ran without raising")
 
     driver = robot._driver
-    assert driver is not None and len(driver.servo_targets) > 0, "no servoj calls observed"
-    print(f"[ok] driver received {len(driver.servo_targets)} servoj targets")
+    assert driver is not None and len(driver.servo_targets) > 0, "no native targets observed"
+    print(f"[ok] driver received {len(driver.servo_targets)} native targets")
 
     robot.disconnect()
     assert driver.stop_calls >= 1, "stopControl not called on disconnect"

@@ -17,7 +17,7 @@
 # to PyPI, host docs and triage issues for the upstream project, none of which
 # applies here, and git history holds them if one is ever wanted back.
 #
-# No vendor SDK is installed: xensesdk, xense.taccap, flexivrdk and elite_cs_sdk
+# No vendor SDK is installed: xensesdk, xense.taccap, flexivrdk and libpyelite
 # are not on PyPI and need hardware to be worth having. The suite is written to
 # skip what needs them (11 tests as of this writing) and to run everything else,
 # so a green run here means the ~733 SDK-free tests pass. Anything touching a

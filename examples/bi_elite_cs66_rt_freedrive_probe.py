@@ -46,6 +46,7 @@ from lerobot.robots.bi_elite_cs66_rt.bi_elite_cs66_rt import BiEliteCS66RT
 from lerobot.robots.bi_elite_cs66_rt.config_bi_elite_cs66_rt import BiEliteCS66RTConfig
 from lerobot.robots.elite_cs66_rt import EliteCS66RT, EliteCS66RTConfig
 from lerobot.robots.elite_cs66_rt.config_elite_cs66_rt import EliteCS66RTControlMode
+from lerobot.robots.elite_cs66_rt.elite_cs66_rt import _controller_tcp_to_pose6, _import_elite_sdk
 from lerobot.utils.robot_utils import best_effort
 from lerobot.utils.rotation import Rotation
 
@@ -114,6 +115,11 @@ def main() -> None:
     if input("Type 'yes' to proceed: ").strip().lower() != "yes":
         print("Aborted.")
         return
+    # libpyelite does not bind writeFreedrive, and connect() always starts its native
+    # servo on the reverse socket; refuse before touching the arm rather than halfway.
+    if not hasattr(_import_elite_sdk()._native.NativeDriver, "writeFreedrive"):
+        print("This libpyelite build has no writeFreedrive; freedrive probing is unavailable.")
+        return
 
     log_path = args.log or f"freedrive_{side}_{int(time.time())}.csv"
     log = open(log_path, "w")  # noqa: SIM115 — held for the whole run, closed in finally
@@ -151,7 +157,7 @@ def main() -> None:
                 fails = 0
                 started = True
 
-            base = np.asarray(rtsi.getActualTCPPose(), dtype=np.float64)
+            base = _controller_tcp_to_pose6(rtsi.getActualTCPPose())
             world = _base_to_world(R_wb, base)
             if baseline is None:
                 baseline = np.concatenate([base[:3], world[:3]])
