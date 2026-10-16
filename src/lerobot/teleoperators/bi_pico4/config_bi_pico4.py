@@ -59,6 +59,11 @@ class BiPico4Config(TeleoperatorConfig):
     left_gripper_width: float = 1.0
     right_gripper_width: float = 1.0
 
+    # On each grip press, restart the mapping from the robot's measured TCP
+    # instead of the last target, when the robot loop provides it
+    # (set_grip_anchor_source). After a collision hold the last target sits
+    # behind the obstacle; re-gripping then moves the arm away immediately.
+    grip_anchor_to_robot: bool = True
     grip_enable_threshold: float = 0.5
     grip_disable_threshold: float = 0.3
     orientation_offset_warning_deg: float = 180.0

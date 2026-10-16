@@ -986,6 +986,7 @@ def teleoperate(cfg: TeleoperateConfig):
             logger.info("Start pose: " + ", ".join(f"{k}={start_obs[k]:.6f}" for k in tcp_keys))
             teleop = make_teleoperator_from_config(cfg.teleop)
             teleop.connect(current_tcp_pose_quat=robot.get_current_tcp_pose_quat())
+            teleop.set_grip_anchor_source(robot.get_current_tcp_pose_quat)
             try:
                 elite_cs66_rt_pico4_teleop_loop(
                     teleop=teleop,
@@ -1110,6 +1111,7 @@ def teleoperate(cfg: TeleoperateConfig):
             logger.info(f"Left start pose:  {left_pose}")
             logger.info(f"Right start pose: {right_pose}")
             teleop.connect(left_tcp_pose_quat=left_pose, right_tcp_pose_quat=right_pose)
+            teleop.set_grip_anchor_source(robot.get_current_tcp_pose_quat)
             try:
                 bi_pico4_teleop_loop(
                     teleop=teleop,

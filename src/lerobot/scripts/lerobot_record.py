@@ -856,12 +856,15 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             ):
                 left_pose, right_pose = robot.get_current_tcp_pose_quat()
                 teleop.connect(left_tcp_pose_quat=left_pose, right_tcp_pose_quat=right_pose)
+                if cfg.robot.type == "bi_elite_cs66_rt":
+                    teleop.set_grip_anchor_source(robot.get_current_tcp_pose_quat)
                 logger.info("BiPico4 initialized with both robot EEF poses.")
             elif cfg.robot.type == "elite_cs66_rt" and teleop_type == "spacemouse":
                 teleop.connect(current_tcp_pose_euler=robot.get_current_tcp_pose_euler())
                 logger.info("Elite CS66 + SpaceMouse: teleop seeded from current TCP pose")
             elif cfg.robot.type == "elite_cs66_rt" and teleop_type == "pico4":
                 teleop.connect(current_tcp_pose_quat=robot.get_current_tcp_pose_quat())
+                teleop.set_grip_anchor_source(robot.get_current_tcp_pose_quat)
                 logger.info("Elite CS66 + Pico4: teleop seeded from current TCP pose")
             else:
                 teleop.connect()

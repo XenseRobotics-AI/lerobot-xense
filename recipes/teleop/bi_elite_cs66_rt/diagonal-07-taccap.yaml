@@ -117,50 +117,56 @@ robot:
   left_use_gripper: true
   right_use_gripper: true
 
-  # ── Singularity / joint-overspeed guards (fixes the down-near-table trips) ──
-  # Predicted joint-velocity guard (model-based, needs NO live tuning): bounds the
-  # predicted joint step BEFORE the controller IK spikes past JOINT_IGNORE_SPEED
-  # (30 rad/s) and drops external control. Naturally directional — holds motion
-  # INTO a wrist(q5≈0)/elbow/boundary singularity, allows escape. Uses DH fetched
-  # per-arm at connect + these datasheet CS66 rates (J1/J2 150°/s, J3 180°/s,
-  # J4-6 230°/s). Watch the connect log for "Kinematic scaling enabled
-  # [joint-vel-limit]"; if it logs "...disabled" the DH fetch / FK self-check
-  # failed and the guard fail-safes off (resolve DH before relying on it).
-  joint_vel_limits_rad_s: [2.618, 2.618, 3.142, 4.014, 4.014, 4.014]
-  joint_vel_limit_margin: 0.8 # enforce at 80% of the limits; lower (e.g. 0.6) for more headroom
-  log_manipulability: true # DIAG: print per-tick w / sigma_min / s / s_jv (turn off in production)
-
-  # ── Manipulability (w-band) damping — THE fix for the "extend → IK refuses" trips ──
-  # Trip diagnosis (session 14:04, left): reaching out SLOWLY, w=|det(J)| fell 0.084→0.020 and the
-  # controller REFUSED the near-singular target (qdot_tgt=0 — NOT an overspeed; the joint-vel guard
-  # saw tiny velocities and stayed s_jv=1 the whole way down, so it structurally cannot catch this).
-  # This directional w-band slows the command as w drops so the operator feels resistance BEFORE the
-  # ~0.02 IK-refusal, while leaving retraction (escape / rising w) free. Thresholds from the live w
-  # trace (normal ~0.08, refuse ~0.02): raise singularity_w_low toward 0.035 if it still trips; lower
-  # singularity_w_high toward 0.04 if it damps legit reach too early. Watch "manipulability w=.. -> s=..".
-  singularity_directional: true
-  singularity_w_high:
-    0.055 # begin damping only just above the hold — narrowed from 0.065 because the
-    # RIGHT arm's normal table work sits at w~0.045-0.06 and was being damped
-    # 95% of the time ("not tracking the hand"). At 0.055 its w>0.055 moves run
-    # free; only w in 0.05-0.055 ramps, w<=0.05 holds.
-  singularity_w_low: 0.05 # TRUE hold at/below this — ABOVE the highest observed refusal (w=0.047).
-  singularity_min_scale:
-    0.0 # 0 = full hold into the singularity (no creep-through); OK because
-    # directional=true still lets any escape / retraction (rising w) run free.
-    # NOTE: refusal-w varies 0.015-0.043 across configs and overlaps normal
-    # working w (dips to ~0.058), so w_high=0.06 will damp some deep reaches —
-    # accepted as the safety trade-off. Watch the now-per-tick w->s log.
+  # Singularity / joint overspeed are handled by the native planner below (Pink IK
+  # Hessian damping + native joint velocity/acceleration/jerk limits). The old Python
+  # singularity_* / joint_vel_* guards protected the controller's own Cartesian IK,
+  # which the Pink path no longer uses (only joint servoJ reaches the controller),
+  # and their w-band hold locked the right arm in normal workspace (2026-10-15,
+  # w=0.048 -> s=0). They have been removed; those keys are now rejected.
   # Per-servo-tick velocity ceiling — smooths jumpy Pico4 wrist tracking at the source.
-  max_lin_speed: 0.25 # m/s
-  max_ang_speed: 1.0 # rad/s (matches the Bi-Pico4 max_rot_velocity default)
+  max_lin_speed: 0.25 # m/s; the native planner uses min(this, native_max_tcp_linear_velocity)
+  max_ang_speed: 1.0 # rad/s; the native planner uses min(this, native_max_tcp_angular_velocity)
+
+  # ── Native motion planning & safety (libpyelite) ────────────────────────────
+  # Same keys as third_party/libpyelite/examples/sim_safety.json. The simulator
+  # reads this block too, so the same file can be checked there first:
+  #   python -m libpyelite.sim --recipe <this file>
+  # The TCP speed cap is max_lin_speed / max_ang_speed above.
+  # Cartesian smoothing before IK; limits are magnitudes of the TCP twist, so a
+  # straight drag stays straight and a rotation turns about the TCP.
+  native_cartesian_motion_limits: true
+  native_max_linear_acceleration: 5.0    # m/s²
+  native_max_angular_acceleration: 10.0  # rad/s²
+  native_max_linear_jerk: 1000.0         # m/s³
+  native_max_angular_jerk: 2500.0        # rad/s³
+  # Joint Ruckig after IK. Elite publishes no joint acceleration/jerk rating:
+  # these only back the Cartesian limits up and should rarely bind.
+  native_joint_motion_limits: true
+  native_max_joint_velocity: [2.6, 2.6, 3.1, 3.1, 3.1, 3.1]  # rad/s; datasheet, wrist capped by the URDF's pi
+  native_max_joint_acceleration: [40.0, 40.0, 40.0, 40.0, 40.0, 40.0]  # rad/s²
+  native_max_joint_jerk: [5000.0, 5000.0, 5000.0, 5000.0, 5000.0, 5000.0]  # rad/s³
+  # Reject a target that jumps this far from the previous accepted one (0 = off).
+  # A rejection is a fault: the arms stop with a latched error.
+  native_max_target_translation_jump: 0.5  # m
+  native_max_target_rotation_jump: 1.5     # rad
+  native_max_target_joint_jump: 0.3        # rad, joint targets only
+  # Collision avoidance (table, stand, self, other arm): null | auto | <collision.json>.
+  # Set, the robot plans both arms through the same native StationGuard as
+  # libpyelite.sim (check the recipe there first), and MoveJ start/home moves are
+  # refused when their joint path is blocked. Not yet validated on hardware.
+  # This recipe sets no native_assembly; the simulator would load diagonal-08.
+  # Set native_assembly before using `auto`.
+  native_collision_profile: null
+  # Joint-current contact stop (any link). Off until its thresholds are tuned on
+  # the bench; see third_party/libpyelite/examples/contact_monitor.json.
+  native_contact_monitor: null
 
   # NOTE: max_reach_radius intentionally left OFF (config default None). The 2026-07-09
   # trip was NOT a reach-boundary problem — the flange was at 0.82 m (well inside the
   # ~0.91 m reach) in a near-singular direction (w=0.051), and a base-origin sphere is
-  # the wrong model anyway (the ~194mm tool makes TCP-distance a poor reach proxy). The
-  # real fix is the model-based joint-vel guard, which is now enabled once the FK
-  # self-check passes on position (see the singularity_* / joint_vel_* handling).
+  # the wrong model anyway (the ~194mm tool makes TCP-distance a poor reach proxy).
+  # That trip came from the controller's Cartesian IK, which the native Pink path
+  # replaced.
 
 teleop:
   type: bi_pico4

@@ -142,6 +142,8 @@ class Pico4(Teleoperator):
 
         # Output rate limiter state
         self._last_action_time: float | None = None  # Timestamp of last get_action call
+        # Robot TCP [x,y,z,qw,qx,qy,qz,...] read on each grip press (grip_anchor_to_robot).
+        self._grip_anchor_source = None
         self._prev_target_pos: np.ndarray | None = None  # Previous frame target position
         self._prev_target_quat: np.ndarray | None = None  # Previous frame target quaternion
 
@@ -292,6 +294,31 @@ class Pico4(Teleoperator):
     def configure(self) -> None:
         """No additional configuration needed."""
         pass
+
+    def set_grip_anchor_source(self, source) -> None:
+        """``source()`` -> the robot's measured TCP [x,y,z,qw,qx,qy,qz,...] in world frame.
+
+        Used on each grip press when ``grip_anchor_to_robot`` is set.
+        """
+        self._grip_anchor_source = source
+
+    def _anchor_target_to_robot(self) -> None:
+        if not self.config.grip_anchor_to_robot or self._grip_anchor_source is None:
+            return
+        try:
+            pose = np.asarray(self._grip_anchor_source(), dtype=np.float64)
+        except Exception as exc:
+            self.logger.warn(f"[ANCHOR] Could not read the robot TCP, keeping the last target: {exc}")
+            return
+        if pose.shape[0] < 7 or not np.isfinite(pose[:7]).all():
+            self.logger.warn(f"[ANCHOR] Invalid robot TCP {pose}, keeping the last target")
+            return
+        self.logger.debug(f"[ANCHOR] grip pressed: target {self._target_pos} -> robot TCP {pose[:3]}")
+        self._target_pos = pose[:3].astype(np.float32)
+        self._target_quat = normalize_quaternion(pose[3:7], input_format="wxyz")
+        # The output rate limiter must not slew from the old target to this one.
+        self._prev_target_pos = self._target_pos.copy()
+        self._prev_target_quat = self._target_quat.copy()
 
     def reset_to_pose(self, pose_7d: np.ndarray, gripper_pos: float = 0.0) -> None:
         """
@@ -613,6 +640,7 @@ class Pico4(Teleoperator):
             # Reset jump filter baseline so the new grip press starts fresh.
             # Without this, a prior jump clamp would lock position permanently.
             self._last_raw_pose = None
+            self._anchor_target_to_robot()
 
         if just_enabled or self._ref_pos is None:
             self.logger.debug(

@@ -16,6 +16,19 @@
 
 robot:
   type: bi_elite_cs66_rt
+  # Validated bench-08 assembly; overrides the legacy mount angles below.
+  native_assembly: diagonal-08
+  # Teach-pendant TCP with the TacCap gripper, in metres (tool0 <- TCP); zero TCP
+  # rotation. Calibrated 2026-10-10 as x=1.9, y=-43.63, z=211.87 mm; both arms carry
+  # the same end effector, so they share it. Does not apply to bench 07 or xgripper.
+  left_tool_transform: [1.0, 0.0, 0.0, 0.00190,
+                        0.0, 1.0, 0.0, -0.04363,
+                        0.0, 0.0, 1.0, 0.21187,
+                        0.0, 0.0, 0.0, 1.0]
+  right_tool_transform: [1.0, 0.0, 0.0, 0.00190,
+                         0.0, 1.0, 0.0, -0.04363,
+                         0.0, 0.0, 1.0, 0.21187,
+                         0.0, 0.0, 0.0, 1.0]
 
   # ── Bench hardware (diagonal-08) ────────────────────────────────────────────
   left_robot_ip: "192.168.8.53"
@@ -103,27 +116,55 @@ robot:
   left_use_gripper: true
   right_use_gripper: true
 
-  # ── Singularity / joint-overspeed guards (fixes the down-near-table trips) ──
-  # Predicted joint-velocity guard (model-based, needs NO live tuning): bounds the
-  # predicted joint step BEFORE the controller IK spikes past JOINT_IGNORE_SPEED
-  # (30 rad/s) and drops external control. Naturally directional — holds motion
-  # INTO a wrist(q5≈0)/elbow/boundary singularity, allows escape. Uses DH fetched
-  # per-arm at connect + these datasheet CS66 rates (J1/J2 150°/s, J3 180°/s,
-  # J4-6 230°/s). Watch the connect log for "Kinematic scaling enabled
-  # [joint-vel-limit]"; if it logs "...disabled" the DH fetch / FK self-check
-  # failed and the guard fail-safes off (resolve DH before relying on it).
-  joint_vel_limits_rad_s: [2.618, 2.618, 3.142, 4.014, 4.014, 4.014]
-  joint_vel_limit_margin: 0.8 # enforce at 80% of the limits; lower (e.g. 0.6) for more headroom
+  # Singularity / joint overspeed are handled by the native planner below (Pink IK
+  # Hessian damping + native joint velocity/acceleration/jerk limits). The old Python
+  # singularity_* / joint_vel_* guards protected the controller's own Cartesian IK,
+  # which the Pink path no longer uses (only joint servoJ reaches the controller),
+  # and their w-band hold locked the right arm in normal workspace (2026-10-15,
+  # w=0.048 -> s=0). They have been removed; those keys are now rejected.
   # Per-servo-tick velocity ceiling — smooths jumpy Pico4 wrist tracking at the source.
-  max_lin_speed: 0.25 # m/s
-  max_ang_speed: 1.0  # rad/s (matches the Bi-Pico4 max_rot_velocity default)
+  max_lin_speed: 0.25 # m/s; the native planner uses min(this, native_max_tcp_linear_velocity)
+  max_ang_speed: 1.0  # rad/s; the native planner uses min(this, native_max_tcp_angular_velocity)
+
+  # ── Native motion planning & safety (libpyelite) ────────────────────────────
+  # Same keys as third_party/libpyelite/examples/sim_safety.json. The simulator
+  # reads this block too, so the same file can be checked there first:
+  #   python -m libpyelite.sim --recipe <this file>
+  # The TCP speed cap is max_lin_speed / max_ang_speed above.
+  # Cartesian smoothing before IK; limits are magnitudes of the TCP twist, so a
+  # straight drag stays straight and a rotation turns about the TCP.
+  native_cartesian_motion_limits: true
+  native_max_linear_acceleration: 5.0    # m/s²
+  native_max_angular_acceleration: 10.0  # rad/s²
+  native_max_linear_jerk: 1000.0         # m/s³
+  native_max_angular_jerk: 2500.0        # rad/s³
+  # Joint Ruckig after IK. Elite publishes no joint acceleration/jerk rating:
+  # these only back the Cartesian limits up and should rarely bind.
+  native_joint_motion_limits: true
+  native_max_joint_velocity: [2.6, 2.6, 3.1, 3.1, 3.1, 3.1]  # rad/s; datasheet, wrist capped by the URDF's pi
+  native_max_joint_acceleration: [40.0, 40.0, 40.0, 40.0, 40.0, 40.0]  # rad/s²
+  native_max_joint_jerk: [5000.0, 5000.0, 5000.0, 5000.0, 5000.0, 5000.0]  # rad/s³
+  # Reject a target that jumps this far from the previous accepted one (0 = off).
+  # A rejection is a fault: the arms stop with a latched error.
+  native_max_target_translation_jump: 0.1  # m
+  native_max_target_rotation_jump: 0.3     # rad
+  native_max_target_joint_jump: 0.3        # rad, joint targets only
+  # Collision avoidance (table, stand, self, other arm): null | auto | <collision.json>.
+  # Set, the robot plans both arms through the same native StationGuard as
+  # libpyelite.sim (check the recipe there first), and MoveJ start/home moves are
+  # refused when their joint path is blocked. Not yet validated on hardware.
+  # `auto` uses this assembly's TacCap collision.json (python -m libpyelite.sim --collision-profile auto).
+  native_collision_profile: auto
+  # Joint-current contact stop (any link). Off until its thresholds are tuned on
+  # the bench; see third_party/libpyelite/examples/contact_monitor.json.
+  native_contact_monitor: null
 
   # NOTE: max_reach_radius intentionally left OFF (config default None). The 2026-07-09
   # trip was NOT a reach-boundary problem — the flange was at 0.82 m (well inside the
   # ~0.91 m reach) in a near-singular direction (w=0.051), and a base-origin sphere is
-  # the wrong model anyway (the ~194mm tool makes TCP-distance a poor reach proxy). The
-  # real fix is the model-based joint-vel guard, which is now enabled once the FK
-  # self-check passes on position (see the singularity_* / joint_vel_* handling).
+  # the wrong model anyway (the ~194mm tool makes TCP-distance a poor reach proxy).
+  # That trip came from the controller's Cartesian IK, which the native Pink path
+  # replaced.
 
 teleop:
   type: bi_pico4
@@ -131,16 +172,16 @@ teleop:
   ori_sensitivity: 1.0
 
 dataset:
-  repo_id: Xense/bi_elite_cs66_rt_test
-  single_task: "pick up the cube and place it in the box"
+  repo_id: Xense/bi_elite_cs66_rt_egg_carton_to_tray
+  single_task: "Open the egg carton, then take out the eggs one by one and place them in the egg tray."
   fps: 30 # must equal teleop fps
-  episode_time_s: 60
-  reset_time_s: 15
+  episode_time_s: 1200
+  reset_time_s: 300
   num_episodes: 2
   video: true
   push_to_hub: false
   private: false
 
 # ── Record loop (top level) ──
-display_data: true
+display_data: false
 resume: false

@@ -52,6 +52,11 @@ class Pico4Config(TeleoperatorConfig):
     ori_sensitivity: float = 1.0  # Scale factor for orientation delta (1.0 = 1:1 mapping)
     filter_window_size: int = 1  # Moving average filter window size
     gripper_width: float = 1.0  # Maximum gripper position in control space [0, 1]
+    # On each grip press, restart the mapping from the robot's measured TCP
+    # instead of the last target, when the robot loop provides it
+    # (set_grip_anchor_source). After a collision hold the last target sits
+    # behind the obstacle; re-gripping then moves the arm away immediately.
+    grip_anchor_to_robot: bool = True
     grip_enable_threshold: float = 0.5  # Threshold for grip to enable control (must exceed to enable)
     grip_disable_threshold: float = 0.3  # Threshold for grip to disable control (must drop below to disable)
     orientation_offset_warning_deg: float = (

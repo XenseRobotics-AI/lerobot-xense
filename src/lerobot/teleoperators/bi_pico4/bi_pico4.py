@@ -100,6 +100,7 @@ class BiPico4(Teleoperator):
             grip_disable_threshold=config.grip_disable_threshold,
             orientation_offset_warning_deg=config.orientation_offset_warning_deg,
             position_jump_threshold=config.position_jump_threshold,
+            grip_anchor_to_robot=config.grip_anchor_to_robot,
         )
         right_config = Pico4Config(
             id="bi_pico4_right",
@@ -115,6 +116,7 @@ class BiPico4(Teleoperator):
             grip_disable_threshold=config.grip_disable_threshold,
             orientation_offset_warning_deg=config.orientation_offset_warning_deg,
             position_jump_threshold=config.position_jump_threshold,
+            grip_anchor_to_robot=config.grip_anchor_to_robot,
         )
         self._left_pico4 = Pico4(left_config)
         self._right_pico4 = Pico4(right_config)
@@ -328,6 +330,14 @@ class BiPico4(Teleoperator):
         right_action = self._right_pico4.get_action()
 
         return {f"left_{k}": v for k, v in left_action.items()} | {f"right_{k}": v for k, v in right_action.items()}
+
+    def set_grip_anchor_source(self, source) -> None:
+        """``source()`` -> (left TCP, right TCP), each [x,y,z,qw,qx,qy,qz,...] in world frame.
+
+        Each controller re-anchors to its own arm on its own grip press.
+        """
+        self._left_pico4.set_grip_anchor_source(lambda: source()[0])
+        self._right_pico4.set_grip_anchor_source(lambda: source()[1])
 
     def reset_to_pose(
         self,
