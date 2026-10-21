@@ -131,6 +131,11 @@ robot:
   # Joint Ruckig after IK. Elite publishes no joint acceleration/jerk rating:
   # these only back the Cartesian limits up and should rarely bind.
   native_joint_motion_limits: true
+  # Preserve the startup IK configuration; hold orientation at reach boundaries.
+  native_preserve_configuration: true
+  native_configuration_margin: 0.05235987755982989  # radians (3 degrees)
+  native_configuration_joint_span: 3.140592653589793  # unwrapped half-span, pi - 0.001
+  native_boundary_orientation_tolerance: 0.01  # radians
   native_max_joint_velocity: [2.6, 2.6, 3.1, 3.1, 3.1, 3.1]  # rad/s; datasheet, wrist capped by the URDF's pi
   native_max_joint_acceleration: [40.0, 40.0, 40.0, 40.0, 40.0, 40.0]  # rad/s²
   native_max_joint_jerk: [5000.0, 5000.0, 5000.0, 5000.0, 5000.0, 5000.0]  # rad/s³
