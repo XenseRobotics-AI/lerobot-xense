@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 from lerobot.robots.bi_elite_cs66_rt.bi_elite_cs66_rt import BiEliteCS66RT
 from lerobot.robots.bi_elite_cs66_rt.config_bi_elite_cs66_rt import BiEliteCS66RTControlMode
+from lerobot.robots.elite_cs66_rt.joint_reset import JointReset
 
 
 class PublisherTests(unittest.TestCase):
@@ -24,6 +25,10 @@ class PublisherTests(unittest.TestCase):
         robot._station_gripper_readers = {}
         robot._coordinator = None
         robot.config = SimpleNamespace(native_collision_gripper_publish_hz=100.0, native_collision_profile=None)
+        robot._joint_reset = JointReset(robot.config)
+        robot._servo_lock = {side: threading.Lock() for side in ("left", "right")}
+        robot._last_tcp_command = dict.fromkeys(("left", "right"))
+        robot._last_submit_time = dict.fromkeys(("left", "right"), 0.0)
         robot._gripper = {side: Mock() for side in ("left", "right")}
         for gripper in robot._gripper.values():
             gripper.config.type = "taccap_follower"
@@ -43,6 +48,10 @@ class PublisherTests(unittest.TestCase):
         robot = self.robot()
         robot._driver = {side: Mock() for side in ("left", "right")}
         robot._rtsi = {side: Mock() for side in ("left", "right")}
+        for rtsi in robot._rtsi.values():
+            rtsi.getTimestamp.return_value = 1.0
+            rtsi.getActualJointPositions.return_value = [0.0] * 6
+            rtsi.getActualJointVelocity.return_value = [0.0] * 6
         robot._coordinator = Mock()
         robot._coordinator.status.return_value = SimpleNamespace(running=True, error="")
         return robot

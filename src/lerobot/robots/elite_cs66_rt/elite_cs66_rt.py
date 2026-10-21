@@ -32,6 +32,7 @@ from lerobot.robots.elite_cs66_rt.config_elite_cs66_rt import (
     EliteCS66RTConfig,
     EliteCS66RTControlMode,
 )
+from lerobot.robots.elite_cs66_rt.joint_reset import JointReset, joint_sample
 from lerobot.robots.robot import Robot
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 from lerobot.utils.robot_utils import (
@@ -82,9 +83,44 @@ def _configure_native_driver(cfg, config, tool, side=None, world_from_base=None)
             "Installed libpyelite predates max_consecutive_write_failures; rebuild it from "
             "third_party/libpyelite (./setup_env.sh --elite)."
         )
+    fields = (
+        "preserve_configuration",
+        "configuration_margin",
+        "configuration_joint_span",
+        "boundary_orientation_tolerance",
+    )
+    for field in fields:
+        if not hasattr(cfg.planner, field):
+            raise RuntimeError(
+                f"Installed libpyelite lacks PlannerConfig.{field}; rebuild it from "
+                "third_party/libpyelite (./setup_env.sh --elite)."
+            )
     from libpyelite.control_profile import configure_native_driver
 
     configure_native_driver(cfg, config, tool, side, world_from_base)
+    for field in fields:
+        setattr(cfg.planner, field, getattr(config, "native_" + field))
+
+
+def _validate_configuration_model(cs, cfg) -> None:
+    """Validate the effective model, including an assembly's selected arm chain."""
+    if not cfg.planner.preserve_configuration:
+        return
+    model = cs.PinkIKModel(cfg.model_path or cs.model_path())
+    lower = np.asarray(model.lower_limits, dtype=np.float64)
+    upper = np.asarray(model.upper_limits, dtype=np.float64)
+    velocity = np.asarray(model.velocity_limits, dtype=np.float64)
+    if (
+        lower.shape != (6,)
+        or upper.shape != (6,)
+        or velocity.shape != (6,)
+        or not np.isfinite(lower).all()
+        or not np.isfinite(upper).all()
+        or not np.isfinite(velocity).all()
+        or np.any(lower >= upper)
+        or np.any(velocity <= 0)
+    ):
+        raise ValueError("Configuration preservation requires six finite bounded joints with positive velocity limits")
 
 
 def _rotvec_to_quaternion(rotvec: np.ndarray) -> np.ndarray:
@@ -218,6 +254,8 @@ class EliteCS66RT(Robot):
         self._reach_warn_time: float = 0.0  # throttle for the workspace-guard warning
         self._servo_lock = threading.Lock()
         self._start_tcp_pose: np.ndarray | None = None
+        self._q_start: np.ndarray | None = None
+        self._joint_reset = JointReset(config)
 
         # External cameras — with the gripper's cameras auto-discovered, resolve
         # the wrist camera + GSPS tactile SNs from hardware and inject them into
@@ -377,6 +415,7 @@ class EliteCS66RT(Robot):
         else:
             cfg.script_file_path = self._resolve_sdk_resource("external_control.script")
         _configure_native_driver(cfg, self.config, self.config.tool_transform)
+        _validate_configuration_model(self._cs, cfg)
         if self.config.tool_transform is None:
             assert self._rtsi is not None
             cfg.tool = _derive_controller_tool(self._cs, self._rtsi, cfg.model_path or self._cs.model_path())
@@ -395,6 +434,8 @@ class EliteCS66RT(Robot):
         if self.is_connected:
             raise DeviceAlreadyConnectedError(f"{self} already connected, do not run connect() twice.")
 
+        self._joint_reset.prepare_connection()
+        self._q_start = None
         self._cs = _import_elite_sdk()
         # No Python real-time scheduling; native workers own the servo path.
 
@@ -498,12 +539,18 @@ class EliteCS66RT(Robot):
             self._start_tcp_pose = current_tcp.copy()
         try:
             self._start_servo_loop()
+            # Save actual joints only after successful native startup. With
+            # go_to_start=False this is the reattached pose, not the recipe pose.
+            self._q_start = joint_sample(self._rtsi)[1]
         except BaseException:
             self._is_connected = False
             self._cleanup_after_failed_connect()
             raise
 
     def _cleanup_after_failed_connect(self) -> None:
+        self._joint_reset.close()
+        self._q_start = None
+        self._clear_reset_targets()
         # Drop the driver / dashboard / RTSI handles first.
         with best_effort(self.logger, "stopping control"):
             if self._driver is not None:
@@ -560,9 +607,6 @@ class EliteCS66RT(Robot):
     def _raise_servo_error_if_any(self) -> None:
         if self._driver is not None:
             self._driver.check_error()
-
-    def _is_reset_moving_locked(self, now: float) -> bool:
-        return self._driver is not None and self._driver.status().reset_active
 
     def _tcp_rotvec_to_feature_values(self, tcp_pose: np.ndarray) -> dict[str, float]:
         values = {
@@ -745,6 +789,17 @@ class EliteCS66RT(Robot):
             self.logger.warn(f"LARGE JOINT STEP {msg}")
 
     def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
+        # The gate spans checking reset ownership and submitting the action;
+        # a reset cannot latch between those operations.
+        with self._joint_reset.lock:
+            self._joint_reset.check_error()
+            if self._joint_reset.closing:
+                raise DeviceNotConnectedError(f"{self} is disconnecting.")
+            if self._joint_reset.active:
+                return {}
+            return self._send_action(action)
+
+    def _send_action(self, action: dict[str, Any]) -> dict[str, Any]:
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
         assert self._driver is not None
@@ -790,6 +845,11 @@ class EliteCS66RT(Robot):
             self.logger.warn(f"{self} is not connected, skipping disconnect.")
             return
 
+        # Join before releasing handles or starting home motion; the worker
+        # cancels its targets and cannot write after this returns.
+        self._joint_reset.close()
+        self._q_start = None
+        self._clear_reset_targets()
         for cam in self.cameras.values():
             if cam.is_connected:
                 cam.disconnect()
@@ -855,8 +915,11 @@ class EliteCS66RT(Robot):
 
     @property
     def rt_moving(self) -> bool:
-        with self._servo_lock:
-            return self._is_reset_moving_locked(time.monotonic())
+        return self._joint_reset.moving()
+
+    def get_reset_status(self) -> dict:
+        """Measured reset outcome; failures are also raised by rt_moving/send_action."""
+        return self._joint_reset.status()
 
     def get_current_tcp_pose_quat(self) -> np.ndarray:
         if not self.is_connected:
@@ -905,15 +968,15 @@ class EliteCS66RT(Robot):
     def reset_to_initial_position(self) -> None:
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
-        self._raise_servo_error_if_any()
-        if self.config.control_mode != EliteCS66RTControlMode.CARTESIAN_SERVO:
-            self._move_j_blocking(list(self.config.start_position_rad), self.config.reset_duration_s)
-        elif self._start_tcp_pose is not None and not self.rt_moving:
-            self._driver.submit_target(_pose6_to_matrix(self._start_tcp_pose), self.config.reset_duration_s)
-            with self._servo_lock:
-                self._last_tcp_command = self._start_tcp_pose.copy()
-                self._last_submit_time = time.monotonic()
-            if not self.config.use_background_servo_loop:
-                while self.rt_moving:
-                    self._raise_servo_error_if_any()
-                    time.sleep(0.01)
+        self._joint_reset.start(
+            {"arm": self._driver},
+            {"arm": self._rtsi},
+            {"arm": self._q_start},
+            lambda targets: None,
+            self._clear_reset_targets,
+        )
+
+    def _clear_reset_targets(self) -> None:
+        with self._servo_lock:
+            self._last_tcp_command = None
+            self._last_submit_time = 0.0

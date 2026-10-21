@@ -18,6 +18,7 @@ from pathlib import Path
 from lerobot.cameras.configs import CameraConfig
 from lerobot.grippers import GripperConfig
 from lerobot.robots.config import RobotConfig
+from lerobot.robots.elite_cs66_rt.joint_reset import validate_reset_config
 
 
 # Not StrEnum, which UP042 suggests: StrEnum changes what str() returns —
@@ -84,15 +85,28 @@ class EliteCS66RTConfig(RobotConfig):
     # Native streaming always runs; this flag selects async vs blocking reset.
     use_background_servo_loop: bool = True
     command_stale_timeout_s: float = 0.5
+    # Joint-reference duration; completion additionally requires fresh measured
+    # joint angle and speed within tolerance throughout the stable dwell.
     reset_duration_s: float = 3.0
+    reset_timeout_s: float = 15.0
+    reset_joint_tolerance_rad: float = 0.005
+    reset_velocity_tolerance_rad_s: float = 0.01
+    reset_stable_dwell_s: float = 0.2
+    reset_feedback_timeout_s: float = 0.5
 
     # Native libpyelite planner; coordinates are still converted by this adapter.
     native_model_path: str | Path | None = None
     native_ik_max_iterations: int = 500
+    # Keep Cartesian IK on the seeded arm configuration; bounded models are
+    # validated at connect, and an SDK missing these fields is rejected.
+    native_preserve_configuration: bool = True
+    native_configuration_margin: float = math.radians(3.0)
+    native_configuration_joint_span: float = math.pi - 1e-3
+    native_boundary_orientation_tolerance: float = 0.01
     native_max_tcp_linear_velocity: float = 0.5  # m/s, planning cap
     native_max_tcp_angular_velocity: float = 1.0  # rad/s, planning cap
     native_joint_velocity_scale: float = 1.0  # fraction of official URDF limit
-    # Explicit opt-in trajectory limits; values are rad/s, rad/s², rad/s³.
+    # Joint trajectory limits; defaults match the Elite recipes (rad/s, rad/s², rad/s³).
     native_joint_target_horizon: float = 0.0  # deprecated, ignored: limits now track the IK reference
     native_joint_tracking_gain: float | None = None  # 1/s, default 20
     # Cartesian smoothing before IK (opt-in). Limits are magnitudes of the linear /
@@ -103,10 +117,10 @@ class EliteCS66RTConfig(RobotConfig):
     native_max_linear_jerk: float | None = None  # m/s³, default 1000
     native_max_angular_jerk: float | None = None  # rad/s³, default 2500
     native_cartesian_tracking_gain: float | None = None  # 1/s, default 20
-    native_joint_motion_limits: bool = False
-    native_max_joint_velocity: list[float] | None = None
-    native_max_joint_acceleration: list[float] | None = None
-    native_max_joint_jerk: list[float] | None = None
+    native_joint_motion_limits: bool = True
+    native_max_joint_velocity: list[float] | None = field(default_factory=lambda: [2.6, 2.6, 3.1, 3.1, 3.1, 3.1])
+    native_max_joint_acceleration: list[float] | None = field(default_factory=lambda: [40.0] * 6)
+    native_max_joint_jerk: list[float] | None = field(default_factory=lambda: [5000.0] * 6)
     native_max_target_translation_jump: float = 0.0
     native_max_target_rotation_jump: float = 0.0
     native_max_target_joint_jump: float = 0.0
@@ -223,6 +237,7 @@ class EliteCS66RTConfig(RobotConfig):
     _serial_autodiscover: bool = field(default=False, init=False)
 
     def __post_init__(self):
+        validate_reset_config(self)
         if self.native_ik_max_iterations < 1:
             raise ValueError("native_ik_max_iterations must be positive")
         for name in (
