@@ -19,6 +19,7 @@ from lerobot.grippers import SerialGripperConfig, TaccapFollowerConfig
 from lerobot.robots.bi_rebot_b601_rt import BiRebotB601RT, BiRebotB601RTConfig, bi_rebot_b601_rt as bi_driver
 from lerobot.robots.rebot_b601_rt import RebotB601RT, RebotB601RTConfig, rebot_b601_rt as driver
 from lerobot.robots.rebot_b601_rt.dm_serial_discovery import DMSerialDevice
+from lerobot.robots.rebot_b601_rt.exit_policy import exit_reset_allowed
 from lerobot.robots.rebot_b601_rt.gravity_compensation import load_joint_torque_offsets
 
 ASSETS = Path(rebot_rt.__file__).parent / "assets"
@@ -558,9 +559,11 @@ class TestRebotB601RT(unittest.TestCase):
         robot.connect()
         self.native.set_target_pose.return_value = SimpleNamespace(success=False, error=0.001)
         self.native.get_state.return_value = SimpleNamespace(fault=True, fault_reason="feedback lost")
-        with self.assertRaisesRegex(RuntimeError, "feedback lost"):
+        with self.assertRaisesRegex(RuntimeError, "feedback lost") as raised:
             robot.send_action(driver._action_from_pose(np.eye(4)))
         self.native.get_target_joints.assert_not_called()
+        # CLI teardown must recognise this as an arm fault and skip the exit return.
+        self.assertFalse(exit_reset_allowed(raised.exception))
 
     def test_reset_returns_to_configured_joints_and_waits_for_measured_settling(self):
         robot = self.make_robot(reset_position_rad=INITIAL_POSE, max_joint_speed=1.5, reset_joint_speed=0.5)

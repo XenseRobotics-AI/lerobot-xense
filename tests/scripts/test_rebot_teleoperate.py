@@ -1,5 +1,6 @@
 """B601 handoffs preserve commanded TCP poses; dry runs use measured poses."""
 
+import contextlib
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, call, patch
@@ -7,6 +8,7 @@ from unittest.mock import Mock, call, patch
 import draccus
 import numpy as np
 
+from lerobot.robots.rebot_b601_rt.exit_policy import B601ControlFaultError
 from lerobot.scripts import lerobot_teleoperate as cli, teleop_device_loops as loops
 from tests.scripts.conftest_teleop_doubles import FakeBiPico4Teleop, FakeRobot, FakeTeleop, run_loop
 from tests.scripts.rebot_test_assets import isolated_rebot_assets
@@ -140,12 +142,16 @@ class TestRebotTeleoperate(unittest.TestCase):
         cleanup.assert_called_once_with(None, None, False)
         self.assertIn("missing rebot_rt", cli.logger.error.call_args.args[0])
 
-    def test_disconnect_requests_return_only_after_normal_or_interrupted_loop(self):
+    def test_disconnect_skips_return_only_for_arm_faults_or_dry_runs(self):
         for mode in ("mit", "pos_vel"):
             for outcome, enabled, dryrun, expected in (
                 (None, True, False, True),
                 (KeyboardInterrupt(), True, False, True),
-                (RuntimeError("motor fault"), True, False, False),
+                (B601ControlFaultError("B601 C++ control fault: motor fault"), True, False, False),
+                (RuntimeError("control fault: CAN timeout"), True, False, False),
+                (TimeoutError("camera frame timeout"), True, False, True),
+                (RuntimeError("Pico4 VR stream lost"), True, False, True),
+                (ValueError("TCP rotation columns are parallel"), True, False, True),
                 (KeyboardInterrupt(), False, False, True),
                 (KeyboardInterrupt(), True, True, False),
             ):
@@ -169,29 +175,35 @@ class TestRebotTeleoperate(unittest.TestCase):
                         patch.object(cli, "make_teleoperator_from_config", return_value=teleop),
                         patch.object(cli, "run_cartesian_teleop_loop", side_effect=outcome),
                         patch.object(cli, "_cleanup", new=events.cleanup),
+                        # teleoperate() logs and swallows ordinary exceptions; Ctrl+C is suppressed in the loop.
+                        contextlib.suppress(KeyboardInterrupt),
                     ):
                         cli.teleoperate(config)
                     self.assertEqual(
                         events.mock_calls, [call.disconnect(reset=expected), call.cleanup(robot, teleop, False)]
                     )
 
-    def test_startup_interrupt_does_not_start_exit_reset(self):
-        config = draccus.parse(
-            cli.TeleoperateConfig,
-            config_path=ROOT / "recipes/teleop/rebot_b601_rt/rs-taccap05.yaml",
-            args=["--display_data=false"],
-        )
-        robot, teleop = Mock(), Mock()
-        teleop.connect.side_effect = KeyboardInterrupt
-        with (
-            patch.object(cli, "make_robot_from_config", return_value=robot),
-            patch.object(cli, "make_teleoperator_from_config", return_value=teleop),
-            patch.object(cli, "_cleanup") as cleanup,
-            self.assertRaises(KeyboardInterrupt),
-        ):
-            cli.teleoperate(config)
-        robot.disconnect.assert_called_once_with(reset=False)
-        cleanup.assert_called_once_with(robot, teleop, False)
+    def test_teleop_startup_failure_after_arm_startup_still_returns_the_arm(self):
+        # The arm is already enabled at its start pose when the VR/SpaceMouse
+        # connect fails; disabling it in place would drop it.
+        for error in (KeyboardInterrupt(), RuntimeError("VR service unavailable")):
+            with self.subTest(error=error):
+                config = draccus.parse(
+                    cli.TeleoperateConfig,
+                    config_path=ROOT / "recipes/teleop/rebot_b601_rt/rs-taccap05.yaml",
+                    args=["--display_data=false"],
+                )
+                robot, teleop = Mock(), Mock()
+                teleop.connect.side_effect = error
+                with (
+                    patch.object(cli, "make_robot_from_config", return_value=robot),
+                    patch.object(cli, "make_teleoperator_from_config", return_value=teleop),
+                    patch.object(cli, "_cleanup") as cleanup,
+                    contextlib.suppress(KeyboardInterrupt),
+                ):
+                    cli.teleoperate(config)
+                robot.disconnect.assert_called_once_with(reset=True)
+                cleanup.assert_called_once_with(robot, teleop, False)
 
     def test_single_arm_spacemouse_uses_commanded_euler_pose(self):
         config = draccus.parse(

@@ -934,7 +934,9 @@ def teleoperate(cfg: TeleoperateConfig):
 
         # --- B601 RT + Cartesian teleoperators ---
         elif cfg.robot.type in ("rebot_b601_rt", "bi_rebot_b601_rt"):
-            b601_reset_on_disconnect = False
+            from lerobot.robots.rebot_b601_rt.exit_policy import exit_reset_allowed
+
+            b601_error: BaseException | None = None
             bimanual = cfg.robot.type == "bi_rebot_b601_rt"
             supported = ("bi_pico4",) if bimanual else ("pico4", "spacemouse")
             if cfg.teleop.type not in supported:
@@ -973,9 +975,14 @@ def teleoperate(cfg: TeleoperateConfig):
                         dryrun=cfg.dryrun,
                         debug_timing=cfg.debug_timing,
                     )
-                b601_reset_on_disconnect = not cfg.dryrun
+            except BaseException as error:
+                b601_error = error
+                raise
             finally:
-                robot.disconnect(reset=b601_reset_on_disconnect)
+                # A teleop/VR, camera or pose-input failure leaves the arm healthy;
+                # disabling it in place would drop it. Only an arm/controller fault
+                # (or a dry run, which never commands the arm) skips the return.
+                robot.disconnect(reset=not cfg.dryrun and exit_reset_allowed(b601_error))
 
         # --- flexiv_rizon4_rt + spacemouse ---
         elif cfg.robot.type == "flexiv_rizon4_rt" and cfg.teleop.type == "spacemouse":

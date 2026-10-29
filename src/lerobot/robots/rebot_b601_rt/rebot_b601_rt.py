@@ -28,6 +28,7 @@ from .dm_serial_discovery import (
     resolve_dm_serial_channel,
     verify_dm_serial_device,
 )
+from .exit_policy import B601ControlFaultError
 from .gravity_compensation import load_joint_torque_offsets
 from .taccap_discovery import inject_taccap_cameras
 from .tactile_camera import make_rebot_cameras as make_cameras_from_configs
@@ -596,7 +597,7 @@ class RebotB601RT(Robot):
 
     def _raise_control_fault(self, reason: str) -> None:
         self._log_can_error_hint(reason)
-        raise RuntimeError(f"B601 C++ control fault: {reason}")
+        raise B601ControlFaultError(f"B601 C++ control fault: {reason}")
 
     def _log_ik_status(self, success: bool, error: float, measured) -> None:
         if success:
@@ -614,7 +615,10 @@ class RebotB601RT(Robot):
             self._ik_failed = True
 
     def disconnect(self, *, reset: bool = True) -> None:
-        """Return all six arm joints to zero, then close; use reset=False after an error."""
+        """Return all six arm joints to zero, then close; use reset=False after an arm/controller fault.
+
+        See exit_policy.exit_reset_allowed for which session failures still return.
+        """
         try:
             # Gate on the arm controller only: a lost camera or gripper must not
             # skip the return to zero and leave the motors to be disabled in place.
