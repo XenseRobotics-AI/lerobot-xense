@@ -177,20 +177,26 @@ class BiRebotB601RT(Robot):
 
     def disconnect(self, *, reset: bool = True) -> None:
         """Return both arms to zero together, then stop controllers before peripheral cleanup."""
+        arms = (self.left_arm, self.right_arm)
         try:
-            if reset and self.config.reset_on_exit and self.is_connected:
+            # Gate on the arm controllers only, not cameras/grippers. Like a fault on
+            # either arm, a lost controller on either arm skips the coordinated return.
+            if reset and self.config.reset_on_exit and all(arm.arm_connected for arm in arms):
                 self.logger.info("B601 exit reset: returning both arms to zero; press Ctrl+C again to abort")
                 self._reset_to_positions([0.0] * 6, [0.0] * 6, exit_reset=True)
                 while self.rt_moving:
                     time.sleep(0.01)
                 self.logger.info("B601 exit reset complete; disconnecting both arms")
+            elif reset and self.config.reset_on_exit and any(arm._native is not None for arm in arms):
+                lost = [side for side, arm in zip(("left", "right"), arms, strict=True) if not arm.arm_connected]
+                self.logger.warn(f"B601 exit reset skipped: native controller not connected on {lost} arm(s)")
         except KeyboardInterrupt:
             self.logger.warn("B601 exit reset interrupted; disconnecting both arms immediately")
         except Exception as error:
             self.logger.error(f"B601 exit reset failed; disconnecting both arms: {error}")
         finally:
             # Stop both controllers before either arm's slower camera/gripper teardown.
-            for arm in (self.left_arm, self.right_arm):
+            for arm in arms:
                 with best_effort(arm.logger, "stopping the native arm"):
                     if arm._native is not None:
                         arm._native.stop()

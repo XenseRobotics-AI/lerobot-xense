@@ -1036,6 +1036,79 @@ class TestRebotB601RT(unittest.TestCase):
         self.native.close.assert_called_once()
         self.assertIsNone(robot._native)
 
+    def test_exit_reset_still_runs_after_peripheral_loss_but_not_after_controller_loss(self):
+        for lost in ("gripper", "camera", "native"):
+            with self.subTest(lost=lost):
+                native = fake_native()
+                self.native_factory.return_value = native
+                gripper = fake_gripper()
+                self.gripper_factory.return_value = gripper
+                robot = self.make_robot(reset_on_exit=True, gripper=TaccapFollowerConfig(auto_discover_cameras=False))
+                robot.connect(go_to_start=False)
+                robot.logger = Mock()
+                camera = SimpleNamespace(is_connected=True, disconnect=Mock())
+                robot.cameras["wrist"] = camera
+                if lost == "gripper":
+                    gripper.is_connected = False
+                elif lost == "camera":
+                    camera.is_connected = False
+                else:
+                    native.connected = False
+                self.assertFalse(robot.is_connected)
+                state = native.get_state.return_value
+                state.command = state.q = [0.4] * 6
+
+                def settle(_, state=state):
+                    state.command = state.q = [0.0] * 6
+
+                with patch.object(driver.time, "sleep", side_effect=settle):
+                    robot.disconnect()
+                if lost == "native":
+                    native.set_target_joints.assert_not_called()
+                    robot.logger.warn.assert_called_once()
+                    self.assertIn("skipped", robot.logger.warn.call_args.args[0])
+                else:
+                    native.set_target_joints.assert_called_with([0.0] * 6 + [-1.2], max_joint_speed=0.5)
+                    robot.logger.warn.assert_not_called()
+                native.close.assert_called_once()
+                self.assertIsNone(robot._native)
+
+    def test_bimanual_exit_reset_survives_peripheral_loss_and_skips_on_controller_loss(self):
+        for lost in ("camera", "native"):
+            with self.subTest(lost=lost):
+                left, right = fake_native(), fake_native()
+                self.native_factory.side_effect = [left, right]
+                robot = BiRebotB601RT(
+                    BiRebotB601RTConfig(
+                        calibration_dir=self.calibration_dir,
+                        reset_on_exit=True,
+                        left_arm_config=RebotB601RTConfig(channel="can1"),
+                        right_arm_config=RebotB601RTConfig(channel="can0"),
+                    )
+                )
+                robot.connect(go_to_start=False)
+                robot.logger = Mock()
+                if lost == "camera":
+                    robot.right_arm.cameras["lost"] = SimpleNamespace(is_connected=False)
+                else:
+                    right.connected = False
+                self.assertFalse(robot.is_connected)
+                for native in (left, right):
+                    native.get_state.return_value.command = native.get_state.return_value.q = [0.0] * 6
+                with patch.object(driver.time, "sleep"):
+                    robot.disconnect()
+                for native in (left, right):
+                    if lost == "camera":
+                        native.set_target_joints.assert_called_with([0.0] * 6 + [-1.2], max_joint_speed=0.5)
+                    else:
+                        native.set_target_joints.assert_not_called()
+                    native.stop.assert_called_once()
+                    native.close.assert_called_once()
+                if lost == "native":
+                    self.assertIn("['right']", robot.logger.warn.call_args.args[0])
+                else:
+                    robot.logger.warn.assert_not_called()
+
     def test_bimanual_startup_interrupt_closes_both_native_controllers(self):
         left, right = fake_native(), fake_native()
         right.start.side_effect = KeyboardInterrupt

@@ -147,6 +147,11 @@ class RebotB601RT(Robot):
         )
 
     @property
+    def arm_connected(self) -> bool:
+        """The native arm controller alone, regardless of camera/gripper state."""
+        return self._native is not None and self._native.connected
+
+    @property
     def is_calibrated(self) -> bool:
         # Hardware zero offsets live in the motor, independent of the local calibration record.
         return True
@@ -611,12 +616,16 @@ class RebotB601RT(Robot):
     def disconnect(self, *, reset: bool = True) -> None:
         """Return all six arm joints to zero, then close; use reset=False after an error."""
         try:
-            if reset and self.config.reset_on_exit and self.is_connected:
+            # Gate on the arm controller only: a lost camera or gripper must not
+            # skip the return to zero and leave the motors to be disabled in place.
+            if reset and self.config.reset_on_exit and self.arm_connected:
                 self.logger.info("B601 exit reset: returning to zero; press Ctrl+C again to abort")
                 self._reset_to_position([0.0] * 6, tolerance_rad=self.config.exit_reset_tolerance_rad)
                 while self.rt_moving:
                     time.sleep(0.01)
                 self.logger.info("B601 exit reset complete; disconnecting")
+            elif reset and self.config.reset_on_exit and self._native is not None:
+                self.logger.warn(f"B601 exit reset skipped: native controller on {self._channel} is not connected")
         except KeyboardInterrupt:
             self.logger.warn("B601 exit reset interrupted; disconnecting immediately")
         except Exception as error:
