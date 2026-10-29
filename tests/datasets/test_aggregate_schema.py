@@ -103,3 +103,90 @@ def test_aggregate_data_preserves_array_schema_and_values(tmp_path, legacy_sourc
     for key, expected in expected_arrays.items():
         np.testing.assert_array_equal(merged[key].to_pylist(), expected)
     assert datasets.Features.from_arrow_schema(merged.schema) == hf_features
+
+
+_INDEX_FEATURES = {
+    "episode_index": {"dtype": "int64", "shape": (1,)},
+    "index": {"dtype": "int64", "shape": (1,)},
+    "task_index": {"dtype": "int64", "shape": (1,)},
+}
+
+
+def _index_columns(num_frames):
+    return {
+        "episode_index": [0] * num_frames,
+        "index": list(range(num_frames)),
+        "task_index": [0] * num_frames,
+    }
+
+
+def _aggregate_single_source(tmp_path, features, frame, writer="pandas"):
+    """Write ``frame`` as a source data file and aggregate it once.
+
+    ``writer="pandas"`` mimics files written by plain pandas (incl. the old aggregate code);
+    ``writer="hf"`` mimics files written by LeRobotDataset recording (HF features schema).
+    """
+    tasks = pd.DataFrame({"task_index": [0]}, index=pd.Index(["clean plates"], name="task"))
+    source_root = tmp_path / "source"
+    source_path = source_root / DEFAULT_DATA_PATH.format(chunk_index=0, file_index=0)
+    source_path.parent.mkdir(parents=True)
+    if writer == "pandas":
+        frame.to_parquet(source_path)
+    else:
+        hf_features = get_hf_features_from_features(features)
+        datasets.Dataset.from_dict(frame.to_dict(orient="list"), features=hf_features).to_parquet(source_path)
+    source = SimpleNamespace(
+        root=source_root,
+        episodes=pd.DataFrame({"data/chunk_index": [0], "data/file_index": [0]}),
+        tasks=tasks,
+    )
+    destination = SimpleNamespace(
+        root=tmp_path / "merged",
+        features=features,
+        image_keys=[],
+        tasks=tasks,
+        info={"total_episodes": 0, "total_frames": 0},
+    )
+    aggregate_data(source, destination, {"chunk": 0, "file": 0}, data_files_size_in_mb=100, chunk_size=1000)
+    return pq.read_table(destination.root / DEFAULT_DATA_PATH.format(chunk_index=0, file_index=0))
+
+
+@pytest.mark.parametrize("writer", ["pandas", "hf"])
+def test_aggregate_data_accepts_2d_features(tmp_path, writer):
+    # pandas stores a 2-D feature as an object column of 1-D arrays (list<list<double>>), and an
+    # HF Array2D column reads back through pandas as 2-D ndarray cells. The old aggregate code
+    # merged both, so the schema-preserving writer must too.
+    num_frames = 3
+    features = {"observation.grid": {"dtype": "float32", "shape": (2, 3)}, **_INDEX_FEATURES}
+    grids = np.arange(num_frames * 6, dtype=np.float32).reshape(num_frames, 2, 3)
+    frame = pd.DataFrame({**_index_columns(num_frames), "observation.grid": [list(grid) for grid in grids]})
+
+    merged = _aggregate_single_source(tmp_path, features, frame, writer)
+
+    assert datasets.Features.from_arrow_schema(merged.schema) == get_hf_features_from_features(features)
+    np.testing.assert_array_equal(np.array(merged["observation.grid"].to_pylist(), dtype=np.float32), grids)
+
+
+def test_aggregate_data_keeps_undeclared_and_tolerates_missing_columns(tmp_path):
+    # Parquet columns and info.json features are not guaranteed to agree; the old
+    # aggregate code wrote whatever columns the source had instead of failing.
+    num_frames = 4
+    features = {
+        "action": {"dtype": "float32", "shape": (2,)},
+        "observation.declared_but_absent": {"dtype": "float32", "shape": (3,)},
+        **_INDEX_FEATURES,
+    }
+    actions = np.arange(num_frames * 2, dtype=np.float32).reshape(num_frames, 2)
+    frame = pd.DataFrame(
+        {**_index_columns(num_frames), "action": list(actions), "undeclared": np.arange(num_frames) * 0.5}
+    )
+
+    merged = _aggregate_single_source(tmp_path, features, frame)
+
+    assert set(merged.column_names) == {"episode_index", "index", "task_index", "action", "undeclared"}
+    assert merged.schema.field("action").type == pa.list_(pa.float32(), 2)
+    np.testing.assert_array_equal(merged["action"].to_pylist(), actions)
+    assert merged["undeclared"].to_pylist() == [0.0, 0.5, 1.0, 1.5]
+    # Declared features keep their HF type in the schema metadata used when loading.
+    hf = datasets.Features.from_arrow_schema(merged.schema)
+    assert hf["action"] == get_hf_features_from_features(features)["action"]
