@@ -110,6 +110,24 @@ lerobot-calibrate \
   --robot.has_gripper=false
 ```
 
+For both arms, run the sequential calibration script with a bimanual teleop or recording recipe:
+
+```bash
+python -m lerobot.robots.bi_rebot_b601_rt.bi_calibration \
+  --config_path=recipes/teleop/bi_rebot_b601_rt/dm-taccap00-09.yaml
+```
+
+or
+
+```bash
+python -m lerobot.robots.bi_rebot_b601_rt.bi_calibration \
+  --config_path=recipes/teleop/bi_rebot_b601_rt/dm-taccap00-10.yaml
+```
+
+It calibrates the **right arm first, then the left**, with a separate mechanical-zero confirmation for each arm.
+An error or interrupt stops the sequence; a completed right-arm calibration remains saved if the left arm fails.
+It uses the recipe's motor settings and `<robot.id>_right` / `<robot.id>_left` record IDs without starting RT control or peripherals.
+
 The calibration path in `rebot_b601_rt` disables the selected motors, checks their
 communication, then waits for you to manually place the arm in its mechanical
 zero pose before sending zero commands. It does not enable motors, switch control

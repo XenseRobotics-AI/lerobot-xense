@@ -1,4 +1,57 @@
-"""Set B601 DM/RS motor zeros without enabling motors or changing control modes."""
+"""Set B601 DM/RS motor zeros without enabling motors or changing control modes.
+
+Usage (run from the lerobot-xense repository root with your Python environment activated):
+    This module is called by lerobot-calibrate and has no standalone main entry point.
+    Install the rebot_rt native SDK and the motorbridge calibration dependency first:
+        python -m pip install 'motorbridge>=0.5.6,<0.6'
+
+Platform 09: dual DM arms with separate TacCap grippers; calibrate each arm separately.
+    Stop teleoperation, recording, and other programs using the arms. Support the arms:
+    calibration disables the motors.
+    Following the platform 09 recipe, plug in the right DM adapter first, wait for enumeration,
+    then plug in the left adapter. Keep both connected: auto:first selects the right arm and
+    auto:second selects the left. Alternatively, use a verified /dev/ttyACM* path for each arm.
+
+    # Right arm: calibrate six arm joints; has_gripper=false excludes the separate USB TacCap gripper.
+    lerobot-calibrate \
+        --robot.type=rebot_b601_rt \
+        --robot.motor_family=dm \
+        --robot.channel=auto:first \
+        --robot.dm_serial_baud=921600 \
+        --robot.id=bi_rebot_dm_taccap00_09_right \
+        --robot.has_gripper=false
+
+    # After finishing the right arm, run calibration for the left arm.
+    lerobot-calibrate \
+        --robot.type=rebot_b601_rt \
+        --robot.motor_family=dm \
+        --robot.channel=auto:second \
+        --robot.dm_serial_baud=921600 \
+        --robot.id=bi_rebot_dm_taccap00_09_left \
+        --robot.has_gripper=false
+
+    Use the single-arm type rebot_b601_rt for calibration; do not pass the dual-arm teleop YAML directly.
+    These IDs match the arms in the platform 09 recipe. Adapt IDs and interfaces for other platforms.
+    If motor models or CAN IDs were overridden, supply matching robot.motor_configs values here too.
+    For RS, use --robot.motor_family=rs and --robot.channel=can0 (replace with the actual SocketCAN interface).
+    Use --robot.has_gripper=true to also zero the original seventh CAN gripper motor.
+
+Interactive procedure:
+    1. If a calibration JSON already exists, ENTER keeps it and exits; type c and press ENTER to recalibrate.
+    2. After communication checks pass, manually place the arm at the mechanical zero pose specified
+       in the B601 manual, then press ENTER. This is not the teleop YAML's reset_position_rad pose.
+       Close the CAN gripper as well if it is included.
+    3. The program sets the current motor positions as hardware zeros and requests fresh position readbacks.
+       Keep supporting the arm throughout verification. The JSON is saved only if every position is within
+       +/-0.01 rad. If verification fails, hardware zeros may already have changed; the JSON is not updated.
+
+Calibration records:
+    Default: HF_LEROBOT_CALIBRATION/robots/rebot_b601_rt/{dm|rs}/{id}.json, normally under
+    ~/.cache/huggingface/lerobot/calibration/robots/rebot_b601_rt/ when no cache paths are overridden.
+    With --robot.calibration_dir=/path/to/calibration, records go to that directory's {dm|rs}/{id}.json.
+    This procedure sets motor zeros; it does not calibrate TCP/kinematics, identify gravity parameters,
+    or measure joint travel. Readback checks do not verify manual alignment or persistence after a power cycle.
+"""
 
 import math
 import time
@@ -16,6 +69,7 @@ from lerobot.utils.robot_utils import get_logger
 from .config_rebot_b601_rt import RebotB601RTConfig
 from .dm_serial_discovery import (
     AUTO_DM_CHANNELS,
+    DMSerialDevice,
     discover_dm_serial_devices,
     resolve_dm_serial_channel,
     verify_dm_serial_device,
@@ -65,7 +119,7 @@ def _motor_targets(config: RebotB601RTConfig) -> list[MotorTarget]:
     return targets
 
 
-def _open_controller(config: RebotB601RTConfig):
+def _open_controller(config: RebotB601RTConfig, *, dm_serial_devices: tuple[DMSerialDevice, ...] | None = None):
     try:
         from motorbridge import Controller
     except ModuleNotFoundError as error:
@@ -78,9 +132,12 @@ def _open_controller(config: RebotB601RTConfig):
 
     channel = config.channel
     if channel in AUTO_DM_CHANNELS:
-        devices = discover_dm_serial_devices()
+        devices = dm_serial_devices if dm_serial_devices is not None else discover_dm_serial_devices()
         channel = resolve_dm_serial_channel(channel, devices)
         verify_dm_serial_device(channel, devices)
+    elif dm_serial_devices is not None and channel in {device.channel for device in dm_serial_devices}:
+        # A dual-arm session pins both ports before calibrating the first arm.
+        verify_dm_serial_device(channel, dm_serial_devices)
     if channel.startswith("/"):
         return Controller.from_dm_serial(serial_port=channel, baud=config.dm_serial_baud)
     return Controller(channel=channel)
@@ -178,7 +235,7 @@ def _close_controller(controller, motors: dict) -> None:
     controller.close()
 
 
-def calibrate_b601(config: RebotB601RTConfig) -> None:
+def calibrate_b601(config: RebotB601RTConfig, *, dm_serial_devices: tuple[DMSerialDevice, ...] | None = None) -> None:
     # A shared id such as follower1 must not reuse calibration across DM and RS.
     directory = (config.calibration_dir or HF_LEROBOT_CALIBRATION / ROBOTS / config.type) / config.motor_family
     path = directory / f"{config.id}.json"
@@ -192,7 +249,11 @@ def calibrate_b601(config: RebotB601RTConfig) -> None:
             return
 
     targets = _motor_targets(config)
-    controller = _open_controller(config)
+    controller = (
+        _open_controller(config)
+        if dm_serial_devices is None
+        else _open_controller(config, dm_serial_devices=dm_serial_devices)
+    )
     motors = {}
     try:
         add_motor = controller.add_damiao_motor if config.motor_family == "dm" else controller.add_robstride_motor
