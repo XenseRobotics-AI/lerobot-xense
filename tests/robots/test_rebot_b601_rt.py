@@ -629,6 +629,22 @@ class TestRebotB601RT(unittest.TestCase):
         self.assertTrue(robot.rt_moving)
         self.native.set_target_joints.assert_called_with([0.0] * 6 + [-1.2], max_joint_speed=0.25)
 
+    def test_mixed_joint_limits_leave_per_joint_capping_to_native(self):
+        # rebot_rt caps each joint at min(its limit, speed) and rejects a speed
+        # above the fastest joint's limit; the adapter must stay within that.
+        limits = [1.0, 0.2, 0.3, 1.0, 1.0, 1.0]
+        for reset_speed, expected in ((0.5, 0.5), (2.0, 1.0)):
+            with self.subTest(reset_speed=reset_speed):
+                robot = self.make_robot(
+                    reset_position_rad=[0.0] * 6, max_joint_speeds=limits, reset_joint_speed=reset_speed
+                )
+                robot.connect(go_to_start=False)
+                robot.reset_to_initial_position()
+                self.native.set_target_joints.assert_called_with([0.0] * 6 + [-1.2], max_joint_speed=expected)
+                self.assertTrue(robot.rt_moving)
+                self.native.set_target_joints.assert_called_with([0.0] * 6 + [-1.2], max_joint_speed=expected)
+                robot.disconnect(reset=False)
+
     def test_dual_arm_decoding_keeps_independent_speed_limits(self):
         left, right = [0.2, 0.8, 1.1, 0.9, 0.7, 0.6], [0.4] * 6
         config = draccus.decode(

@@ -332,7 +332,7 @@ class RebotB601RT(Robot):
     def _reset_to_position(self, position_rad: list[float], *, tolerance_rad: float | None = None) -> None:
         self._validate_reset()
         target = [*position_rad, self._native.get_target_joints()[6]]
-        speed = min(self.config.reset_joint_speed, max(self.config.max_joint_speeds or [self.config.max_joint_speed]))
+        speed = self._reset_joint_speed
         self._native.set_target_joints(target, max_joint_speed=speed)
         self._reset_target = target
         self._reset_tolerance_rad = self.config.reset_tolerance_rad if tolerance_rad is None else tolerance_rad
@@ -392,13 +392,16 @@ class RebotB601RT(Robot):
             self._reset_settled_since = None
         # Reset lasts longer than the teleop watchdog. Keep its goal alive while
         # the shared loop stands aside, until measured feedback settles.
-        self._native.set_target_joints(
-            self._reset_target,
-            max_joint_speed=min(
-                self.config.reset_joint_speed, max(self.config.max_joint_speeds or [self.config.max_joint_speed])
-            ),
-        )
+        self._native.set_target_joints(self._reset_target, max_joint_speed=self._reset_joint_speed)
         return True
+
+    @property
+    def _reset_joint_speed(self) -> float:
+        # rebot_rt applies this as min(joint_limit[i], speed) for every joint and
+        # rejects a speed above its fastest joint's limit, so cap at the max here:
+        # a slower joint is still held to its own limit by the native controller,
+        # while capping at the min would needlessly slow every faster joint.
+        return min(self.config.reset_joint_speed, max(self.config.max_joint_speeds or [self.config.max_joint_speed]))
 
     def _reset_torque_diagnostics(self, state) -> str:
         """Report the same state snapshot even before the observation/teleop loop starts.
