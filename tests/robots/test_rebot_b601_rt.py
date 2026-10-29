@@ -14,10 +14,12 @@ try:
 except ImportError as exc:
     raise unittest.SkipTest("Build libpyrebot to run the B601 RT adapter tests") from exc
 
+from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
 from lerobot.grippers import SerialGripperConfig, TaccapFollowerConfig
 from lerobot.robots.bi_rebot_b601_rt import BiRebotB601RT, BiRebotB601RTConfig, bi_rebot_b601_rt as bi_driver
 from lerobot.robots.rebot_b601_rt import RebotB601RT, RebotB601RTConfig, rebot_b601_rt as driver
 from lerobot.robots.rebot_b601_rt.dm_serial_discovery import DMSerialDevice
+from lerobot.robots.rebot_b601_rt.exit_policy import exit_reset_allowed
 from lerobot.robots.rebot_b601_rt.gravity_compensation import load_joint_torque_offsets
 
 ASSETS = Path(rebot_rt.__file__).parent / "assets"
@@ -557,9 +559,11 @@ class TestRebotB601RT(unittest.TestCase):
         robot.connect()
         self.native.set_target_pose.return_value = SimpleNamespace(success=False, error=0.001)
         self.native.get_state.return_value = SimpleNamespace(fault=True, fault_reason="feedback lost")
-        with self.assertRaisesRegex(RuntimeError, "feedback lost"):
+        with self.assertRaisesRegex(RuntimeError, "feedback lost") as raised:
             robot.send_action(driver._action_from_pose(np.eye(4)))
         self.native.get_target_joints.assert_not_called()
+        # CLI teardown must recognise this as an arm fault and skip the exit return.
+        self.assertFalse(exit_reset_allowed(raised.exception))
 
     def test_reset_returns_to_configured_joints_and_waits_for_measured_settling(self):
         robot = self.make_robot(reset_position_rad=INITIAL_POSE, max_joint_speed=1.5, reset_joint_speed=0.5)
@@ -628,6 +632,22 @@ class TestRebotB601RT(unittest.TestCase):
         self.native.set_target_joints.assert_called_with([0.0] * 6 + [-1.2], max_joint_speed=0.25)
         self.assertTrue(robot.rt_moving)
         self.native.set_target_joints.assert_called_with([0.0] * 6 + [-1.2], max_joint_speed=0.25)
+
+    def test_mixed_joint_limits_leave_per_joint_capping_to_native(self):
+        # rebot_rt caps each joint at min(its limit, speed) and rejects a speed
+        # above the fastest joint's limit; the adapter must stay within that.
+        limits = [1.0, 0.2, 0.3, 1.0, 1.0, 1.0]
+        for reset_speed, expected in ((0.5, 0.5), (2.0, 1.0)):
+            with self.subTest(reset_speed=reset_speed):
+                robot = self.make_robot(
+                    reset_position_rad=[0.0] * 6, max_joint_speeds=limits, reset_joint_speed=reset_speed
+                )
+                robot.connect(go_to_start=False)
+                robot.reset_to_initial_position()
+                self.native.set_target_joints.assert_called_with([0.0] * 6 + [-1.2], max_joint_speed=expected)
+                self.assertTrue(robot.rt_moving)
+                self.native.set_target_joints.assert_called_with([0.0] * 6 + [-1.2], max_joint_speed=expected)
+                robot.disconnect(reset=False)
 
     def test_dual_arm_decoding_keeps_independent_speed_limits(self):
         left, right = [0.2, 0.8, 1.1, 0.9, 0.7, 0.6], [0.4] * 6
@@ -1019,6 +1039,79 @@ class TestRebotB601RT(unittest.TestCase):
         self.native.close.assert_called_once()
         self.assertIsNone(robot._native)
 
+    def test_exit_reset_still_runs_after_peripheral_loss_but_not_after_controller_loss(self):
+        for lost in ("gripper", "camera", "native"):
+            with self.subTest(lost=lost):
+                native = fake_native()
+                self.native_factory.return_value = native
+                gripper = fake_gripper()
+                self.gripper_factory.return_value = gripper
+                robot = self.make_robot(reset_on_exit=True, gripper=TaccapFollowerConfig(auto_discover_cameras=False))
+                robot.connect(go_to_start=False)
+                robot.logger = Mock()
+                camera = SimpleNamespace(is_connected=True, disconnect=Mock())
+                robot.cameras["wrist"] = camera
+                if lost == "gripper":
+                    gripper.is_connected = False
+                elif lost == "camera":
+                    camera.is_connected = False
+                else:
+                    native.connected = False
+                self.assertFalse(robot.is_connected)
+                state = native.get_state.return_value
+                state.command = state.q = [0.4] * 6
+
+                def settle(_, state=state):
+                    state.command = state.q = [0.0] * 6
+
+                with patch.object(driver.time, "sleep", side_effect=settle):
+                    robot.disconnect()
+                if lost == "native":
+                    native.set_target_joints.assert_not_called()
+                    robot.logger.warn.assert_called_once()
+                    self.assertIn("skipped", robot.logger.warn.call_args.args[0])
+                else:
+                    native.set_target_joints.assert_called_with([0.0] * 6 + [-1.2], max_joint_speed=0.5)
+                    robot.logger.warn.assert_not_called()
+                native.close.assert_called_once()
+                self.assertIsNone(robot._native)
+
+    def test_bimanual_exit_reset_survives_peripheral_loss_and_skips_on_controller_loss(self):
+        for lost in ("camera", "native"):
+            with self.subTest(lost=lost):
+                left, right = fake_native(), fake_native()
+                self.native_factory.side_effect = [left, right]
+                robot = BiRebotB601RT(
+                    BiRebotB601RTConfig(
+                        calibration_dir=self.calibration_dir,
+                        reset_on_exit=True,
+                        left_arm_config=RebotB601RTConfig(channel="can1"),
+                        right_arm_config=RebotB601RTConfig(channel="can0"),
+                    )
+                )
+                robot.connect(go_to_start=False)
+                robot.logger = Mock()
+                if lost == "camera":
+                    robot.right_arm.cameras["lost"] = SimpleNamespace(is_connected=False)
+                else:
+                    right.connected = False
+                self.assertFalse(robot.is_connected)
+                for native in (left, right):
+                    native.get_state.return_value.command = native.get_state.return_value.q = [0.0] * 6
+                with patch.object(driver.time, "sleep"):
+                    robot.disconnect()
+                for native in (left, right):
+                    if lost == "camera":
+                        native.set_target_joints.assert_called_with([0.0] * 6 + [-1.2], max_joint_speed=0.5)
+                    else:
+                        native.set_target_joints.assert_not_called()
+                    native.stop.assert_called_once()
+                    native.close.assert_called_once()
+                if lost == "native":
+                    self.assertIn("['right']", robot.logger.warn.call_args.args[0])
+                else:
+                    robot.logger.warn.assert_not_called()
+
     def test_bimanual_startup_interrupt_closes_both_native_controllers(self):
         left, right = fake_native(), fake_native()
         right.start.side_effect = KeyboardInterrupt
@@ -1132,6 +1225,32 @@ class TestRebotB601RT(unittest.TestCase):
         for native in (left, right):
             native.stop.assert_called_once()
             native.close.assert_called_once()
+
+    def test_bimanual_cameras_with_the_same_name_on_each_arm_are_both_kept(self):
+        def cam_config():
+            return OpenCVCameraConfig(index_or_path=0, width=4, height=2, fps=30)
+
+        self.enterContext(
+            patch.object(
+                driver,
+                "make_cameras_from_configs",
+                side_effect=lambda cfgs: {name: Mock(use_depth=False) for name in cfgs},
+            )
+        )
+        robot = BiRebotB601RT(
+            BiRebotB601RTConfig(
+                calibration_dir=self.calibration_dir,
+                cameras={"scene": cam_config()},
+                left_arm_config=RebotB601RTConfig(channel="can0", cameras={"wrist": cam_config()}),
+                right_arm_config=RebotB601RTConfig(channel="can1", cameras={"wrist": cam_config()}),
+            )
+        )
+        self.assertEqual(set(robot.cameras), {"scene", "left_wrist", "right_wrist"})
+        self.assertIs(robot.cameras["left_wrist"], robot.left_arm.cameras["wrist"])
+        self.assertIs(robot.cameras["right_wrist"], robot.right_arm.cameras["wrist"])
+        self.assertIs(robot.cameras["scene"], robot.left_arm.cameras["scene"])
+        image_keys = {k for k, v in robot.observation_features.items() if isinstance(v, tuple)}
+        self.assertEqual(set(robot.cameras), image_keys)
 
     def test_taccap_camera_discovery_pins_the_separate_gripper(self):
         gripper = fake_gripper()

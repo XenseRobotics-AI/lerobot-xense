@@ -28,6 +28,7 @@ from .dm_serial_discovery import (
     resolve_dm_serial_channel,
     verify_dm_serial_device,
 )
+from .exit_policy import B601ControlFaultError
 from .gravity_compensation import load_joint_torque_offsets
 from .taccap_discovery import inject_taccap_cameras
 from .tactile_camera import make_rebot_cameras as make_cameras_from_configs
@@ -145,6 +146,11 @@ class RebotB601RT(Robot):
             and (self._gripper is None or self._gripper.is_connected)
             and all(cam.is_connected for cam in self.cameras.values())
         )
+
+    @property
+    def arm_connected(self) -> bool:
+        """The native arm controller alone, regardless of camera/gripper state."""
+        return self._native is not None and self._native.connected
 
     @property
     def is_calibrated(self) -> bool:
@@ -332,7 +338,7 @@ class RebotB601RT(Robot):
     def _reset_to_position(self, position_rad: list[float], *, tolerance_rad: float | None = None) -> None:
         self._validate_reset()
         target = [*position_rad, self._native.get_target_joints()[6]]
-        speed = min(self.config.reset_joint_speed, max(self.config.max_joint_speeds or [self.config.max_joint_speed]))
+        speed = self._reset_joint_speed
         self._native.set_target_joints(target, max_joint_speed=speed)
         self._reset_target = target
         self._reset_tolerance_rad = self.config.reset_tolerance_rad if tolerance_rad is None else tolerance_rad
@@ -392,13 +398,16 @@ class RebotB601RT(Robot):
             self._reset_settled_since = None
         # Reset lasts longer than the teleop watchdog. Keep its goal alive while
         # the shared loop stands aside, until measured feedback settles.
-        self._native.set_target_joints(
-            self._reset_target,
-            max_joint_speed=min(
-                self.config.reset_joint_speed, max(self.config.max_joint_speeds or [self.config.max_joint_speed])
-            ),
-        )
+        self._native.set_target_joints(self._reset_target, max_joint_speed=self._reset_joint_speed)
         return True
+
+    @property
+    def _reset_joint_speed(self) -> float:
+        # rebot_rt applies this as min(joint_limit[i], speed) for every joint and
+        # rejects a speed above its fastest joint's limit, so cap at the max here:
+        # a slower joint is still held to its own limit by the native controller,
+        # while capping at the min would needlessly slow every faster joint.
+        return min(self.config.reset_joint_speed, max(self.config.max_joint_speeds or [self.config.max_joint_speed]))
 
     def _reset_torque_diagnostics(self, state) -> str:
         """Report the same state snapshot even before the observation/teleop loop starts.
@@ -588,7 +597,7 @@ class RebotB601RT(Robot):
 
     def _raise_control_fault(self, reason: str) -> None:
         self._log_can_error_hint(reason)
-        raise RuntimeError(f"B601 C++ control fault: {reason}")
+        raise B601ControlFaultError(f"B601 C++ control fault: {reason}")
 
     def _log_ik_status(self, success: bool, error: float, measured) -> None:
         if success:
@@ -606,14 +615,21 @@ class RebotB601RT(Robot):
             self._ik_failed = True
 
     def disconnect(self, *, reset: bool = True) -> None:
-        """Return all six arm joints to zero, then close; use reset=False after an error."""
+        """Return all six arm joints to zero, then close; use reset=False after an arm/controller fault.
+
+        See exit_policy.exit_reset_allowed for which session failures still return.
+        """
         try:
-            if reset and self.config.reset_on_exit and self.is_connected:
+            # Gate on the arm controller only: a lost camera or gripper must not
+            # skip the return to zero and leave the motors to be disabled in place.
+            if reset and self.config.reset_on_exit and self.arm_connected:
                 self.logger.info("B601 exit reset: returning to zero; press Ctrl+C again to abort")
                 self._reset_to_position([0.0] * 6, tolerance_rad=self.config.exit_reset_tolerance_rad)
                 while self.rt_moving:
                     time.sleep(0.01)
                 self.logger.info("B601 exit reset complete; disconnecting")
+            elif reset and self.config.reset_on_exit and self._native is not None:
+                self.logger.warn(f"B601 exit reset skipped: native controller on {self._channel} is not connected")
         except KeyboardInterrupt:
             self.logger.warn("B601 exit reset interrupted; disconnecting immediately")
         except Exception as error:

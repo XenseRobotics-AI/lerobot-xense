@@ -852,6 +852,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
     dataset = None
     listener = None
+    record_error: BaseException | None = None
 
     try:
         if cfg.resume:
@@ -1086,7 +1087,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         # main() suppresses on the way out.
         logger.info("Recording interrupted by user (Ctrl+C)")
         raise
-    except BaseException:
+    except BaseException as error:
+        record_error = error
         # Say why the recording stopped. Without this the only trace is the
         # "Stop recording" line below, and a session that died one second in
         # looks exactly like one the operator ended — the log carried neither
@@ -1099,7 +1101,14 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         if dataset:
             dataset.finalize()
 
-        if robot.is_connected:
+        if cfg.robot.type in {"rebot_b601_rt", "bi_rebot_b601_rt"}:
+            # B601 is_connected also requires every camera/gripper, so a dropped
+            # peripheral must not skip closing the arm. disconnect() is idempotent
+            # and applies the same exit-reset policy as lerobot-teleoperate.
+            from lerobot.robots.rebot_b601_rt.exit_policy import exit_reset_allowed
+
+            robot.disconnect(reset=exit_reset_allowed(record_error))
+        elif robot.is_connected:
             robot.disconnect()
         if teleop and teleop.is_connected:
             teleop.disconnect()

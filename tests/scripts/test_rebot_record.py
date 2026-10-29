@@ -14,6 +14,7 @@ import numpy as np
 import pyarrow.parquet as pq
 
 from lerobot.datasets.utils import hw_to_dataset_features
+from lerobot.robots.rebot_b601_rt.exit_policy import B601ControlFaultError
 from lerobot.scripts import lerobot_record as cli
 from tests.scripts.conftest_teleop_doubles import (
     FakeBiPico4Teleop,
@@ -367,7 +368,7 @@ class TestB601RecordEntrypoint(unittest.TestCase):
                     np.testing.assert_allclose(teleop.connect.call_args.kwargs[key], value)
                 self.assertNotIn("get_current_tcp_pose_quat", robot.names())
                 self.assertEqual(loop.call_count, 1)
-                robot.disconnect.assert_called_once_with()
+                robot.disconnect.assert_called_once_with(reset=True)
                 self.assertEqual(order, ["save", "encoder_cleanup", "finalize", "disconnect"])
                 dataset.stop_image_writer.assert_not_called()
                 dataset.push_to_hub.assert_not_called()
@@ -407,7 +408,7 @@ class TestB601RecordEntrypoint(unittest.TestCase):
         dataset.save_episode.assert_not_called()
         dataset.clear_episode_buffer.assert_not_called()
         dataset.stop_image_writer.assert_not_called()
-        robot.disconnect.assert_called_once_with()
+        robot.disconnect.assert_called_once_with(reset=True)
 
     def test_record_fault_uses_common_disconnect_after_finalize(self):
         cfg, robot, _, dataset, order = self.setup_record()
@@ -417,9 +418,38 @@ class TestB601RecordEntrypoint(unittest.TestCase):
         ):
             cli.record(cfg)
         self.assertNotIn("reset_to_initial_position", robot.names())
-        robot.disconnect.assert_called_once_with()
+        robot.disconnect.assert_called_once_with(reset=True)
         self.assertEqual(order, ["encoder_cleanup", "finalize", "disconnect"])
         dataset.save_episode.assert_not_called()
+
+    def test_arm_control_fault_disconnects_without_exit_return(self):
+        for error in (
+            B601ControlFaultError("B601 C++ control fault: motor 3 overcurrent"),
+            RuntimeError("control fault: x"),
+        ):
+            with self.subTest(error=error):
+                cfg, robot, _, _, order = self.setup_record()
+                with patch.object(cli, "rebot_b601_rt_record_loop", side_effect=error), self.assertRaises(RuntimeError):
+                    cli.record(cfg)
+                robot.disconnect.assert_called_once_with(reset=False)
+                self.assertEqual(order, ["encoder_cleanup", "finalize", "disconnect"])
+
+    def test_lost_peripheral_still_closes_and_returns_the_arm(self):
+        # B601 is_connected is False once any camera/gripper drops; the arm
+        # controller must still be closed, with the configured return.
+        cfg, robot, _, _, order = self.setup_record()
+
+        def drop_camera(**kwargs):
+            robot.is_connected = False
+            raise TimeoutError("wrist camera frame timeout")
+
+        with (
+            patch.object(cli, "rebot_b601_rt_record_loop", side_effect=drop_camera),
+            self.assertRaises(TimeoutError),
+        ):
+            cli.record(cfg)
+        robot.disconnect.assert_called_once_with(reset=True)
+        self.assertEqual(order, ["encoder_cleanup", "finalize", "disconnect"])
 
     def test_encoder_cleanup_failure_uses_common_disconnect(self):
         cfg, robot, teleop, _, order = self.setup_record()
@@ -438,7 +468,7 @@ class TestB601RecordEntrypoint(unittest.TestCase):
             cli.record(cfg)
         self.assertNotIn("reset_to_initial_position", robot.names())
         self.assertEqual(order, ["save", "encoder_cleanup", "finalize", "disconnect"])
-        robot.disconnect.assert_called_once_with()
+        robot.disconnect.assert_called_once_with(reset=True)
         teleop.disconnect.assert_called_once()
 
     def test_ctrl_c_skips_current_episode_and_disconnects_through_driver(self):
@@ -450,7 +480,7 @@ class TestB601RecordEntrypoint(unittest.TestCase):
         with patch.object(cli, "_record_loop_sleep"), self.assertRaises(KeyboardInterrupt):
             cli.record(cfg)
         self.assertEqual(dataset.add_frame.call_count, 1)
-        robot.disconnect.assert_called_once_with()
+        robot.disconnect.assert_called_once_with(reset=True)
         self.assertEqual(order, ["encoder_cleanup", "finalize", "disconnect"])
         dataset.save_episode.assert_not_called()
         dataset.stop_image_writer.assert_not_called()
@@ -464,7 +494,7 @@ class TestB601RecordEntrypoint(unittest.TestCase):
         with patch.object(cli, "rebot_b601_rt_record_loop"):
             cli.record(cfg)
         self.assertNotIn("reset_to_initial_position", robot.names())
-        robot.disconnect.assert_called_once_with()
+        robot.disconnect.assert_called_once_with(reset=True)
 
     def test_spacemouse_connection_uses_commanded_euler_pose(self):
         cfg, robot, teleop, dataset, _ = self.setup_record(dual=False)
@@ -484,7 +514,7 @@ class TestB601RecordEntrypoint(unittest.TestCase):
         with self.assertRaises(KeyboardInterrupt):
             cli.record(cfg)
         self.assertNotIn("reset_to_initial_position", robot.names())
-        robot.disconnect.assert_called_once_with()
+        robot.disconnect.assert_called_once_with(reset=True)
         self.assertEqual(order, ["finalize", "disconnect"])
 
 

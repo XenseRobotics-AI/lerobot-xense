@@ -308,3 +308,34 @@ runpy.run_module('lerobot.robots.bi_rebot_b601_rt.bi_calibration', run_name='__m
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "right arm first" in result.stdout
+
+
+def test_calibrate_cli_routes_bimanual_config_without_connecting_either_arm(rig, monkeypatch):
+    from lerobot.scripts import lerobot_calibrate as cli
+
+    arm_args = [
+        f"--robot.{side}_arm_config.{key}={value}"
+        for side, channel in (("left", "can1"), ("right", "can0"))
+        for key, value in (("motor_family", rig.family), ("channel", channel), ("has_gripper", "false"))
+    ]
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "lerobot-calibrate",
+            "--robot.type=bi_rebot_b601_rt",
+            "--robot.id=bench",
+            f"--robot.calibration_dir={rig.config.calibration_dir}",
+            *arm_args,
+        ],
+    )
+    with (
+        patch.object(cli, "register_third_party_plugins"),
+        patch.object(cli, "make_robot_from_config") as robot_factory,
+    ):
+        cli.main()
+    robot_factory.assert_not_called()
+    assert [event for event in rig.events if event[1] == "open"] == [("right", "open"), ("left", "open")]
+    for side in ("right", "left"):
+        assert rig.paths[side].is_file()
+        rig.controllers[side].enable_all.assert_not_called()

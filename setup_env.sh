@@ -1310,7 +1310,7 @@ USAGE
     echo ""
 
     if is_sel arx5;       then install_arx5      || echo "[WARN] arx5 installation skipped or failed (see above)"; fi
-    if is_sel rebot;      then install_rebot     || exit 1; fi
+    if is_sel rebot;      then install_rebot     || echo "[WARN] rebot installation skipped or failed (see above)"; fi
     if is_sel flexiv;     then install_flexiv    || echo "[WARN] flexiv installation skipped or failed (see above)"; fi
     if is_sel pico4;      then ( install_pico4 ) || echo "[WARN] pico4 installation skipped or failed (see above)"; fi
     if is_sel xense;      then install_xense     || echo "[WARN] xense installation skipped or failed (see above)"; fi
