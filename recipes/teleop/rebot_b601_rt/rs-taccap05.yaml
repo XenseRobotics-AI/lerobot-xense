@@ -1,0 +1,78 @@
+# Teleop recipe — single-arm Rebot B601 RS + Pico4, with TacCap05 followers.
+#   lerobot-teleoperate --config_path=recipes/teleop/rebot_b601_rt/rs-taccap05.yaml
+#
+# Self-contained: hardware and tuning live here; omitted fields use dataclass defaults.
+# Run from the lerobot-xense repository root; urdf_path below is relative to that directory.
+# This recipe uses RS + TacCap05. For another assembly, set each arm's urdf_path and end_frame.
+
+robot:
+  type: rebot_b601_rt
+  id: rebot_rs_taccap # String; robot setup identifier
+
+  # ── Bench hardware ──────────────────────────────────────────────────────
+  motor_family: rs # rs, dm; RobStride / Damiao motors
+  # RS + TacCap05 v2 arm/payload model; replace for a different mount or payload.
+  urdf_path: third_party/libpyrebot/rebot_rt/assets/RS_TacCap05/urdf/rebot_b601_rs_taccap_v2_gripper.urdf
+  end_frame: taccap_eef_link # TCP frame in the selected URDF; update with the model
+  # Configure the SocketCAN interface at 1 Mbps and bring it UP.
+  channel: can0 # SocketCAN name; e.g. can0, can1
+  # Joint angles in RADIANS (J1..J6); Rebot uses this pose for startup and user reset.
+  reset_position_rad: [0, 0.8, 0.8, -0.5, 0, 0] # 6 angles (rad); initial pose within model limits
+
+  # ── Cameras ─────────────────────────────────────────────────────────────
+  # Wrist + tactile cameras are discovered through gripper.auto_discover_cameras below.
+  cameras: {} # Optional external cameras for this arm.
+
+  # ── Control ─────────────────────────────────────────────────────────────
+  control_mode: mit # mit, pos_vel; PD + torque feedforward / position-velocity loop
+  # pos_vel automatically disables gravity feedforward; the MIT scale below can stay configured.
+  interpolate_cartesian_targets: true # true, false; 100 Hz TCP interpolation / synchronous IK
+  coordinate_cartesian_speed: true # true, false; coordinate TCP speed when interpolation is on
+  mit_velocity_feedforward: false # true, false; command velocity / dq=0 with damping (MIT only)
+  max_joint_speeds: # rad/s; independent J1..J6 speed caps
+    - 1.5 # J1
+    - 1.5 # J2
+    - 1.5 # J3
+    - 1.5 # J4
+    - 1.5 # J5
+    - 1.5 # J6
+
+  # Gravity feedforward (MIT only).
+  # Upright base + TacCap05: the explicit URDF above already includes its mass.
+  gravity_compensation_scale: 1.0 # [0.0, 1.0]; 0=off, 0.5=half, 1=full model gravity
+  gravity_torque_limits_nm: [1, 8, 8, 3, 1, 1] # 6 values >= 0 (Nm); J1..J6 feedforward caps, not total PD+FF limits
+  gravity_slew_rate_nm_s: 5.0 # > 0 (Nm/s); maximum feedforward change rate
+
+  # Reset / disconnect.
+  reset_joint_speed: 0.5 # > 0 (rad/s); startup/reset/exit speed, capped by joint limits
+  reset_tolerance_rad: 0.06 # > 0 (rad); startup/user-reset arrival tolerance
+  exit_reset_tolerance_rad: 0.03 # > 0 (rad); exit-to-zero arrival tolerance
+  reset_on_exit: true # true, false; return to zero before disconnecting / skip return
+
+  # ── Gripper ─────────────────────────────────────────────────────────────
+  has_gripper: false # true, false; enable / disable the seventh arm motor (TacCap is separate)
+  gripper:
+    type: taccap_follower # taccap_follower, serial; TacCap / Xense serial gripper
+    side: right # left, right; physical unit selected by firmware serial number
+    controller: force_position # force_position; TacCap controller
+    motor_stream_hz: 100 # [1, 100] (Hz); motor status stream rate
+    print_status: false # true, false; show / hide gripper runtime status
+    status_print_hz: 5.0 # > 0 (Hz); runtime status refresh rate
+    close_speed_radps: 3.0 # > 0 (rad/s); closing setpoint ramp speed
+    status_timeout_ms: 350 # > 0 (ms); motor status timeout
+    auto_discover_cameras: true # true, false; discover wrist/tactile cameras / configure manually
+    enable_tactile: true # true, false; include / omit tactile cameras during discovery
+    undistort_wrist: false # true, false; rectify / retain raw wrist fisheye images
+    # fisheye_balance: 0.0 # [0.0, 1.0]; calibrated focal length / widest FOV
+    require_calibrated: true # true, false; require gripper calibration / allow uncalibrated setup
+    init_open: true # true, false; open gripper on connect / keep its position
+    # mcu_device: null # null / device path; discover gripper MCU / explicit device
+
+teleop:
+  type: pico4 # pico4, spacemouse; Pico VR controller / SpaceMouse
+  pos_sensitivity: 1.0 # Position scale; 1=1:1 mapping
+  ori_sensitivity: 1.0 # Orientation scale; 1=full tracking
+
+# ── Teleoperate loop (top level) ──
+fps: 30 # > 0 (Hz); teleop target rate; native control remains 100 Hz
+display_data: false # true, false; enable / disable Rerun visualization

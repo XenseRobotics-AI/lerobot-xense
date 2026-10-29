@@ -70,9 +70,11 @@ from lerobot.datasets.utils import (
 from lerobot.datasets.video_utils import (
     StreamingVideoEncoder,
     VideoFrame,
+    VideoTimeBaseError,
     concatenate_video_files,
     decode_video_frames,
     encode_video_frames,
+    get_common_video_time_base,
     get_safe_default_codec,
     get_video_duration_in_s,
     get_video_info,
@@ -1568,7 +1570,18 @@ class LeRobotDataset(torch.utils.data.Dataset):
             latest_size_in_mb = get_file_size_in_mb(latest_path)
             latest_duration_in_s = latest_ep[f"videos/{video_key}/to_timestamp"][0]
 
-            if latest_size_in_mb + ep_size_in_mb >= self.meta.video_files_size_in_mb:
+            start_new_file = latest_size_in_mb + ep_size_in_mb >= self.meta.video_files_size_in_mb
+            if not start_new_file:
+                # The episode's frames are already in the data parquet at this point, so a
+                # time_base mismatch must not abort the save: the episode would exist in the data
+                # but not in the metadata. Video files are tracked per episode, so start a new one.
+                try:
+                    get_common_video_time_base([latest_path, ep_path])
+                except VideoTimeBaseError as e:
+                    logger.warn(f"Starting a new video file for episode {episode_index} of '{video_key}': {e}")
+                    start_new_file = True
+
+            if start_new_file:
                 # Move temporary episode video to a new video file in the dataset
                 chunk_idx, file_idx = update_chunk_file_indices(chunk_idx, file_idx, self.meta.chunks_size)
                 new_path = self.root / self.meta.video_path.format(
