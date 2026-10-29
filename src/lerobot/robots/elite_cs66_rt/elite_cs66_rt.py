@@ -254,7 +254,7 @@ class EliteCS66RT(Robot):
         self._reach_warn_time: float = 0.0  # throttle for the workspace-guard warning
         self._servo_lock = threading.Lock()
         self._q_start: np.ndarray | None = None
-        self._joint_reset = JointReset(config)
+        self._joint_reset = JointReset(config, self.logger)
 
         # External cameras — with the gripper's cameras auto-discovered, resolve
         # the wrist camera + GSPS tactile SNs from hardware and inject them into
@@ -790,12 +790,32 @@ class EliteCS66RT(Robot):
         # The gate spans checking reset ownership and submitting the action;
         # a reset cannot latch between those operations.
         with self._joint_reset.lock:
-            self._joint_reset.check_error()
             if self._joint_reset.closing:
                 raise DeviceNotConnectedError(f"{self} is disconnecting.")
             if self._joint_reset.active:
-                return {}
+                return self._action_during_reset(action)
             return self._send_action(action)
+
+    def _action_during_reset(self, action: dict[str, Any]) -> dict[str, Any]:
+        """While a reset owns the arm, forward only the gripper and report what is held.
+
+        The arm entries are the measured pose, with the keys and frame of
+        get_observation, so a caller that records the returned action always
+        gets every action key.
+        """
+        assert self._rtsi is not None
+        if self.config.control_mode == EliteCS66RTControlMode.JOINT_SERVO:
+            joints = self._rtsi.getActualJointPositions()
+            held = {key: float(value) for key, value in zip(JOINT_POSITION_KEYS, joints, strict=True)}
+        else:
+            held = self._tcp_rotvec_to_feature_values(_controller_tcp_to_pose6(self._rtsi.getActualTCPPose()))
+        if self._gripper is not None:
+            if "gripper.pos" in action:
+                self._gripper.set_gripper_position(float(action["gripper.pos"]))
+                held["gripper.pos"] = float(action["gripper.pos"])
+            else:
+                held["gripper.pos"] = self._gripper.get_gripper_position()
+        return held
 
     def _send_action(self, action: dict[str, Any]) -> dict[str, Any]:
         if not self.is_connected:
@@ -909,8 +929,13 @@ class EliteCS66RT(Robot):
     def rt_moving(self) -> bool:
         return self._joint_reset.moving()
 
+    @property
+    def reset_generation(self) -> int:
+        """Count of finished resets (any outcome); loops re-sync teleop when it changes."""
+        return self._joint_reset.generation
+
     def get_reset_status(self) -> dict:
-        """Measured reset outcome; failures are also raised by rt_moving/send_action."""
+        """Measured reset outcome; a failure is logged once and reported here."""
         return self._joint_reset.status()
 
     def get_current_tcp_pose_quat(self) -> np.ndarray:

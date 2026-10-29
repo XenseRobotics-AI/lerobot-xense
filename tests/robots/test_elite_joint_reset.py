@@ -118,17 +118,20 @@ def test_exact_saved_unwrapped_joints_and_async_status(rig):
         robot.config.start_position_rad = [2.0] * 6
         robot._last_tcp_command = np.ones(6) * 90
         robot._last_submit_time = time.monotonic()
+    generation = robot.reset_generation
     robot.reset_to_initial_position()
     assert robot.rt_moving
     worker = robot._joint_reset._thread
     robot.reset_to_initial_position()
     assert robot._joint_reset._thread is worker
     # Even malformed actions cannot replace either joint or Cartesian reset.
-    assert robot.send_action({"tcp.x": 90.0, "left_tcp.x": 90.0}) == {}
+    held = robot.send_action({"tcp.x": 90.0, "left_tcp.x": 90.0})
+    assert set(held) == set(robot.action_features)
+    assert all(value != 90.0 for value in held.values())
+    assert robot.reset_generation == generation
     wait_for(lambda: not robot._joint_reset.active)
-    assert robot.rt_moving
-    assert robot.rt_moving
     assert not robot.rt_moving
+    assert robot.reset_generation == generation + 1
     assert robot.get_reset_status() == {"state": "succeeded", "active": False, "error": ""}
     for side, driver in drivers.items():
         np.testing.assert_array_equal(driver.submit_joints.call_args.args[0], expected[side])
@@ -149,7 +152,7 @@ def test_reset_mode_is_always_joint_and_suppresses_normal_sends(rig, mode):
     robot, drivers, _ = rig
     robot.config.control_mode = mode
     robot.reset_to_initial_position()
-    assert robot.send_action({}) == {}
+    assert set(robot.send_action({})) == set(robot.action_features)
     wait_for(lambda: not robot._joint_reset.active)
     assert robot.get_reset_status()["state"] == "succeeded"
     assert all(d.submit_joints.called and not d.submit_target.called for d in drivers.values())
@@ -181,14 +184,48 @@ def test_no_tcp_only_timeout_or_fault_success(rig, failure):
         driver.status.return_value.running = False
     elif failure == "invalid":
         feed.q[0] = np.nan
+    robot.logger = Mock()
+    robot._joint_reset.logger = robot.logger
+    generation = robot.reset_generation
     robot.reset_to_initial_position()
     wait_for(lambda: not robot._joint_reset.active)
     assert robot.get_reset_status()["state"] == "failed"
-    with pytest.raises(RuntimeError, match="joint reset failed"):
-        _ = robot.rt_moving
-    with pytest.raises(RuntimeError, match="joint reset failed"):
-        robot.send_action({})
     assert all(d.cancel.call_count >= 2 for d in drivers.values())
+    # Reported once, then the session carries on: rt_moving reads False (no
+    # raise), the loop sees one finished reset to re-sync on, and no stale
+    # failure is re-raised by later reads.
+    robot.logger.error.assert_called_once()
+    assert "joint reset failed" in robot.logger.error.call_args.args[0]
+    for _ in range(3):
+        assert not robot.rt_moving
+    assert robot.reset_generation == generation + 1
+    robot.logger.error.assert_called_once()
+
+
+@pytest.mark.parametrize("mode", ["cartesian_servo", "joint_servo"])
+def test_send_during_reset_forwards_grippers_and_returns_every_action_key(rig, mode):
+    robot, drivers, _ = rig
+    robot.config.control_mode = mode
+    paired = isinstance(robot, BiEliteCS66RT)
+    keys = ["left_gripper.pos", "right_gripper.pos"] if paired else ["gripper.pos"]
+    grippers = {key: Mock() for key in keys}
+    for gripper in grippers.values():
+        gripper.get_gripper_position.return_value = 0.3
+    if paired:
+        robot._gripper = {"left": grippers[keys[0]], "right": grippers[keys[1]]}
+    else:
+        robot._gripper = grippers[keys[0]]
+    robot.reset_to_initial_position()
+    held = robot.send_action({keys[0]: 0.8})
+    assert set(held) == set(robot.action_features)
+    assert held[keys[0]] == 0.8
+    grippers[keys[0]].set_gripper_position.assert_called_once_with(0.8)
+    if paired:
+        assert held[keys[1]] == 0.3  # Not commanded: report the measured opening.
+        grippers[keys[1]].set_gripper_position.assert_not_called()
+    assert all(not d.submit_target.called for d in drivers.values())
+    wait_for(lambda: not robot._joint_reset.active)
+    robot._gripper = {"left": None, "right": None} if paired else None
 
 
 def test_velocity_and_angle_must_stay_settled_for_the_whole_dwell(rig):
@@ -265,17 +302,18 @@ def test_disconnect_cancels_worker_before_teardown_and_clears_start(rig):
 def test_blocking_compatibility_waits_and_raises(rig):
     robot, _, feedback = rig
     robot.config.use_background_servo_loop = False
+    generation = robot.reset_generation
     robot.reset_to_initial_position()
     assert robot.get_reset_status()["state"] == "succeeded"
-    assert robot.rt_moving  # Preserve the resync edge through hasattr + read.
-    assert robot.rt_moving
     assert not robot.rt_moving
+    assert robot.reset_generation == generation + 1
     next(iter(feedback.values())).freeze = True
     with pytest.raises(RuntimeError, match="stale"):
         robot.reset_to_initial_position()
+    assert not robot.rt_moving  # The failed blocking reset raised once, from the request.
 
 
-@pytest.mark.parametrize("completion", ["blocking", "before_poll", "between_reads"])
+@pytest.mark.parametrize("completion", ["blocking", "before_poll", "during_poll"])
 def test_recording_resyncs_before_sending_after_reset(rig, monkeypatch, completion):
     robot, drivers, feedback = rig
     stale_action = robot.get_observation()
@@ -287,8 +325,9 @@ def test_recording_resyncs_before_sending_after_reset(rig, monkeypatch, completi
         driver.submit_target.reset_mock()
     teleop_action = stale_action
     events = []
+    last_generation = robot.reset_generation
 
-    if completion == "between_reads":
+    if completion == "during_poll":
         entered, release = threading.Event(), threading.Event()
 
         def preflight(targets):
@@ -300,7 +339,7 @@ def test_recording_resyncs_before_sending_after_reset(rig, monkeypatch, completi
         moving = robot._joint_reset.moving
         first_read = True
 
-        def complete_after_hasattr_read():
+        def complete_after_first_read():
             nonlocal first_read
             result = moving()
             if first_read:
@@ -311,7 +350,7 @@ def test_recording_resyncs_before_sending_after_reset(rig, monkeypatch, completi
                 assert robot.get_reset_status()["state"] == "succeeded"
             return result
 
-        monkeypatch.setattr(robot._joint_reset, "moving", complete_after_hasattr_read)
+        monkeypatch.setattr(robot._joint_reset, "moving", complete_after_first_read)
     else:
         robot.config.use_background_servo_loop = completion != "blocking"
         robot.reset_to_initial_position()
@@ -321,14 +360,16 @@ def test_recording_resyncs_before_sending_after_reset(rig, monkeypatch, completi
     prev_rt_moving = False
     moving_frames = []
     for _ in range(3):
-        # Keep the recording expression verbatim: hasattr evaluates the property.
-        robot_is_moving = hasattr(robot, "rt_moving") and robot.rt_moving
+        # Mirrors run_rt_record_loop / run_cartesian_teleop_loop.
+        reset_generation = getattr(robot, "reset_generation", None)
+        robot_is_moving = getattr(robot, "rt_moving", False)
+        _ = robot.rt_moving  # An extra reader must not swallow the completion.
         moving_frames.append(robot_is_moving)
-        assert robot.get_reset_status() == {"state": "succeeded", "active": False, "error": ""}
         if robot_is_moving:
             prev_rt_moving = True
-        if prev_rt_moving and not robot_is_moving:
+        if not robot_is_moving and (prev_rt_moving or reset_generation != last_generation):
             prev_rt_moving = False
+            last_generation = reset_generation
             events.append("resync")
             teleop_action = robot.get_observation()
         if not robot_is_moving:
@@ -340,14 +381,40 @@ def test_recording_resyncs_before_sending_after_reset(rig, monkeypatch, completi
                 assert all(value is None for value in robot._last_tcp_command.values())
             else:
                 assert robot._last_tcp_command is None
+        assert robot.get_reset_status() == {"state": "succeeded", "active": False, "error": ""}
 
-    assert moving_frames == [True, False, False]
-    assert events == ["resync", "send", "send"]
+    if completion == "during_poll":
+        assert moving_frames == [True, False, False]
+        assert events == ["resync", "send", "send"]
+    else:
+        assert moving_frames == [False, False, False]
+        assert events == ["resync", "send", "send", "send"]
     for side, driver in drivers.items():
-        assert driver.submit_target.call_count == 2
+        assert driver.submit_target.call_count == events.count("send")
         for submission in driver.submit_target.call_args_list:
             np.testing.assert_allclose(submission.args[0][:3, 3], feedback[side].getActualTCPPose()[:3])
         assert driver.cancel.call_count == 2
+
+
+def test_dwell_completes_when_polling_outpaces_rtsi(rig):
+    """A repeated RTSI stamp must not restart the dwell (e.g. rtsi_frequency=50)."""
+    robot, _, feedback = rig
+    for feed in feedback.values():
+        stamps = iter(np.arange(1.0, 100.0, 0.02))
+        state = {"stamp": next(stamps), "at": time.monotonic()}
+
+        def slow_stamp(state=state, stamps=stamps):
+            # New packet only every 20 ms, i.e. twice the reset's 10 ms poll.
+            if time.monotonic() - state["at"] >= 0.02:
+                state["stamp"], state["at"] = next(stamps), time.monotonic()
+            return state["stamp"]
+
+        feed.getTimestamp = slow_stamp
+    robot.config.reset_stable_dwell_s = 0.06
+    robot.config.reset_timeout_s = 1.0
+    robot.reset_to_initial_position()
+    wait_for(lambda: not robot._joint_reset.active, timeout=3.0)
+    assert robot.get_reset_status() == {"state": "succeeded", "active": False, "error": ""}
 
 
 def test_missing_start_never_uses_recipe_fallback(rig):
@@ -424,7 +491,7 @@ def test_command_gate_serializes_send_and_reset(rig):
     resetting.join(1.0)
     assert not sending.is_alive() and not resetting.is_alive()
     assert robot._joint_reset.active
-    assert robot.send_action({}) == {}
+    assert set(robot.send_action({})) == set(robot.action_features)
     wait_for(lambda: not robot._joint_reset.active)
     assert robot.get_reset_status()["state"] == "succeeded"
 

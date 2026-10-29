@@ -136,7 +136,7 @@ class BiEliteCS66RT(Robot):
         # Monotonic time each arm's _last_tcp_command was submitted.
         self._last_submit_time: dict[str, float] = dict.fromkeys(_SIDES, 0.0)
         self._q_start: dict[str, np.ndarray | None] = dict.fromkeys(_SIDES)
-        self._joint_reset = JointReset(config)
+        self._joint_reset = JointReset(config, self.logger)
         self._reach_warn_time: dict[str, float] = dict.fromkeys(_SIDES, 0.0)  # workspace-guard warn throttle
 
         # Prefixed key tuples (built once).
@@ -1206,12 +1206,38 @@ class BiEliteCS66RT(Robot):
 
     def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
         with self._joint_reset.lock:
-            self._joint_reset.check_error()
             if self._joint_reset.closing:
                 raise DeviceNotConnectedError(f"{self} is disconnecting.")
             if self._joint_reset.active:
-                return {}
+                return self._action_during_reset(action)
             return self._send_action(action)
+
+    def _action_during_reset(self, action: dict[str, Any]) -> dict[str, Any]:
+        """While a reset owns both arms, forward only the grippers and report what is held.
+
+        The arm entries are the measured poses, with the keys and world frame of
+        get_observation, so a caller that records the returned action always
+        gets every action key.
+        """
+        held: dict[str, Any] = {}
+        for side in _SIDES:
+            rtsi = self._rtsi[side]
+            assert rtsi is not None
+            if self.config.control_mode == BiEliteCS66RTControlMode.CARTESIAN_SERVO:
+                tcp_world = self._base_pose6_to_world(side, _controller_tcp_to_pose6(rtsi.getActualTCPPose()))
+                held.update(self._tcp_rotvec_to_feature_values(side, tcp_world))
+            else:
+                joints = rtsi.getActualJointPositions()
+                held.update({k: float(v) for k, v in zip(self._joint_pos_keys[side], joints, strict=True)})
+            gripper = self._gripper[side]
+            gripper_key = self._gripper_key[side]
+            if gripper is not None:
+                if gripper_key in action:
+                    gripper.set_gripper_position(float(action[gripper_key]))
+                    held[gripper_key] = float(action[gripper_key])
+                else:
+                    held[gripper_key] = gripper.get_gripper_position()
+        return held
 
     def _send_action(self, action: dict[str, Any]) -> dict[str, Any]:
         if not self.is_connected:
@@ -1297,6 +1323,11 @@ class BiEliteCS66RT(Robot):
     @property
     def rt_moving(self) -> bool:
         return self._joint_reset.moving()
+
+    @property
+    def reset_generation(self) -> int:
+        """Count of finished resets (any outcome); loops re-sync teleop when it changes."""
+        return self._joint_reset.generation
 
     def get_reset_status(self) -> dict:
         """One measured reset outcome for both independently saved arm targets."""
