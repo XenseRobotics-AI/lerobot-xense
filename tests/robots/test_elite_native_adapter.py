@@ -1,16 +1,20 @@
 """Adapter behaviour around the native libpyelite driver, with the driver mocked.
 
-No libpyelite needed: the adapters only import it in connect(), so these run on
-every host and cover the review fixes for PR #30.
+Most tests need no libpyelite and cover the review fixes for PR #30 on every
+host. Native configuration mapping tests require the optional SDK.
 """
 
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import draccus
 import numpy as np
 import pytest
+import yaml
 
+from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
 from lerobot.robots.bi_elite_cs66_rt.bi_elite_cs66_rt import BiEliteCS66RT
 from lerobot.robots.bi_elite_cs66_rt.config_bi_elite_cs66_rt import BiEliteCS66RTConfig
 from lerobot.robots.elite_cs66_rt.config_elite_cs66_rt import EliteCS66RTConfig
@@ -239,7 +243,7 @@ def test_derivation_needs_a_live_rtsi_stream():
 
 
 def _native_cfg():
-    return SimpleNamespace(ik=SimpleNamespace(), planner=SimpleNamespace(), tool=None, model_path="")
+    return pytest.importorskip("libpyelite").EliteDriverConfig()
 
 
 def test_write_failure_tolerance_reaches_the_native_sender():
@@ -259,6 +263,66 @@ def test_single_and_bimanual_planner_defaults_agree():
     single, bi = EliteCS66RTConfig(), BiEliteCS66RTConfig()
     assert single.native_max_tcp_linear_velocity == bi.native_max_tcp_linear_velocity
     assert single.native_max_tcp_angular_velocity == bi.native_max_tcp_angular_velocity
+
+
+@pytest.mark.parametrize(
+    "path", sorted((Path(__file__).resolve().parents[2] / "recipes").glob("*/bi_elite_cs66_rt/*.yaml"))
+)
+def test_bimanual_recipes_decode_with_native_safety(path):
+    values = yaml.safe_load(path.read_text())["robot"]
+    values.pop("type")
+    config = draccus.decode(BiEliteCS66RTConfig, values)
+    assert (config.max_lin_speed, config.max_ang_speed) == (0.25, 1.0)
+    assert config.native_cartesian_motion_limits
+    assert config.native_joint_motion_limits
+    if config.native_assembly is None or config.gripper.type == "serial":
+        assert config.native_collision_profile is None
+    else:
+        assert config.native_collision_profile == "auto"
+
+
+@pytest.mark.parametrize("reset_active", [False, True])
+def test_xgripper_without_collision_keeps_commands_observations_and_record_fields(reset_active, monkeypatch):
+    from lerobot.scripts.lerobot_record import _build_raw_passthrough_dataset_features
+
+    robot = _bi()
+    robot._is_connected = False
+    for side, position in (("left", 0.2), ("right", 0.7)):
+        # Only the existing public gripper API is available; no snapshot method.
+        gripper = Mock(spec_set=["config", "get_gripper_position", "set_gripper_position"])
+        gripper.config = SimpleNamespace(type="serial")
+        gripper.get_gripper_position.return_value = position
+        robot._gripper[side] = gripper
+        robot._driver[side].status.return_value = _status(reset_active=reset_active)
+        robot._rtsi[side].getActualJointVelocity.return_value = [0.0] * 6
+        robot._rtsi[side].getActualJointTorques.return_value = [0.0] * 6
+
+    monkeypatch.setattr("lerobot.robots.bi_elite_cs66_rt.bi_elite_cs66_rt._import_elite_sdk", Mock())
+    monkeypatch.setattr(robot, "_connect_arm", Mock())  # No hardware is contacted.
+    configure = Mock(side_effect=AssertionError("collision calibration must not run"))
+    publisher = Mock(side_effect=AssertionError("collision snapshots must not start"))
+    monkeypatch.setattr(robot, "_configure_station_grippers", configure)
+    monkeypatch.setattr(robot, "_start_station_gripper_publisher", publisher)
+    robot.connect()
+    assert robot.is_connected
+    configure.assert_not_called()
+    publisher.assert_not_called()
+    assert robot._coordinator is None
+
+    observation = robot.get_observation()
+    assert observation["left_gripper.pos"] == 0.2
+    assert observation["right_gripper.pos"] == 0.7
+    action = {"left_gripper.pos": 0.4, "right_gripper.pos": 0.6}
+    sent = robot.send_action(action)
+    for side in ("left", "right"):
+        key = f"{side}_gripper.pos"
+        robot._gripper[side].set_gripper_position.assert_called_once_with(action[key])
+        assert sent[key] == action[key]
+
+    features = _build_raw_passthrough_dataset_features(robot, use_videos=False)
+    for key in action:
+        assert key in features["action"]["names"]
+        assert key in features["observation.state"]["names"]
 
 
 def test_servoj_time_error_says_why():

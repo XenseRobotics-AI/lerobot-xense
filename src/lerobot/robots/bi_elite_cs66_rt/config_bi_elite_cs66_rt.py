@@ -27,7 +27,6 @@ from pathlib import Path
 from lerobot.cameras.configs import CameraConfig
 from lerobot.grippers import GripperConfig
 from lerobot.robots.config import RobotConfig
-from lerobot.robots.elite_cs66_rt.config_elite_cs66_rt import _validate_singularity_params
 
 ROBOT_TYPE = "bi_elite_cs66_rt"
 
@@ -91,6 +90,10 @@ class BiEliteCS66RTConfig(RobotConfig):
     observe_tcp: bool = True
     observe_joints: bool = False
 
+    # Elite Pico4 adapter: each grip press starts from the measured TCP, so
+    # re-gripping after a collision hold discards the target behind the obstacle.
+    grip_anchor_to_robot: bool = True
+
     # Elite external control script (shared; resolved from the SDK when unset).
     script_file_path: str | Path | None = None
 
@@ -104,7 +107,7 @@ class BiEliteCS66RTConfig(RobotConfig):
     use_background_servo_loop: bool = True
     # Host-side stale threshold; validated as command_stale_timeout_s*1000 >=
     # command_timeout_ms so the host keeps feeding (idle) before the controller times out.
-    command_stale_timeout_s: float = 1.0
+    command_stale_timeout_s: float = 0.5
     # Deprecated compatibility field; no Python FIFO threads are created.
     servo_fifo_scheduling: bool = False
     reset_duration_s: float = 3.0
@@ -130,33 +133,6 @@ class BiEliteCS66RTConfig(RobotConfig):
     # 0.88-0.90 to re-enable. See config_elite_cs66_rt.py for rationale.
     max_reach_radius: float | None = None  # m; None disables the guard
 
-    # Singularity-aware manipulability damping (per arm). OFF by default (w_high=None); the
-    # per-arm Modified-DH is read from each controller at connect and damping disables itself
-    # on any fetch / self-check failure. See config_elite_cs66_rt.py and manipulability.py.
-    singularity_w_high: float | None = None  # disables damping when None
-    singularity_w_low: float = 0.0  # w at/below which damping is maxed (s = s_min)
-    singularity_min_scale: float = 0.05  # s_min in (0, 1]; floor so escape is always possible
-    singularity_directional: bool = False  # don't damp moves that increase w (escape); needs live tuning
-    dh_params: tuple[list[float], list[float], list[float]] | None = None  # (alpha, a, d) override
-    log_manipulability: bool = False  # throttled debug log of w for live threshold tuning
-    primary_timeout_ms: int = 1000  # one-shot DH (KinematicsInfo) fetch timeout at connect
-
-    # Predicted joint-velocity limit scaling (per arm; single shared value). Bounds the predicted
-    # joint step BEFORE the controller's internal IK spikes joint velocity past JOINT_IGNORE_SPEED
-    # (30 rad/s) and drops external control — the fix for wrist-singularity rotation trips. Naturally
-    # directional; needs only DH (fetched at connect) + datasheet joint limits, no live w-tuning.
-    # OFF by default. See config_elite_cs66_rt.py and manipulability.py.joint_velocity_scale.
-    # Official CS66 datasheet rates (J1/J2 150°/s, J3 180°/s, J4-6 230°/s)
-    # -> [2.618, 2.618, 3.142, 4.014, 4.014, 4.014] rad/s.
-    joint_vel_limits_rad_s: list[float] | None = None  # per-joint [J1..J6] rad/s; None disables
-    joint_vel_limit_margin: float = 0.8  # enforce at this fraction of the limits (headroom, (0, 1])
-    joint_vel_horizon_s: float = 0.033  # command horizon for the velocity check (~ 1/teleop fps)
-    # DLS damping of the PREDICTION pseudo-inverse; keep well below the operating sigma_min so the
-    # predicted dq tracks the controller's near-exact IK spike (~1/sigma_min) instead of capping it.
-    # 1e-2 silently under-predicts near a wrist singularity and lets the trip through — do NOT raise.
-    # See config_elite_cs66_rt.py and manipulability.py.joint_velocity_scale.
-    joint_vel_dls_lambda: float = 1e-4
-
     # Native libpyelite planner; coordinates are still converted by this adapter.
     native_model_path: str | Path | None = None
     # Packaged assembly supplies arm chains and full world<-base transforms.
@@ -164,9 +140,49 @@ class BiEliteCS66RTConfig(RobotConfig):
     # checked by libpyelite.assembly.Assembly when the robot is built, not duplicated here.
     native_assembly: str | None = None
     native_ik_max_iterations: int = 500
-    native_max_tcp_linear_velocity: float = 0.5  # m/s, planning cap (single-arm default)
+    native_max_tcp_linear_velocity: float = 0.5  # m/s, planning cap (native/single-arm default)
     native_max_tcp_angular_velocity: float = 1.0  # rad/s, planning cap
     native_joint_velocity_scale: float = 1.0  # fraction of official URDF limit
+    # Explicit opt-in trajectory limits; values are rad/s, rad/s², rad/s³.
+    native_joint_target_horizon: float = 0.0  # deprecated, ignored: limits now track the IK reference
+    native_joint_tracking_gain: float | None = None  # 1/s, default 20
+    # Cartesian smoothing before IK (opt-in). Limits are magnitudes of the linear /
+    # angular TCP twist; velocity comes from native_max_tcp_*_velocity.
+    native_cartesian_motion_limits: bool = False
+    native_max_linear_acceleration: float | None = None  # m/s², default 2.0
+    native_max_angular_acceleration: float | None = None  # rad/s², default 5.0
+    native_max_linear_jerk: float | None = None  # m/s³, default 1000
+    native_max_angular_jerk: float | None = None  # rad/s³, default 2500
+    native_cartesian_tracking_gain: float | None = None  # 1/s, default 20
+    native_joint_motion_limits: bool = False
+    native_max_joint_velocity: list[float] | None = None
+    native_max_joint_acceleration: list[float] | None = None
+    native_max_joint_jerk: list[float] | None = None
+    native_max_target_translation_jump: float = 0.0
+    native_max_target_rotation_jump: float = 0.0
+    native_max_target_joint_jump: float = 0.0
+    native_check_robot_safety: bool = True
+    native_max_contact_wrench: list[float] | None = None
+    native_max_start_joint_speed: float = 0.02
+    # Joint-current residual collision stop (any link), opt-in. Keys are
+    # libpyelite ComplianceConfig fields plus "enabled"; see
+    # third_party/libpyelite/examples/contact_monitor.json. gravity defaults to
+    # the mount rotation, payload to payload_mass/payload_cog.
+    native_contact_monitor: dict | None = None
+    # Collision avoidance (table, stand, self, other arm): null, "auto" (the
+    # assembly's collision.json) or a path. Needs native_assembly; the robot then
+    # runs both arms through the same StationGuard as libpyelite.sim.
+    # Hardware collision checking supports TacCap followers only, not retired XGrippers.
+    native_collision_profile: str | None = None
+    # Actual sensor opening -> URDF driver coordinate calibration, per side.
+    # {left: {left_tool_taccap_right_finger_joint: [[opening, rad], ...]}, right: {...}}
+    # Must be measured; URDF limits do not establish motor/finger gearing.
+    native_collision_gripper_calibration: dict[str, dict[str, list[list[float]]]] | None = None
+    native_collision_gripper_max_age_s: float = 0.1
+    native_collision_gripper_publish_hz: float = 100.0
+    left_native_contact_monitor: dict | None = None  # per-arm overrides (fitted gravity, friction)
+    right_native_contact_monitor: dict | None = None
+
     # Row-major tool0 <- TCP SE(3). None reads the active teach-pendant TCP back at
     # connect (FK_flange(q)^-1 @ measured TCP) and logs it; set it to pin the value.
     left_tool_transform: list[float] | None = None
@@ -299,6 +315,12 @@ class BiEliteCS66RTConfig(RobotConfig):
                 raise ValueError(f"payload_cog must have 3 elements [x, y, z] (m), got {self.payload_cog}")
         if self.native_assembly is not None and self.native_model_path is not None:
             raise ValueError("native_model_path and native_assembly are mutually exclusive")
+        if self.native_collision_profile is not None and self.native_assembly is None:
+            raise ValueError("native_collision_profile needs native_assembly (the station the profile models)")
+        for name in ("native_collision_gripper_max_age_s", "native_collision_gripper_publish_hz"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be positive and finite")
         if self.native_ik_max_iterations < 1:
             raise ValueError("native_ik_max_iterations must be positive")
         for name in (
@@ -334,7 +356,6 @@ class BiEliteCS66RTConfig(RobotConfig):
         ):
             if _val is not None and _val <= 0:
                 raise ValueError(f"{_name} must be > 0 when set (None disables it), got {_val}")
-        _validate_singularity_params(self)
         if self.command_timeout_ms < 5:
             raise ValueError(f"command_timeout_ms must be >= 5 (Elite SDK lower bound), got {self.command_timeout_ms}")
         if self.command_stale_timeout_s <= 0:

@@ -997,8 +997,13 @@ install_elite() {
             echo "[elite] ERROR: expected one wheel under $elite_wheel_dir"
             exit 1
         fi
-        # Reinstall only our wheel, not conda-owned transitive dependencies.
-        uv pip install --reinstall-package libpyelite "${elite_wheels[0]}" || exit 1
+        # libpyelite's only runtime deps are pin==4.1.0 (cmeel wheels, owned by
+        # uv alone) and numpy (conda-owned, already pinned). Install pin
+        # explicitly -- keep it in sync with third_party/libpyelite/pyproject.toml
+        # -- and the wheel with --no-deps, so this resolution can never move a
+        # conda-owned package (see check_conda_uv_consistency).
+        uv pip install "pin==4.1.0" || exit 1
+        uv pip install --no-deps --reinstall-package libpyelite "${elite_wheels[0]}" || exit 1
     ) || return 1
     python -c 'import libpyelite; print(libpyelite.__version__, libpyelite.IK_BACKEND)'
 }

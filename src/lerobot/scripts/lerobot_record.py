@@ -837,7 +837,15 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         cfg.teleop.ori_sensitivity = 0.5
 
     robot = make_robot_from_config(cfg.robot)
-    teleop = make_teleoperator_from_config(cfg.teleop) if cfg.teleop is not None else None
+    if cfg.teleop is not None and (cfg.robot.type, cfg.teleop.type) in (
+        ("elite_cs66_rt", "pico4"),
+        ("bi_elite_cs66_rt", "bi_pico4"),
+    ):
+        from lerobot.robots.bi_elite_cs66_rt.pico4 import make_elite_pico4_teleoperator
+
+        teleop = make_elite_pico4_teleoperator(cfg.teleop, robot)
+    else:
+        teleop = make_teleoperator_from_config(cfg.teleop) if cfg.teleop is not None else None
 
     teleop_type = cfg.teleop.type if cfg.teleop is not None else None
     use_raw_passthrough = _use_raw_passthrough_record(cfg.robot.type, teleop_type)

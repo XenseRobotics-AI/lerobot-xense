@@ -29,47 +29,6 @@ class EliteCS66RTControlMode(str, Enum):  # noqa: UP042
     JOINT_SERVO = "joint_servo"
 
 
-def _validate_singularity_params(cfg) -> None:
-    """Validate the singularity-damping fields. Shared by the single-arm and bimanual configs
-    (duck-typed on the common attribute names)."""
-    if cfg.singularity_w_high is not None and (
-        cfg.singularity_w_low < 0 or cfg.singularity_w_high <= cfg.singularity_w_low
-    ):
-        raise ValueError(
-            "require singularity_w_high > singularity_w_low >= 0, got "
-            f"w_high={cfg.singularity_w_high}, w_low={cfg.singularity_w_low}"
-        )
-    # min_scale is the damping floor. A NON-directional guard must keep it > 0 so the operator can
-    # always creep out of a singularity. A directional guard handles escape separately (it returns
-    # s=1 for any move that raises w), so it may use min_scale == 0 for a TRUE hold — the fix for the
-    # observed creep-through, where a 0.05 floor let the arm crawl past the IK-refusal boundary.
-    if cfg.singularity_directional:
-        if not (0.0 <= cfg.singularity_min_scale <= 1.0):
-            raise ValueError(f"singularity_min_scale must be in [0, 1], got {cfg.singularity_min_scale}")
-    elif not (0.0 < cfg.singularity_min_scale <= 1.0):
-        raise ValueError(
-            "singularity_min_scale must be in (0, 1] for a non-directional guard (0 would trap the "
-            f"arm; set singularity_directional=true to allow a full hold), got {cfg.singularity_min_scale}"
-        )
-    if cfg.dh_params is not None and (len(cfg.dh_params) != 3 or any(len(v) != 6 for v in cfg.dh_params)):
-        raise ValueError("dh_params must be a 3-tuple (alpha, a, d) of length-6 lists")
-    if cfg.primary_timeout_ms < 5:
-        raise ValueError(f"primary_timeout_ms must be >= 5, got {cfg.primary_timeout_ms}")
-    if cfg.joint_vel_limits_rad_s is not None and (
-        len(cfg.joint_vel_limits_rad_s) != 6 or any(v <= 0 for v in cfg.joint_vel_limits_rad_s)
-    ):
-        raise ValueError(
-            "joint_vel_limits_rad_s must be a length-6 list of positive per-joint velocity "
-            f"limits (rad/s), got {cfg.joint_vel_limits_rad_s}"
-        )
-    if not (0.0 < cfg.joint_vel_limit_margin <= 1.0):
-        raise ValueError(f"joint_vel_limit_margin must be in (0, 1], got {cfg.joint_vel_limit_margin}")
-    if cfg.joint_vel_horizon_s <= 0:
-        raise ValueError(f"joint_vel_horizon_s must be > 0, got {cfg.joint_vel_horizon_s}")
-    if cfg.joint_vel_dls_lambda <= 0:
-        raise ValueError(f"joint_vel_dls_lambda must be > 0, got {cfg.joint_vel_dls_lambda}")
-
-
 @RobotConfig.register_subclass("elite_cs66_rt")
 @dataclass
 class EliteCS66RTConfig(RobotConfig):
@@ -93,6 +52,10 @@ class EliteCS66RTConfig(RobotConfig):
     # Cameras / gripper are independent of both.
     observe_tcp: bool = True
     observe_joints: bool = False
+
+    # Elite Pico4 adapter: each grip press starts from the measured TCP, so
+    # re-gripping after a collision hold discards the target behind the obstacle.
+    grip_anchor_to_robot: bool = True
 
     # Elite external control script. When unset, connect() resolves
     # libpyelite/external_control.script from the installed SDK package.
@@ -129,6 +92,33 @@ class EliteCS66RTConfig(RobotConfig):
     native_max_tcp_linear_velocity: float = 0.5  # m/s, planning cap
     native_max_tcp_angular_velocity: float = 1.0  # rad/s, planning cap
     native_joint_velocity_scale: float = 1.0  # fraction of official URDF limit
+    # Explicit opt-in trajectory limits; values are rad/s, rad/s², rad/s³.
+    native_joint_target_horizon: float = 0.0  # deprecated, ignored: limits now track the IK reference
+    native_joint_tracking_gain: float | None = None  # 1/s, default 20
+    # Cartesian smoothing before IK (opt-in). Limits are magnitudes of the linear /
+    # angular TCP twist; velocity comes from native_max_tcp_*_velocity.
+    native_cartesian_motion_limits: bool = False
+    native_max_linear_acceleration: float | None = None  # m/s², default 2.0
+    native_max_angular_acceleration: float | None = None  # rad/s², default 5.0
+    native_max_linear_jerk: float | None = None  # m/s³, default 1000
+    native_max_angular_jerk: float | None = None  # rad/s³, default 2500
+    native_cartesian_tracking_gain: float | None = None  # 1/s, default 20
+    native_joint_motion_limits: bool = False
+    native_max_joint_velocity: list[float] | None = None
+    native_max_joint_acceleration: list[float] | None = None
+    native_max_joint_jerk: list[float] | None = None
+    native_max_target_translation_jump: float = 0.0
+    native_max_target_rotation_jump: float = 0.0
+    native_max_target_joint_jump: float = 0.0
+    native_check_robot_safety: bool = True
+    native_max_contact_wrench: list[float] | None = None
+    native_max_start_joint_speed: float = 0.02
+    # Joint-current residual collision stop (any link), opt-in. Keys are
+    # libpyelite ComplianceConfig fields plus "enabled"; see
+    # third_party/libpyelite/examples/contact_monitor.json. gravity is required
+    # (base frame), payload to payload_mass/payload_cog.
+    native_contact_monitor: dict | None = None
+
     # Row-major tool0 <- TCP SE(3). None reads the active teach-pendant TCP back at
     # connect (FK_flange(q)^-1 @ measured TCP) and logs it; set it to pin the value.
     tool_transform: list[float] | None = None
@@ -210,51 +200,6 @@ class EliteCS66RTConfig(RobotConfig):
     # dropout becomes a problem. Applies to both the background and direct servo paths.
     max_reach_radius: float | None = None  # m; None disables the guard
 
-    # Singularity-aware manipulability damping (model-based). Detects proximity to ANY
-    # kinematic singularity (wrist q5≈0, shoulder, elbow/boundary) from the arm's Modified-DH
-    # kinematics and smoothly slows the Cartesian command before the controller's IK spikes
-    # joint velocity past JOINT_IGNORE_SPEED and drops external control. The metric is
-    # w = |det(J)| at the current joints (tool- and frame-invariant). When w drops below
-    # singularity_w_high, the target is pulled toward the last commanded pose by a scale
-    # s = clamp((w-w_low)/(w_high-w_low), s_min, 1); s_min>0 always permits slow escape.
-    #
-    # OFF by default (w_high=None): the per-arm DH must be read from the live controller and
-    # w_low/w_high tuned from logged values, so enable only after that. Set log_manipulability
-    # to print w (throttled) while teleoperating near a singular pose to read off the band.
-    # If the DH fetch or the connect-time FK self-check fails, damping disables itself
-    # (fail-safe to the no-damping behavior). See manipulability.py for the kinematics.
-    singularity_w_high: float | None = None  # disables damping when None
-    singularity_w_low: float = 0.0  # w at/below which damping is maxed (s = s_min)
-    singularity_min_scale: float = 0.05  # s_min in (0, 1]; floor so escape is always possible
-    singularity_directional: bool = False  # don't damp moves that increase w (escape); needs live tuning
-    # Optional (alpha, a, d) Modified-DH override (each length-6) if the controller fetch is
-    # unavailable; None -> read from the controller via getPrimaryPackage at connect.
-    dh_params: tuple[list[float], list[float], list[float]] | None = None
-    log_manipulability: bool = False  # throttled debug log of w for live threshold tuning
-    primary_timeout_ms: int = 1000  # one-shot DH (KinematicsInfo) fetch timeout at connect
-
-    # Predicted joint-velocity limit scaling (model-based, MoveIt-Servo style). Complements the
-    # w-band damping above and shares the same DH (fetched at connect; the guard self-disables on
-    # any DH fetch / self-check failure, exactly like the damping). Before a Cartesian target is
-    # sent, the DLS pseudo-inverse of the geometric Jacobian predicts the joint step dq for the
-    # commanded step; if any |dq_i| would exceed joint_vel_limits_rad_s[i] * joint_vel_limit_margin
-    # over joint_vel_horizon_s, the whole Cartesian step is scaled down uniformly (preserving EE
-    # direction). This bounds joint velocity BEFORE the controller's internal IK spikes it past
-    # JOINT_IGNORE_SPEED (30 rad/s) and drops external control — the fix for wrist-singularity
-    # rotation trips, where a small TCP rotation maps to a huge joint velocity. It is naturally
-    # directional (holds moves into a singularity, allows escape) and needs only DH + datasheet
-    # joint limits — no live w-band tuning. OFF by default (limits None). Official CS66 datasheet
-    # rates (Elite CS-Series): J1/J2 150°/s, J3 180°/s, J4-6 230°/s
-    # -> [2.618, 2.618, 3.142, 4.014, 4.014, 4.014] rad/s.
-    joint_vel_limits_rad_s: list[float] | None = None  # per-joint [J1..J6] rad/s; None disables
-    joint_vel_limit_margin: float = 0.8  # enforce at this fraction of the limits (headroom, (0, 1])
-    joint_vel_horizon_s: float = 0.033  # command horizon for the velocity check (~ 1/teleop fps)
-    # DLS damping of the PREDICTION pseudo-inverse. Must stay a couple orders below the operating
-    # sigma_min (~4e-3 entering the trip) so the predicted dq tracks the controller's near-exact IK
-    # (~1/sigma_min) instead of capping the spike at 1/(2*lambda); a lambda ~ sigma_min under-predicts
-    # and lets the trip through. 1e-4 verified vs the datasheet limits; do NOT raise toward 1e-2.
-    joint_vel_dls_lambda: float = 1e-4
-
     # ── Gripper ── A typed block in the recipe, e.g.
     #     gripper:
     #       type: serial            # or taccap_follower
@@ -323,7 +268,6 @@ class EliteCS66RTConfig(RobotConfig):
         ):
             if _val is not None and _val <= 0:
                 raise ValueError(f"{_name} must be > 0 when set (None disables it), got {_val}")
-        _validate_singularity_params(self)
         if self.command_timeout_ms < 5:
             raise ValueError(f"command_timeout_ms must be >= 5 (Elite SDK lower bound), got {self.command_timeout_ms}")
         if self.command_stale_timeout_s <= 0:

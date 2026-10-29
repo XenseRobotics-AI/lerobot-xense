@@ -47,6 +47,7 @@ from lerobot.robots.bi_elite_cs66_rt.config_bi_elite_cs66_rt import (
     BiEliteCS66RTConfig,
     BiEliteCS66RTControlMode,
 )
+from lerobot.robots.bi_elite_cs66_rt.gripper_snapshots import GripperSnapshot, TaccapGripperSnapshotReader
 from lerobot.robots.elite_cs66_rt import elite_cs66_rt as _elite_mod
 from lerobot.robots.elite_cs66_rt.elite_cs66_rt import (
     _configure_native_driver,
@@ -58,17 +59,6 @@ from lerobot.robots.elite_cs66_rt.elite_cs66_rt import (
     _quaternion_to_rotvec,
     _reach_exceeded,
     _rotvec_to_quaternion,
-)
-from lerobot.robots.elite_cs66_rt.manipulability import (
-    SELFCHECK_POS_TOL_M,
-    SELFCHECK_ROT_WARN_DEG,
-    damping_scale,
-    directional_scale,
-    geometric_jacobian,
-    joint_velocity_scale,
-    manipulability,
-    pose_delta,
-    tool_consistency,
 )
 from lerobot.robots.robot import Robot
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
@@ -121,6 +111,16 @@ class BiEliteCS66RT(Robot):
 
         # Per-arm SDK handles + servo state.
         self._driver: dict[str, Any] = dict.fromkeys(_SIDES)
+        # Station collision layer (native_collision_profile): the libpyelite
+        # StationLayer and the StationCoordinator planning both arms through it.
+        self._station: Any = None
+        self._coordinator: Any = None
+        self._station_gripper_stop = threading.Event()
+        self._station_gripper_thread: threading.Thread | None = None
+        self._station_gripper_error: str | None = None
+        self._station_gripper_samples: tuple[float, dict[str, GripperSnapshot]] | None = None
+        self._station_gripper_readers: dict[str, TaccapGripperSnapshotReader] = {}
+        self._native_tools: dict[str, list[float] | None] = dict.fromkeys(_SIDES)
         self._dashboard: dict[str, Any] = dict.fromkeys(_SIDES)
         self._rtsi: dict[str, Any] = dict.fromkeys(_SIDES)
 
@@ -135,11 +135,6 @@ class BiEliteCS66RT(Robot):
         self._last_submit_time: dict[str, float] = dict.fromkeys(_SIDES, 0.0)
         self._start_tcp_pose: dict[str, np.ndarray | None] = dict.fromkeys(_SIDES)
         self._reach_warn_time: dict[str, float] = dict.fromkeys(_SIDES, 0.0)  # workspace-guard warn throttle
-        # Singularity damping, per arm (set up at connect; disabled unless DH + self-check pass).
-        self._dh: dict[str, tuple[list[float], list[float], list[float]] | None] = dict.fromkeys(_SIDES)
-        self._damping_enabled: dict[str, bool] = dict.fromkeys(_SIDES, False)
-        self._w_log_time: dict[str, float] = dict.fromkeys(_SIDES, 0.0)
-        self._jv_log_time: dict[str, float] = dict.fromkeys(_SIDES, 0.0)  # joint-vel guard log throttle
 
         # Prefixed key tuples (built once).
         self._tcp_pos_keys = {s: tuple(f"{s}_{k}" for k in TCP_POSITION_KEYS) for s in _SIDES}
@@ -426,7 +421,13 @@ class BiEliteCS66RT(Robot):
         else:
             cfg.script_file_path = self._resolve_sdk_resource("external_control.script")
         tool = getattr(self.config, f"{side}_tool_transform")
-        _configure_native_driver(cfg, self.config, tool)
+        _configure_native_driver(
+            cfg,
+            self.config,
+            tool,
+            side,
+            None if self._assembly is None else self._assembly.world_from_base(side),
+        )
         if self._assembly is not None:
             cfg.model_path = self._assembly.control_model_path(side)
         if tool is None:
@@ -441,6 +442,7 @@ class BiEliteCS66RT(Robot):
             f"{side} native planner TCP caps: {cfg.planner.max_linear_velocity:g} m/s, "
             f"{cfg.planner.max_angular_velocity:g} rad/s (min of max_*_speed and native_max_tcp_*)"
         )
+        self._native_tools[side] = list(cfg.tool)
         return cfg
 
     # =========================================================================
@@ -451,6 +453,13 @@ class BiEliteCS66RT(Robot):
         if self.is_connected:
             raise DeviceAlreadyConnectedError(f"{self} already connected, do not run connect() twice.")
 
+        if self.config.native_collision_profile is not None:
+            from libpyelite.collision import StationLayer
+
+            # Validate geometry/backend/calibration before powerOn/brakeRelease
+            # or gripper enable. Actual TCP transforms are obtained later.
+            preflight = StationLayer(self._assembly, self.config.native_collision_profile, [np.eye(4), np.eye(4)])
+            self._configure_station_grippers(preflight)
         self._cs = _import_elite_sdk()
         # Native workers own the high-rate path; preserve the Python station logic.
 
@@ -463,7 +472,6 @@ class BiEliteCS66RT(Robot):
                 futs = {side: ex.submit(self._connect_arm, side) for side in _SIDES}
                 for side in _SIDES:
                     futs[side].result()
-
             # --- Connect bimanual cameras in parallel ---
             # Read the wrist fisheye intrinsics off each gripper's MCU while it is
             # open, before the cameras build their remap tables.
@@ -475,7 +483,14 @@ class BiEliteCS66RT(Robot):
                     cam_futs = [ex.submit(cam.connect) for cam in self.cameras.values()]
                     for f in cam_futs:
                         f.result()
+            # Start freshness-sensitive publication after device initialization,
+            # still before any MoveJ or servo command. Camera/MCU setup may block
+            # Python threads longer than the gripper freshness budget.
+            self._start_station_layer()
+            self._check_station_health()
         except BaseException:
+            with best_effort(self.logger, "logging connection fault diagnostics"):
+                self._log_native_fault_diagnostics()
             self._cleanup_after_failed_connect()
             raise
 
@@ -492,41 +507,36 @@ class BiEliteCS66RT(Robot):
         # idle while the slower arm finishes (the previous "wait for both, then
         # seed/start sequentially" structure starved whichever arm finished
         # first -> intermittent "socket timed out ... reverse_socket" RST).
-        def _bring_arm_online(side: str) -> None:
-            # Pre-start-move (joints, TCP) sample for the singularity-damping FK self-check.
-            premove = None
-            if (
-                self.config.singularity_w_high is not None or self.config.joint_vel_limits_rad_s is not None
-            ) and self.config.control_mode == BiEliteCS66RTControlMode.CARTESIAN_SERVO:
-                try:
-                    premove = (
-                        np.asarray(self._rtsi[side].getActualJointPositions(), dtype=np.float64),
-                        _controller_tcp_to_pose6(self._rtsi[side].getActualTCPPose()),
-                    )
-                except Exception:
-                    premove = None
+        def _bring_arm_online(side: str, paired_failed: threading.Event) -> None:
             if go_to_start:
-                self._move_j_blocking(side, self._arm_start_pose(side), self.config.start_move_duration_s)
+                self._move_j_blocking(
+                    side,
+                    self._arm_start_pose(side),
+                    self.config.start_move_duration_s,
+                    path_checked=True,
+                    paired_failed=paired_failed,
+                )
+            if paired_failed.is_set():
+                raise RuntimeError(f"{side} arm: servo start skipped, the paired arm failed to come online")
             if self.config.control_mode == BiEliteCS66RTControlMode.CARTESIAN_SERVO:
                 current_tcp = _controller_tcp_to_pose6(self._rtsi[side].getActualTCPPose())
                 self._last_tcp_command[side] = current_tcp.copy()
                 self._start_tcp_pose[side] = current_tcp.copy()
             self._start_servo_loop(side)
-            if self.config.control_mode == BiEliteCS66RTControlMode.CARTESIAN_SERVO and (
-                self.config.singularity_w_high is not None or self.config.joint_vel_limits_rad_s is not None
-            ):
-                self._setup_singularity_damping(side, premove)
 
         try:
             if go_to_start:
+                self._check_joint_move({side: self._arm_start_pose(side) for side in _SIDES}, "start move")
                 self.logger.info(
                     f"Bi Elite CS66 moving both arms to start_position over {self.config.start_move_duration_s:.1f}s..."
                 )
-            with ThreadPoolExecutor(max_workers=2) as ex:
-                online_futs = {side: ex.submit(_bring_arm_online, side) for side in _SIDES}
-                for side in _SIDES:
-                    online_futs[side].result()
+            self._run_arms_paired(_bring_arm_online, "start move")
+            self._check_station_health()
+            for side in _SIDES:
+                self._driver[side].check_error()
         except BaseException:
+            with best_effort(self.logger, "logging connection fault diagnostics"):
+                self._log_native_fault_diagnostics()
             self._is_connected = False
             self._cleanup_after_failed_connect()
             raise
@@ -604,6 +614,9 @@ class BiEliteCS66RT(Robot):
             # failed after this one handed off; stop it before tearing down.
             with contextlib.suppress(Exception):
                 self._stop_servo_loop(side)
+        with best_effort(self.logger, "stopping the station collision layer"):
+            self._stop_station_layer()
+        for side in _SIDES:
             with best_effort(self.logger, f"stopping control ({side})"):
                 if self._driver[side] is not None:
                     self._driver[side].stopControl(1000)
@@ -644,11 +657,24 @@ class BiEliteCS66RT(Robot):
         for side in _SIDES:
             self._stop_servo_loop(side)
 
-        # Smooth return to home for both arms in parallel before teardown.
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            home_futs = {side: ex.submit(self._return_home_arm, side) for side in _SIDES}
-            for side in _SIDES:
-                home_futs[side].result()
+        # Smooth return to home for both arms in parallel before teardown,
+        # unless the collision layer finds the joint path to home blocked.
+        go_home = True
+        home_error: Exception | None = None
+        if self._station is not None:
+            try:
+                self._check_joint_move({side: self._arm_home_pose(side) for side in _SIDES}, "return-to-home")
+            except Exception as exc:
+                go_home = False
+                self.logger.error(f"Skipping return-to-home, arms left where they are: {exc}")
+        if go_home:
+            try:
+                self._run_arms_paired(self._return_home_arm, "return-to-home")
+            except Exception as exc:
+                # Teardown still runs; the failure is raised once it is done.
+                home_error = exc
+        with best_effort(self.logger, "stopping the station collision layer"):
+            self._stop_station_layer()
 
         for side in _SIDES:
             driver = self._driver[side]
@@ -682,18 +708,56 @@ class BiEliteCS66RT(Robot):
                     self.logger.warn(f"{side} gripper disconnect failed: {exc}")
 
         self._is_connected = False
+        if home_error is not None:
+            raise RuntimeError(
+                f"Return-to-home failed; arms were left where they stopped: {home_error}"
+            ) from home_error
 
-    def _return_home_arm(self, side: str) -> None:
+    def _return_home_arm(self, side: str, paired_failed: threading.Event | None = None) -> None:
         """Blocking MoveJ to home for one arm, then re-kill its servo loop."""
         if self._driver[side] is None or self._rtsi[side] is None:
             return
         try:
             self.logger.info(f"{side} arm: returning to home_position over {self.config.home_move_duration_s:.1f}s...")
-            self._move_j_blocking(side, self._arm_home_pose(side), self.config.home_move_duration_s)
-        except Exception as exc:
-            self.logger.warn(f"{side} arm: return-to-home failed; proceeding with shutdown anyway: {exc}")
-        # _move_j_blocking may have restarted the servo loop in its finally block.
-        self._stop_servo_loop(side)
+            self._move_j_blocking(
+                side,
+                self._arm_home_pose(side),
+                self.config.home_move_duration_s,
+                path_checked=True,
+                paired_failed=paired_failed,
+            )
+        finally:
+            # _move_j_blocking may have restarted the servo loop in its finally block.
+            self._stop_servo_loop(side)
+
+    def _run_arms_paired(self, work, what: str) -> None:
+        """Run ``work(side, paired_failed)`` for both arms in parallel.
+
+        A both-arm station path check assumes the arms progress together, so once
+        one arm fails the other must not go on into a combination nobody checked:
+        ``paired_failed`` is set and the other arm skips any MoveJ or servo start
+        it has not begun yet. A native MoveJ already in flight cannot be
+        interrupted from here (moveJ holds the driver's lifecycle lock and the
+        dashboard binding exposes no stop), so it finishes or is aborted by the
+        controller. Every per-arm error is logged; the first one is raised.
+        """
+        paired_failed = threading.Event()
+
+        def _run(side: str) -> None:
+            try:
+                work(side, paired_failed)
+            except BaseException:
+                paired_failed.set()
+                raise
+
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            futs = {side: ex.submit(_run, side) for side in _SIDES}
+        errors = {side: futs[side].exception() for side in _SIDES if futs[side].exception() is not None}
+        if not errors:
+            return
+        for side, exc in errors.items():
+            self.logger.error(f"{side} arm: {what} failed: {exc}")
+        raise next(iter(errors.values()))
 
     # =========================================================================
     # Servo loop (per arm)
@@ -701,7 +765,16 @@ class BiEliteCS66RT(Robot):
 
     def _start_servo_loop(self, side: str) -> None:
         assert self._driver[side] is not None and self._rtsi[side] is not None
+        # startServo clears the driver's latched error. It must never revive a
+        # sender whose external planner has already stopped with a station fault.
+        self._check_station_health()
         self._driver[side].startServo(self._rtsi[side])
+        try:
+            self._check_station_health()
+        except Exception:
+            with best_effort(self.logger, f"stopping {side} after station fault during servo startup"):
+                self._stop_servo_loop(side)
+            raise
 
     def _stop_servo_loop(self, side: str) -> None:
         if self._driver[side] is not None:
@@ -710,15 +783,211 @@ class BiEliteCS66RT(Robot):
     def _is_reset_moving_locked(self, side: str, now: float) -> bool:
         return self._driver[side] is not None and self._driver[side].status().reset_active
 
+    def _check_station_health(self) -> None:
+        if self._coordinator is None:
+            return
+        status = self._coordinator.status()
+        if status.error:
+            raise RuntimeError(f"Elite station collision layer failed: {status.error}")
+        if not status.running:
+            raise RuntimeError("Elite station collision coordinator is not running")
+
     def _raise_servo_error_if_any(self, side: str) -> None:
-        if self._driver[side] is not None:
-            self._driver[side].check_error()
+        try:
+            # Preserve the primary station fault instead of a subsequent sender
+            # deadline error caused by the stopped external planner.
+            self._check_station_health()
+            # A fault on either arm stops command production for the pair.
+            for selected in _SIDES:
+                if self._driver[selected] is not None:
+                    self._driver[selected].check_error()
+        except Exception:
+            with best_effort(self.logger, "logging native fault diagnostics"):
+                self._log_native_fault_diagnostics()
+            for selected in _SIDES:
+                with best_effort(self.logger, f"stopping paired arm after native fault ({selected})"):
+                    if self._driver[selected] is not None:
+                        self._driver[selected].stopServo()
+            raise
 
-    _interpolate_tcp_pose = staticmethod(_elite_mod.EliteCS66RT._interpolate_tcp_pose)
+    def _log_native_fault_diagnostics(self) -> None:
+        """Per-arm sender timing and the collision coordinator's state at a fault."""
+        for side in _SIDES:
+            if self._driver[side] is None:
+                continue
+            st = self._driver[side].status()
+            self.logger.error(
+                f"[{side}] native fault: error={st.error!r} max_sender_gap={st.max_sender_gap_s * 1000:.1f} ms "
+                f"max_socket_write={st.max_write_s * 1000:.1f} ms planner_overruns={st.planner_overruns}"
+            )
+        if self._coordinator is not None:
+            st = self._coordinator.status()
+            self.logger.error(
+                f"[station] ticks={st.ticks} overruns={st.overruns} max_tick={st.max_tick_s * 1000:.2f} ms "
+                f"error={st.error!r} last: held={list(st.last.held)} limited={list(st.last.limited)} "
+                f"clearance={st.last.clearance.minimum_distance * 1000:.1f} mm"
+            )
+        if self._station_gripper_error is not None:
+            self.logger.error(f"[station] gripper publisher error: {self._station_gripper_error}")
+        if self._station_gripper_samples is not None:
+            published_at, samples = self._station_gripper_samples
+            now = time.monotonic()
+            for side, sample in samples.items():
+                # This is the latest publication, not necessarily the one that
+                # faulted. The native station error describes the failing sample.
+                self.logger.error(
+                    f"[{side}] latest gripper snapshot: opening={sample.position!r} raw={sample.raw_position!r} "
+                    f"valid={sample.valid} sequence={sample.sequence} "
+                    f"sample_age={(now - sample.sampled_at) * 1000:.1f} ms "
+                    f"publication_age={(now - published_at) * 1000:.1f} ms"
+                )
 
-    def _move_j_blocking(self, side: str, target_joints: list[float], duration_s: float) -> None:
+    def _start_station_layer(self) -> None:
+        """Bring up the station collision layer when the recipe asks for it.
+
+        Both drivers switch to external planning and one StationCoordinator plans
+        them together through the same StationGuard libpyelite.sim runs. Must run
+        before any servo loop starts (nothing else feeds the senders then).
+        """
+        profile = self.config.native_collision_profile
+        if profile is None:
+            return
+        from libpyelite.collision import StationLayer
+
+        # The same tool0 <- TCP the drivers plan with (_make_driver_config).
+        if any(self._native_tools[side] is None for side in _SIDES):
+            raise RuntimeError("Both native driver TCP transforms must be configured before the station layer")
+        tools = [self._native_tools[side] for side in _SIDES]
+        self._station = StationLayer(self._assembly, profile, tools)
+        self._configure_station_grippers(self._station)
+        self._start_station_gripper_publisher()
+        native = {side: self._driver[side]._native for side in _SIDES}
+        for side in _SIDES:
+            native[side].setExternalPlanning(True)
+        self._coordinator = self._cs._native.StationCoordinator(
+            self._station.guard, native["left"], native["right"], self._rtsi["left"], self._rtsi["right"]
+        )
+        self._coordinator.start()
+        self.logger.info(f"Station collision layer active: {self._station.path}")
+
+    def _configure_station_grippers(self, station) -> None:
+        for side in _SIDES:
+            gripper = self._gripper[side]
+            if gripper is None:
+                raise ValueError(
+                    f"Collision station models movable {side} gripper fingers but no sensor backend is enabled"
+                )
+            if gripper.config.type != "taccap_follower":
+                raise ValueError(
+                    f"Elite collision checking supports TacCap followers only; {side} backend is "
+                    f"{gripper.config.type!r}. XGripper collision checking is unsupported; "
+                    "set native_collision_profile to null."
+                )
+        station.configure_grippers(
+            self.config.native_collision_gripper_calibration,
+            self.config.native_collision_gripper_max_age_s,
+        )
+
+    def _start_station_gripper_publisher(self) -> None:
+        # Query calibration only for this connected Elite collision session,
+        # before starting the nonblocking publisher or any arm motion.
+        self._station_gripper_readers = {side: TaccapGripperSnapshotReader(self._gripper[side]) for side in _SIDES}
+        # An independent cache reader owns publication, including while arms
+        # hold and when no get_observation() calls are made. No USB/serial
+        # transaction is permitted in the reader's read().
+        # A fresh Event per start: a reader that failed to join on an earlier
+        # stop keeps its own (set) Event and can never be revived by this one.
+        self._station_gripper_stop = threading.Event()
+        self._station_gripper_error = None
+        self._station_gripper_samples = None
+        self._station_gripper_thread = threading.Thread(
+            target=self._station_gripper_loop,
+            args=(self._station, self._station_gripper_stop, self._station_gripper_readers),
+            name="station-gripper-state",
+            daemon=True,
+        )
+        self._station_gripper_thread.start()
+        deadline = time.monotonic() + 1.0
+        while True:
+            try:
+                self._station.station_q([0.0] * 6, [0.0] * 6)
+                break
+            except RuntimeError as exc:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"No fresh calibrated gripper state for collision startup: {exc}") from exc
+                time.sleep(0.01)
+
+    def _station_gripper_loop(self, station, stop: threading.Event, readers: dict) -> None:
+        period = 1.0 / self.config.native_collision_gripper_publish_hz
+        while not stop.is_set():
+            try:
+                snapshots = {side: readers[side].read() for side in _SIDES}
+                self._station_gripper_samples = (time.monotonic(), snapshots)
+                station.publish_gripper_snapshots(snapshots)
+                self._station_gripper_error = None
+            except Exception as exc:
+                self._station_gripper_error = str(exc)
+                # Explicit invalidation, never refresh the old valid sample.
+                try:
+                    station.publish_gripper_snapshots({})
+                except Exception:
+                    return  # native timestamp validation still expires the last publication
+            stop.wait(period)
+
+    def _stop_station_layer(self) -> None:
+        thread = self._station_gripper_thread
+        try:
+            if self._coordinator is not None:
+                self._coordinator.stop()
+        finally:
+            # Cleanup always completes; a coordinator.stop() error stays the one raised.
+            self._station_gripper_stop.set()
+            self._station_gripper_thread = None
+            if thread is not None:
+                thread.join(timeout=1.0)
+            self._station_gripper_readers.clear()
+            self._coordinator = None
+            self._station = None
+        if thread is not None and thread.is_alive():
+            raise RuntimeError("Gripper snapshot reader did not stop; backend must provide a nonblocking snapshot")
+
+    def _measured_joints(self) -> dict[str, np.ndarray]:
+        return {side: np.asarray(self._rtsi[side].getActualJointPositions(), dtype=np.float64) for side in _SIDES}
+
+    def _check_joint_move(self, targets: dict[str, list[float]], what: str) -> None:
+        """Refuse a MoveJ whose straight joint path the collision layer finds blocked.
+
+        ``targets`` maps the moving arm(s) to their goal; any other arm stays at
+        its measured joints. Arms moved together share one duration, so their
+        joint-interpolated paths progress together along this segment.
+        """
+        self._check_station_health()
+        if self._station is None:
+            return
+        start = self._measured_joints()
+        end = {side: np.asarray(targets.get(side, start[side]), dtype=np.float64) for side in _SIDES}
+        result = self._station.check_joint_path(start, end)
+        if not result.safe:
+            raise RuntimeError(
+                f"{what} refused by the station collision layer: the joint path reaches "
+                f"{result.minimum_distance * 1000:.1f} mm between {result.pair} (clearance {result.clearance * 1000:.1f} mm)"
+            )
+
+    def _move_j_blocking(
+        self,
+        side: str,
+        target_joints: list[float],
+        duration_s: float,
+        path_checked: bool = False,
+        paired_failed: threading.Event | None = None,
+    ) -> None:
         driver = self._driver[side]
         assert driver is not None
+        self._check_station_health()  # also required for a previously checked joint path
+        if not path_checked:
+            self._check_joint_move({side: list(target_joints)}, f"{side} MoveJ")
+        if paired_failed is not None and paired_failed.is_set():
+            raise RuntimeError(f"{side} MoveJ skipped: the paired arm's move failed")
         was_running = driver.status().running
         self._stop_servo_loop(side)
         # The arm moves under MoveJ, so the last streamed target no longer applies.
@@ -817,170 +1086,6 @@ class BiEliteCS66RT(Robot):
     # Action
     # =========================================================================
 
-    # =========================================================================
-    # Singularity-aware manipulability damping (per arm)
-    # =========================================================================
-
-    def _fetch_dh(self, side: str) -> tuple[list[float], list[float], list[float]] | None:
-        """Return arm ``side``'s Modified-DH ``(alpha, a, d)`` from the config override or the
-        controller's primary package, or None if unavailable / unpopulated."""
-        if self.config.dh_params is not None:
-            alpha, a, d = self.config.dh_params
-            return (list(alpha), list(a), list(d))
-        assert self._cs is not None and self._driver[side] is not None
-        ki = self._cs.KinematicsInfo()
-        if not self._driver[side].getPrimaryPackage(ki, self.config.primary_timeout_ms):
-            return None
-        dh = (list(ki.dh_alpha_), list(ki.dh_a_), list(ki.dh_d_))
-        if any(len(v) != 6 for v in dh) or all(x == 0.0 for x in dh[0] + dh[1] + dh[2]):
-            return None
-        return dh
-
-    def _setup_singularity_damping(self, side: str, premove_sample) -> None:
-        """Acquire arm ``side``'s DH and validate it against the live robot. Fail-safe: any
-        problem leaves damping disabled for that arm only."""
-        self._dh[side] = None
-        self._damping_enabled[side] = False
-        try:
-            dh = self._fetch_dh(side)
-        except Exception as exc:
-            self.logger.warn(f"[{side}] singularity damping disabled: DH fetch error ({exc}).")
-            return
-        if dh is None:
-            self.logger.warn(
-                f"[{side}] singularity damping disabled: no DH (controller fetch returned nothing "
-                "and no dh_params override)."
-            )
-            return
-
-        q1 = np.asarray(self._rtsi[side].getActualJointPositions(), dtype=np.float64)
-        w1 = manipulability(*dh, q1)
-        if not np.isfinite(w1) or w1 < 1e-6:
-            self.logger.warn(
-                f"[{side}] singularity damping disabled: manipulability at the start pose is "
-                f"degenerate (w={w1:.3e}); the DH is likely wrong."
-            )
-            return
-
-        validated = False
-        if premove_sample is not None:
-            q0, t0 = premove_sample
-            q0 = np.asarray(q0, dtype=np.float64)
-            if int(np.sum(np.abs(q0 - q1) >= 0.3)) >= 3:  # well-separated configs
-                t1 = _controller_tcp_to_pose6(self._rtsi[side].getActualTCPPose())
-                pos_drift_m, rot_drift_deg = tool_consistency(dh, q0, t0, q1, t1)
-                # Gate on POSITION drift only (validates the DH for the Jacobian); a large ROTATION
-                # drift is a benign about-flange-Z TCP-convention artifact not in det(J) — log, don't
-                # disable. See manipulability.tool_consistency.
-                if pos_drift_m > SELFCHECK_POS_TOL_M:
-                    self.logger.warn(
-                        f"[{side}] singularity damping disabled: FK self-check position drift "
-                        f"{pos_drift_m * 1000:.1f}mm > {SELFCHECK_POS_TOL_M * 1000:.1f}mm "
-                        f"(DH / convention mismatch)."
-                    )
-                    return
-                if rot_drift_deg > SELFCHECK_ROT_WARN_DEG:
-                    self.logger.info(
-                        f"[{side}] FK self-check: tool-orientation drift {rot_drift_deg:.1f}deg "
-                        f"(about-flange-Z TCP convention; does NOT affect det(J)) — guard enabled on "
-                        f"the position-validated DH (pos drift {pos_drift_m * 1000:.1f}mm)."
-                    )
-                validated = True
-
-        self._dh[side] = dh
-        self._damping_enabled[side] = True
-        guards = []
-        if self.config.singularity_w_high is not None:
-            guards.append("w-damping")
-        if self.config.joint_vel_limits_rad_s is not None:
-            guards.append("joint-vel-limit")
-        guard_str = "+".join(guards)
-        if validated:
-            self.logger.info(f"[{side}] kinematic scaling enabled [{guard_str}] (FK validated; start w={w1:.4f}).")
-        else:
-            self.logger.info(
-                f"[{side}] kinematic scaling enabled [{guard_str}] (FK unvalidated by motion — "
-                f"relying on w-sanity; start w={w1:.4f})."
-            )
-
-    def _maybe_log_w(self, side: str, w: float, s: float) -> None:
-        # Log EVERY tick while damping is active (s < 1) so the fast approach into a singularity is
-        # visible; throttle to 0.5s only when there's nothing happening (s == 1). Otherwise the coarse
-        # throttle hides exactly the 0.2-0.3s window where the guard has to catch the arm.
-        now = time.monotonic()
-        if s >= 1.0 and now - self._w_log_time[side] < 0.5:
-            return
-        self._w_log_time[side] = now
-        self.logger.info(f"[{side}] manipulability w={w:.5f} -> damping scale s={s:.3f}")
-
-    def _maybe_log_jv(self, side: str, q: np.ndarray, s_jv: float, dq: np.ndarray) -> None:
-        """Throttled diagnostic of the predicted joint-velocity guard (log_manipulability only).
-        ``dq`` is the DLS-predicted joint step for the UNSCALED commanded step; peak_qdot is what the
-        controller's IK is expected to demand before scaling, so peak_qdot*s_jv should sit at budget."""
-        now = time.monotonic()
-        if now - self._jv_log_time[side] < 0.5:
-            return
-        self._jv_log_time[side] = now
-        jac = geometric_jacobian(*self._dh[side], q)
-        sigma_min = float(np.linalg.svd(jac, compute_uv=False)[-1])
-        peak_qdot = float(np.max(np.abs(dq))) / max(self.config.joint_vel_horizon_s, 1e-9)
-        self.logger.info(
-            f"[{side}] joint-vel guard: w={abs(float(np.linalg.det(jac))):.5f} sigma_min={sigma_min:.4f} "
-            f"s_jv={s_jv:.3f} peak_pred_qdot={peak_qdot:.1f} rad/s "
-            f"(argmax J{int(np.argmax(np.abs(dq))) + 1})"
-        )
-
-    def _apply_kinematic_scaling(self, side: str, target: np.ndarray, held: np.ndarray) -> np.ndarray:
-        """Slow arm ``side``'s command toward ``target`` as its config nears a singularity or as the
-        predicted joint step approaches the per-joint velocity limits. Both guards operate in the
-        base frame from the joints (det-invariant / Jacobian in base — no world conversion). The
-        final scale is the min of whichever opt-in guards are active."""
-        assert self._dh[side] is not None and self._rtsi[side] is not None
-        q = np.asarray(self._rtsi[side].getActualJointPositions(), dtype=np.float64)
-        s = 1.0
-
-        if self.config.singularity_w_high is not None:
-            if self.config.singularity_directional:
-                s_sing, w = directional_scale(
-                    *self._dh[side],
-                    q,
-                    pose_delta(held, target),
-                    self.config.singularity_w_low,
-                    self.config.singularity_w_high,
-                    self.config.singularity_min_scale,
-                )
-            else:
-                w = manipulability(*self._dh[side], q)
-                s_sing = damping_scale(
-                    w,
-                    self.config.singularity_w_low,
-                    self.config.singularity_w_high,
-                    self.config.singularity_min_scale,
-                )
-            if self.config.log_manipulability:
-                self._maybe_log_w(side, w, s_sing)
-            s = min(s, s_sing)
-
-        if self.config.joint_vel_limits_rad_s is not None:
-            qdot_limit = (
-                np.asarray(self.config.joint_vel_limits_rad_s, dtype=np.float64) * self.config.joint_vel_limit_margin
-            )
-            s_jv, dq_jv = joint_velocity_scale(
-                *self._dh[side],
-                q,
-                pose_delta(held, target),
-                self.config.joint_vel_horizon_s,
-                qdot_limit,
-                self.config.joint_vel_dls_lambda,
-            )
-            if self.config.log_manipulability:
-                self._maybe_log_jv(side, q, s_jv, dq_jv)
-            s = min(s, s_jv)
-
-        if s < 1.0:
-            return self._interpolate_tcp_pose(held, target, s)
-        return target
-
     def _warn_reach_exceeded(self, side: str, target: np.ndarray) -> None:
         now = time.monotonic()
         if now - self._reach_warn_time[side] < 1.0:
@@ -1038,13 +1143,6 @@ class BiEliteCS66RT(Robot):
             target_world[3:6] = _quaternion_to_rotvec(rotation_6d_to_quaternion(r6d))
 
         target = self._world_pose6_to_base(side, target_world)
-
-        # Kinematic scaling (singularity damping and/or predicted joint-velocity limit) pulls the
-        # target toward last_base (the in-reach held pose) as this arm's config nears a singularity
-        # or its predicted joint step nears the velocity limits. Runs BEFORE the reach guard so the
-        # scaled (closer) target preserves the reach guard's in-reach invariant.
-        if self._damping_enabled[side]:
-            target = self._apply_kinematic_scaling(side, target, last_base)
 
         # Workspace guard: last_base is in-reach by construction (last commanded
         # in-reach pose, or the physical current pose), so holding it keeps the arm
@@ -1153,6 +1251,24 @@ class BiEliteCS66RT(Robot):
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
+        if self.config.control_mode != BiEliteCS66RTControlMode.CARTESIAN_SERVO:
+            # Check the combined both-arm sweep once, like connect/disconnect;
+            # per-arm checks would each treat the other arm as parked.
+            for side in _SIDES:
+                self._raise_servo_error_if_any(side)
+            self._check_joint_move({side: self._arm_start_pose(side) for side in _SIDES}, "reset move")
+            self._run_arms_paired(
+                lambda side, paired_failed: self._move_j_blocking(
+                    side,
+                    self._arm_start_pose(side),
+                    self.config.reset_duration_s,
+                    path_checked=True,
+                    paired_failed=paired_failed,
+                ),
+                "reset move",
+            )
+            return
+
         with ThreadPoolExecutor(max_workers=2) as ex:
             futs = {side: ex.submit(self._reset_arm, side) for side in _SIDES}
             for side in _SIDES:
@@ -1160,9 +1276,7 @@ class BiEliteCS66RT(Robot):
 
     def _reset_arm(self, side: str) -> None:
         self._raise_servo_error_if_any(side)
-        if self.config.control_mode != BiEliteCS66RTControlMode.CARTESIAN_SERVO:
-            self._move_j_blocking(side, self._arm_start_pose(side), self.config.reset_duration_s)
-        elif self._start_tcp_pose[side] is not None and not self._driver[side].status().reset_active:
+        if self._start_tcp_pose[side] is not None and not self._driver[side].status().reset_active:
             self._driver[side].submit_target(_pose6_to_matrix(self._start_tcp_pose[side]), self.config.reset_duration_s)
             with self._servo_lock[side]:
                 self._last_tcp_command[side] = self._start_tcp_pose[side].copy()
@@ -1177,8 +1291,11 @@ class BiEliteCS66RT(Robot):
     # =========================================================================
 
     def get_native_status(self) -> dict[str, Any]:
-        """Per-arm native IK diagnostics, watchdog errors and planner overruns."""
-        return {side: self._driver[side].status() if self._driver[side] else None for side in _SIDES}
+        """Per-arm native IK diagnostics, watchdog errors and planner overruns (+ the collision layer's)."""
+        status = {side: self._driver[side].status() if self._driver[side] else None for side in _SIDES}
+        if self._coordinator is not None:
+            status["station"] = self._coordinator.status()
+        return status
 
     @property
     def rt_running(self) -> bool:

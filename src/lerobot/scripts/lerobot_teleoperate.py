@@ -1038,7 +1038,9 @@ def teleoperate(cfg: TeleoperateConfig):
             start_obs = robot.get_observation()
             tcp_keys = [k for k in start_obs if k.startswith("tcp.")]
             logger.info("Start pose: " + ", ".join(f"{k}={start_obs[k]:.6f}" for k in tcp_keys))
-            teleop = make_teleoperator_from_config(cfg.teleop)
+            from lerobot.robots.bi_elite_cs66_rt.pico4 import make_elite_pico4_teleoperator
+
+            teleop = make_elite_pico4_teleoperator(cfg.teleop, robot)
             teleop.connect(current_tcp_pose_quat=robot.get_current_tcp_pose_quat())
             try:
                 elite_cs66_rt_pico4_teleop_loop(
@@ -1142,7 +1144,9 @@ def teleoperate(cfg: TeleoperateConfig):
                     "BiElite: defaulting teleop max_rot_velocity to 1.0 rad/s "
                     "(pass --teleop.max_rot_velocity to override)"
                 )
-            teleop = make_teleoperator_from_config(cfg.teleop)
+            from lerobot.robots.bi_elite_cs66_rt.pico4 import make_elite_pico4_teleoperator
+
+            teleop = make_elite_pico4_teleoperator(cfg.teleop, robot)
 
             # Bring the VR side up FIRST, then the robot. pre_init caps out at
             # ~3s (0.5s + 25 polls), while robot.connect() takes 20-40s and moves
