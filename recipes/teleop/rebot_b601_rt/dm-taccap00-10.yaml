@@ -1,0 +1,108 @@
+# Teleop recipe — single-arm Rebot B601 DM + Pico4, with TacCap followers.
+#   lerobot-teleoperate --config_path=recipes/teleop/rebot_b601_rt/dm-taccap00-10.yaml
+#
+# Self-contained: hardware and tuning live here; omitted fields use dataclass defaults.
+# Platform 10 only: DM arms + TacCap00. Other platforms may use a different gripper/model.
+# Run from the lerobot-xense repository root; urdf_path below is relative to that directory.
+# For another platform, copy/rename this recipe and set each arm's urdf_path and end_frame.
+# The URDF must match that arm, mount and payload; motor_family does not identify the payload.
+# gravity_use_joint_offsets=true also requires the matching <URDF stem>_offset.yaml beside it.
+# DM C1 direct-output TacCap mount; J1..J3=4340P, J4..J6=4310, IDs 1..6, feedback 0x11..0x16.
+
+robot:
+  type: rebot_b601_rt
+  id: rebot_dm_taccap00_10 # String; platform 10 robot setup identifier
+
+  # ── Bench hardware ──────────────────────────────────────────────────────
+  motor_family: dm # rs, dm; RobStride / Damiao motors
+  # Platform 10 identified DM + TacCap00 model; replace for other arms/payloads.
+  urdf_path: third_party/libpyrebot/rebot_rt/assets/DM_TacCap00/urdf/rebot_b601_dm_taccap_v1_gripper.urdf
+  end_frame: taccap_eef_link # TCP frame in the selected URDF; update with the model
+  # Plug right DM bridge first, wait for enumeration, then left (if used); repeat after reboot/reconnection.
+  # Explicit /dev/... paths or SocketCAN names (can0, can1) are also supported.
+  channel: auto:first # auto:first, auto:second; first / second DM bridge by USB initialization time
+  dm_serial_baud: 921600 # 115200, 230400, 460800, 921600; serial baud, ignored for SocketCAN
+  # Joint angles in RADIANS (J1..J6); Rebot uses this pose for startup and user reset.
+  # DM J2/J3 use negative angles; check this example pose against the physical workspace.
+  reset_position_rad: [0, -0.8, -0.8, 0.5, 0, 0] # 6 angles (rad); initial pose within model limits
+
+  # ── Cameras ─────────────────────────────────────────────────────────────
+  # Wrist + tactile cameras are discovered through gripper.auto_discover_cameras below.
+  cameras:
+    head:
+      type: intelrealsense
+      serial_number_or_name: "021422060263" # Platform 10 D415; serial reported by librealsense
+      fps: 30
+      width: 640
+      height: 480
+      warmup_s: 1
+      use_depth: false # Record RGB; depth is opt-in
+
+  # ── Control ─────────────────────────────────────────────────────────────
+  control_mode: mit # mit, pos_vel; PD + torque feedforward / position-velocity loop
+  # pos_vel requires gravity_compensation_scale: 0.0.
+  # Trial MIT gains: validate tracking and contact feel on this arm.
+  motor_configs: # J1..J7; kp [0, 500] (Nm/rad), kd [0, 5] (Nm*s/rad), protocol ranges
+    - {kp: 60.0, kd: 5.0} # J1
+    - {kp: 60.0, kd: 5.0} # J2
+    - {kp: 80.0, kd: 5.0} # J3
+    - {kp: 12.0, kd: 1.2} # J4
+    - {kp: 12.0, kd: 1.2} # J5
+    - {kp: 12.0, kd: 1.2} # J6
+    - {} # J7; unused with the separate TacCap driver
+  interpolate_cartesian_targets: true # true, false; 100 Hz TCP interpolation / synchronous IK
+  coordinate_cartesian_speed: true # true, false; coordinate TCP speed when interpolation is on
+  max_cartesian_linear_speed: 1.0 # m/s; TCP translation limit; all joints coordinate below this cap
+  max_cartesian_angular_speed: 6.28 # rad/s; TCP rotation limit; shares progress with translation
+  mit_velocity_feedforward: false # true, false; command velocity / dq=0 with damping (MIT only)
+  max_joint_speeds: # rad/s; independent J1..J6 speed caps
+    - 1.5 # J1
+    - 1.5 # J2
+    - 1.5 # J3
+    - 1.5 # J4
+    - 1.5 # J5
+    - 1.5 # J6
+  trace_joint_tracking: false # true, false; show / hide joint tracking diagnostics
+  trace_joint_tracking_hz: 2.0 # > 0 (Hz); diagnostic log rate
+
+  # Gravity feedforward (MIT only).
+  # Uses the platform-specific urdf_path and its matching offset file above.
+  gravity_compensation_scale: 1.0 # [0.0, 1.0]; 0=off, 0.5=half, 1=full model gravity
+  gravity_torque_limits_nm: [1.0, 22.0, 12.0, 4.0, 2.0, 1.0] # 6 values >= 0 (Nm); feedforward caps, J1..J6
+  gravity_slew_rate_nm_s: 5.0 # > 0 (Nm/s); maximum feedforward change rate
+  gravity_vector: [0.0, 0.0, -9.80665] # 3 values (m/s^2); gravity in URDF root frame
+  gravity_use_joint_offsets: true # true, false; load / omit the matching URDF _offset.yaml
+
+  # Reset / disconnect.
+  reset_joint_speed: 0.5 # > 0 (rad/s); startup/reset/exit speed, capped by joint limits
+  reset_tolerance_rad: 0.06 # > 0 (rad); startup/user-reset arrival tolerance
+  exit_reset_tolerance_rad: 0.03 # > 0 (rad); exit-to-zero arrival tolerance
+  reset_on_exit: true # true, false; return to zero before disconnecting / skip return
+
+  # ── Gripper ─────────────────────────────────────────────────────────────
+  has_gripper: false # true, false; enable / disable the seventh arm motor (TacCap is separate)
+  gripper:
+    type: taccap_follower # taccap_follower, serial; TacCap / Xense serial gripper
+    side: right # left, right; physical unit selected by firmware serial number
+    controller: force_position # force_position; TacCap controller
+    motor_stream_hz: 100 # [1, 100] (Hz); motor status stream rate
+    print_status: false # true, false; show / hide gripper runtime status
+    status_print_hz: 5.0 # > 0 (Hz); runtime status refresh rate
+    close_speed_radps: 3.0 # > 0 (rad/s); closing setpoint ramp speed
+    status_timeout_ms: 350 # > 0 (ms); motor status timeout
+    auto_discover_cameras: true # true, false; discover wrist/tactile cameras / configure manually
+    enable_tactile: true # true, false; include / omit tactile cameras during discovery
+    undistort_wrist: false # true, false; rectify / retain raw wrist fisheye images
+    # fisheye_balance: 0.0 # [0.0, 1.0]; calibrated focal length / widest FOV
+    require_calibrated: true # true, false; require gripper calibration / allow uncalibrated setup
+    init_open: true # true, false; open gripper on connect / keep its position
+    # mcu_device: null # null / device path; discover gripper MCU / explicit device
+
+teleop:
+  type: pico4 # pico4, spacemouse; Pico VR controller / SpaceMouse
+  pos_sensitivity: 1.0 # Position scale; 1=1:1 mapping
+  ori_sensitivity: 1.0 # Orientation scale; 1=full tracking
+
+# ── Teleoperate loop (top level) ──
+fps: 30 # > 0 (Hz); teleop target rate; native control remains 100 Hz
+display_data: false # true, false; enable / disable Rerun visualization
