@@ -14,6 +14,7 @@ try:
 except ImportError as exc:
     raise unittest.SkipTest("Build libpyrebot to run the B601 RT adapter tests") from exc
 
+from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
 from lerobot.grippers import SerialGripperConfig, TaccapFollowerConfig
 from lerobot.robots.bi_rebot_b601_rt import BiRebotB601RT, BiRebotB601RTConfig, bi_rebot_b601_rt as bi_driver
 from lerobot.robots.rebot_b601_rt import RebotB601RT, RebotB601RTConfig, rebot_b601_rt as driver
@@ -1148,6 +1149,32 @@ class TestRebotB601RT(unittest.TestCase):
         for native in (left, right):
             native.stop.assert_called_once()
             native.close.assert_called_once()
+
+    def test_bimanual_cameras_with_the_same_name_on_each_arm_are_both_kept(self):
+        def cam_config():
+            return OpenCVCameraConfig(index_or_path=0, width=4, height=2, fps=30)
+
+        self.enterContext(
+            patch.object(
+                driver,
+                "make_cameras_from_configs",
+                side_effect=lambda cfgs: {name: Mock(use_depth=False) for name in cfgs},
+            )
+        )
+        robot = BiRebotB601RT(
+            BiRebotB601RTConfig(
+                calibration_dir=self.calibration_dir,
+                cameras={"scene": cam_config()},
+                left_arm_config=RebotB601RTConfig(channel="can0", cameras={"wrist": cam_config()}),
+                right_arm_config=RebotB601RTConfig(channel="can1", cameras={"wrist": cam_config()}),
+            )
+        )
+        self.assertEqual(set(robot.cameras), {"scene", "left_wrist", "right_wrist"})
+        self.assertIs(robot.cameras["left_wrist"], robot.left_arm.cameras["wrist"])
+        self.assertIs(robot.cameras["right_wrist"], robot.right_arm.cameras["wrist"])
+        self.assertIs(robot.cameras["scene"], robot.left_arm.cameras["scene"])
+        image_keys = {k for k, v in robot.observation_features.items() if isinstance(v, tuple)}
+        self.assertEqual(set(robot.cameras), image_keys)
 
     def test_taccap_camera_discovery_pins_the_separate_gripper(self):
         gripper = fake_gripper()

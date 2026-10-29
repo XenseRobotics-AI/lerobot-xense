@@ -45,7 +45,12 @@ class BiRebotB601RT(Robot):
         )
         self.left_arm = RebotB601RT(left_config)
         self.right_arm = RebotB601RT(right_config)
-        self.cameras = {**self.left_arm.cameras, **self.right_arm.cameras}
+        # Key cameras as get_observation() keys their frames, so a camera name
+        # used on both arms (e.g. a per-arm "wrist") is kept twice, not overwritten.
+        self.cameras = {
+            **{k if k in self._top_camera_names else f"left_{k}": v for k, v in self.left_arm.cameras.items()},
+            **{f"right_{k}": v for k, v in self.right_arm.cameras.items()},
+        }
 
     @property
     def is_connected(self) -> bool:
