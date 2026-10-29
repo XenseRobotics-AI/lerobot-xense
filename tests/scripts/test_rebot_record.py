@@ -575,6 +575,13 @@ class TestExistingRobotRecordEntrypoint(unittest.TestCase):
                     ("logger", Mock()),
                 ):
                     patches.enter_context(patch.object(cli, name, replacement))
+                # Elite + Pico4 bypasses make_teleoperator_from_config for the Elite grip-anchor adapter.
+                patches.enter_context(
+                    patch(
+                        "lerobot.robots.bi_elite_cs66_rt.pico4.make_elite_pico4_teleoperator",
+                        Mock(return_value=teleop),
+                    )
+                )
                 patches.enter_context(patch.object(cli.LeRobotDataset, "create", return_value=dataset))
                 loops = {
                     name: patches.enter_context(patch.object(cli, name, side_effect=capture))
