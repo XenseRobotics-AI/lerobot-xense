@@ -135,7 +135,6 @@ class BiEliteCS66RT(Robot):
         self._servo_lock: dict[str, threading.Lock] = {s: threading.Lock() for s in _SIDES}
         # Monotonic time each arm's _last_tcp_command was submitted.
         self._last_submit_time: dict[str, float] = dict.fromkeys(_SIDES, 0.0)
-        self._start_tcp_pose: dict[str, np.ndarray | None] = dict.fromkeys(_SIDES)
         self._q_start: dict[str, np.ndarray | None] = dict.fromkeys(_SIDES)
         self._joint_reset = JointReset(config)
         self._reach_warn_time: dict[str, float] = dict.fromkeys(_SIDES, 0.0)  # workspace-guard warn throttle
@@ -528,7 +527,6 @@ class BiEliteCS66RT(Robot):
             if self.config.control_mode == BiEliteCS66RTControlMode.CARTESIAN_SERVO:
                 current_tcp = _controller_tcp_to_pose6(self._rtsi[side].getActualTCPPose())
                 self._last_tcp_command[side] = current_tcp.copy()
-                self._start_tcp_pose[side] = current_tcp.copy()
             self._start_servo_loop(side)
 
         try:
@@ -1233,12 +1231,6 @@ class BiEliteCS66RT(Robot):
         gripper_key = self._gripper_key[side]
 
         if self.config.control_mode == BiEliteCS66RTControlMode.CARTESIAN_SERVO:
-            if driver.status().reset_active:
-                if gripper is not None and gripper_key in action:
-                    gripper.set_gripper_position(float(action[gripper_key]))
-                    sent[gripper_key] = float(action[gripper_key])
-                return
-
             target_tcp = self._cartesian_action_to_tcp_pose(side, action)
             self._trace_send_action(side, action, target_tcp)
             driver.submit_target(_pose6_to_matrix(target_tcp))

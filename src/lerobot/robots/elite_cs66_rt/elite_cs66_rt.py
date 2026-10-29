@@ -253,7 +253,6 @@ class EliteCS66RT(Robot):
         self._last_submit_time: float = 0.0  # monotonic time _last_tcp_command was submitted
         self._reach_warn_time: float = 0.0  # throttle for the workspace-guard warning
         self._servo_lock = threading.Lock()
-        self._start_tcp_pose: np.ndarray | None = None
         self._q_start: np.ndarray | None = None
         self._joint_reset = JointReset(config)
 
@@ -536,7 +535,6 @@ class EliteCS66RT(Robot):
         if self.config.control_mode == EliteCS66RTControlMode.CARTESIAN_SERVO:
             current_tcp = _controller_tcp_to_pose6(self._rtsi.getActualTCPPose())
             self._last_tcp_command = current_tcp.copy()
-            self._start_tcp_pose = current_tcp.copy()
         try:
             self._start_servo_loop()
             # Save actual joints only after successful native startup. With
@@ -808,12 +806,6 @@ class EliteCS66RT(Robot):
         sent: dict[str, Any] = {}
 
         if self.config.control_mode == EliteCS66RTControlMode.CARTESIAN_SERVO:
-            if self._driver.status().reset_active:
-                if self._gripper is not None and "gripper.pos" in action:
-                    self._gripper.set_gripper_position(float(action["gripper.pos"]))
-                    sent["gripper.pos"] = float(action["gripper.pos"])
-                return sent or action
-
             target_tcp = self._cartesian_action_to_tcp_pose(action)
             self._trace_send_action(action, target_tcp)
             self._driver.submit_target(_pose6_to_matrix(target_tcp))

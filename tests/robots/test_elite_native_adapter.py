@@ -300,8 +300,7 @@ def test_bimanual_recipes_decode_with_native_safety(path):
         assert config.native_collision_profile == "auto"
 
 
-@pytest.mark.parametrize("reset_active", [False, True])
-def test_xgripper_without_collision_keeps_commands_observations_and_record_fields(reset_active, monkeypatch):
+def test_xgripper_without_collision_keeps_commands_observations_and_record_fields(monkeypatch):
     from lerobot.scripts.lerobot_record import _build_raw_passthrough_dataset_features
 
     robot = _bi()
@@ -312,7 +311,7 @@ def test_xgripper_without_collision_keeps_commands_observations_and_record_field
         gripper.config = SimpleNamespace(type="serial")
         gripper.get_gripper_position.return_value = position
         robot._gripper[side] = gripper
-        robot._driver[side].status.return_value = _status(reset_active=reset_active)
+        robot._driver[side].status.return_value = _status()
         robot._rtsi[side].getTimestamp.return_value = 1.0
         robot._rtsi[side].getActualJointVelocity.return_value = [0.0] * 6
         robot._rtsi[side].getActualJointTorques.return_value = [0.0] * 6
