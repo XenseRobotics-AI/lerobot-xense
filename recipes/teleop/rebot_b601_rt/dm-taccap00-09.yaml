@@ -41,14 +41,16 @@ robot:
   # ── Control ─────────────────────────────────────────────────────────────
   control_mode: mit # mit, pos_vel; PD + torque feedforward / position-velocity loop
   # pos_vel requires gravity_compensation_scale: 0.0.
-  # Trial MIT gains: validate tracking and contact feel on this arm.
+  # MIT gains based on lerobot-robot-seeed-b601-rt DM defaults.
+  # Its J1-J3 Kd=8 exceeds the DM encoder range; use the upper limit of 5.
+  # Validate tracking and oscillation on hardware before further tuning.
   motor_configs: # J1..J7; kp [0, 500] (Nm/rad), kd [0, 5] (Nm*s/rad), protocol ranges
-    - {kp: 60.0, kd: 5.0} # J1
-    - {kp: 60.0, kd: 5.0} # J2
-    - {kp: 80.0, kd: 5.0} # J3
-    - {kp: 12.0, kd: 1.2} # J4
-    - {kp: 12.0, kd: 1.2} # J5
-    - {kp: 12.0, kd: 1.2} # J6
+    - {kp: 120.0, kd: 5.0} # J1
+    - {kp: 120.0, kd: 5.0} # J2
+    - {kp: 120.0, kd: 5.0} # J3
+    - {kp: 18.0, kd: 2.0} # J4
+    - {kp: 18.0, kd: 2.0} # J5
+    - {kp: 18.0, kd: 2.0} # J6
     - {} # J7; unused with the separate TacCap driver
   interpolate_cartesian_targets: true # true, false; 100 Hz TCP interpolation / synchronous IK
   coordinate_cartesian_speed: true # true, false; coordinate TCP speed when interpolation is on
