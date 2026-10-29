@@ -507,11 +507,17 @@ class BiEliteCS66RT(Robot):
         # idle while the slower arm finishes (the previous "wait for both, then
         # seed/start sequentially" structure starved whichever arm finished
         # first -> intermittent "socket timed out ... reverse_socket" RST).
-        def _bring_arm_online(side: str) -> None:
+        def _bring_arm_online(side: str, paired_failed: threading.Event) -> None:
             if go_to_start:
                 self._move_j_blocking(
-                    side, self._arm_start_pose(side), self.config.start_move_duration_s, path_checked=True
+                    side,
+                    self._arm_start_pose(side),
+                    self.config.start_move_duration_s,
+                    path_checked=True,
+                    paired_failed=paired_failed,
                 )
+            if paired_failed.is_set():
+                raise RuntimeError(f"{side} arm: servo start skipped, the paired arm failed to come online")
             if self.config.control_mode == BiEliteCS66RTControlMode.CARTESIAN_SERVO:
                 current_tcp = _controller_tcp_to_pose6(self._rtsi[side].getActualTCPPose())
                 self._last_tcp_command[side] = current_tcp.copy()
@@ -524,10 +530,7 @@ class BiEliteCS66RT(Robot):
                 self.logger.info(
                     f"Bi Elite CS66 moving both arms to start_position over {self.config.start_move_duration_s:.1f}s..."
                 )
-            with ThreadPoolExecutor(max_workers=2) as ex:
-                online_futs = {side: ex.submit(_bring_arm_online, side) for side in _SIDES}
-                for side in _SIDES:
-                    online_futs[side].result()
+            self._run_arms_paired(_bring_arm_online, "start move")
             self._check_station_health()
             for side in _SIDES:
                 self._driver[side].check_error()
@@ -657,6 +660,7 @@ class BiEliteCS66RT(Robot):
         # Smooth return to home for both arms in parallel before teardown,
         # unless the collision layer finds the joint path to home blocked.
         go_home = True
+        home_error: Exception | None = None
         if self._station is not None:
             try:
                 self._check_joint_move({side: self._arm_home_pose(side) for side in _SIDES}, "return-to-home")
@@ -664,10 +668,11 @@ class BiEliteCS66RT(Robot):
                 go_home = False
                 self.logger.error(f"Skipping return-to-home, arms left where they are: {exc}")
         if go_home:
-            with ThreadPoolExecutor(max_workers=2) as ex:
-                home_futs = {side: ex.submit(self._return_home_arm, side) for side in _SIDES}
-                for side in _SIDES:
-                    home_futs[side].result()
+            try:
+                self._run_arms_paired(self._return_home_arm, "return-to-home")
+            except Exception as exc:
+                # Teardown still runs; the failure is raised once it is done.
+                home_error = exc
         with best_effort(self.logger, "stopping the station collision layer"):
             self._stop_station_layer()
 
@@ -703,18 +708,56 @@ class BiEliteCS66RT(Robot):
                     self.logger.warn(f"{side} gripper disconnect failed: {exc}")
 
         self._is_connected = False
+        if home_error is not None:
+            raise RuntimeError(
+                f"Return-to-home failed; arms were left where they stopped: {home_error}"
+            ) from home_error
 
-    def _return_home_arm(self, side: str) -> None:
+    def _return_home_arm(self, side: str, paired_failed: threading.Event | None = None) -> None:
         """Blocking MoveJ to home for one arm, then re-kill its servo loop."""
         if self._driver[side] is None or self._rtsi[side] is None:
             return
         try:
             self.logger.info(f"{side} arm: returning to home_position over {self.config.home_move_duration_s:.1f}s...")
-            self._move_j_blocking(side, self._arm_home_pose(side), self.config.home_move_duration_s, path_checked=True)
-        except Exception as exc:
-            self.logger.warn(f"{side} arm: return-to-home failed; proceeding with shutdown anyway: {exc}")
-        # _move_j_blocking may have restarted the servo loop in its finally block.
-        self._stop_servo_loop(side)
+            self._move_j_blocking(
+                side,
+                self._arm_home_pose(side),
+                self.config.home_move_duration_s,
+                path_checked=True,
+                paired_failed=paired_failed,
+            )
+        finally:
+            # _move_j_blocking may have restarted the servo loop in its finally block.
+            self._stop_servo_loop(side)
+
+    def _run_arms_paired(self, work, what: str) -> None:
+        """Run ``work(side, paired_failed)`` for both arms in parallel.
+
+        A both-arm station path check assumes the arms progress together, so once
+        one arm fails the other must not go on into a combination nobody checked:
+        ``paired_failed`` is set and the other arm skips any MoveJ or servo start
+        it has not begun yet. A native MoveJ already in flight cannot be
+        interrupted from here (moveJ holds the driver's lifecycle lock and the
+        dashboard binding exposes no stop), so it finishes or is aborted by the
+        controller. Every per-arm error is logged; the first one is raised.
+        """
+        paired_failed = threading.Event()
+
+        def _run(side: str) -> None:
+            try:
+                work(side, paired_failed)
+            except BaseException:
+                paired_failed.set()
+                raise
+
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            futs = {side: ex.submit(_run, side) for side in _SIDES}
+        errors = {side: futs[side].exception() for side in _SIDES if futs[side].exception() is not None}
+        if not errors:
+            return
+        for side, exc in errors.items():
+            self.logger.error(f"{side} arm: {what} failed: {exc}")
+        raise next(iter(errors.values()))
 
     # =========================================================================
     # Servo loop (per arm)
@@ -852,11 +895,16 @@ class BiEliteCS66RT(Robot):
         # An independent cache reader owns publication, including while arms
         # hold and when no get_observation() calls are made. No USB/serial
         # transaction is permitted in the reader's read().
-        self._station_gripper_stop.clear()
+        # A fresh Event per start: a reader that failed to join on an earlier
+        # stop keeps its own (set) Event and can never be revived by this one.
+        self._station_gripper_stop = threading.Event()
         self._station_gripper_error = None
         self._station_gripper_samples = None
         self._station_gripper_thread = threading.Thread(
-            target=self._station_gripper_loop, args=(self._station,), name="station-gripper-state", daemon=True
+            target=self._station_gripper_loop,
+            args=(self._station, self._station_gripper_stop, self._station_gripper_readers),
+            name="station-gripper-state",
+            daemon=True,
         )
         self._station_gripper_thread.start()
         deadline = time.monotonic() + 1.0
@@ -869,11 +917,11 @@ class BiEliteCS66RT(Robot):
                     raise RuntimeError(f"No fresh calibrated gripper state for collision startup: {exc}") from exc
                 time.sleep(0.01)
 
-    def _station_gripper_loop(self, station) -> None:
+    def _station_gripper_loop(self, station, stop: threading.Event, readers: dict) -> None:
         period = 1.0 / self.config.native_collision_gripper_publish_hz
-        while not self._station_gripper_stop.is_set():
+        while not stop.is_set():
             try:
-                snapshots = {side: self._station_gripper_readers[side].read() for side in _SIDES}
+                snapshots = {side: readers[side].read() for side in _SIDES}
                 self._station_gripper_samples = (time.monotonic(), snapshots)
                 station.publish_gripper_snapshots(snapshots)
                 self._station_gripper_error = None
@@ -884,24 +932,24 @@ class BiEliteCS66RT(Robot):
                     station.publish_gripper_snapshots({})
                 except Exception:
                     return  # native timestamp validation still expires the last publication
-            self._station_gripper_stop.wait(period)
+            stop.wait(period)
 
     def _stop_station_layer(self) -> None:
+        thread = self._station_gripper_thread
         try:
             if self._coordinator is not None:
                 self._coordinator.stop()
         finally:
+            # Cleanup always completes; a coordinator.stop() error stays the one raised.
             self._station_gripper_stop.set()
-            if self._station_gripper_thread is not None:
-                self._station_gripper_thread.join(timeout=1.0)
-                if self._station_gripper_thread.is_alive():
-                    raise RuntimeError(
-                        "Gripper snapshot reader did not stop; backend must provide a nonblocking snapshot"
-                    )
-                self._station_gripper_thread = None
+            self._station_gripper_thread = None
+            if thread is not None:
+                thread.join(timeout=1.0)
             self._station_gripper_readers.clear()
             self._coordinator = None
             self._station = None
+        if thread is not None and thread.is_alive():
+            raise RuntimeError("Gripper snapshot reader did not stop; backend must provide a nonblocking snapshot")
 
     def _measured_joints(self) -> dict[str, np.ndarray]:
         return {side: np.asarray(self._rtsi[side].getActualJointPositions(), dtype=np.float64) for side in _SIDES}
@@ -926,13 +974,20 @@ class BiEliteCS66RT(Robot):
             )
 
     def _move_j_blocking(
-        self, side: str, target_joints: list[float], duration_s: float, path_checked: bool = False
+        self,
+        side: str,
+        target_joints: list[float],
+        duration_s: float,
+        path_checked: bool = False,
+        paired_failed: threading.Event | None = None,
     ) -> None:
         driver = self._driver[side]
         assert driver is not None
         self._check_station_health()  # also required for a previously checked joint path
         if not path_checked:
             self._check_joint_move({side: list(target_joints)}, f"{side} MoveJ")
+        if paired_failed is not None and paired_failed.is_set():
+            raise RuntimeError(f"{side} MoveJ skipped: the paired arm's move failed")
         was_running = driver.status().running
         self._stop_servo_loop(side)
         # The arm moves under MoveJ, so the last streamed target no longer applies.
@@ -1196,6 +1251,24 @@ class BiEliteCS66RT(Robot):
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
+        if self.config.control_mode != BiEliteCS66RTControlMode.CARTESIAN_SERVO:
+            # Check the combined both-arm sweep once, like connect/disconnect;
+            # per-arm checks would each treat the other arm as parked.
+            for side in _SIDES:
+                self._raise_servo_error_if_any(side)
+            self._check_joint_move({side: self._arm_start_pose(side) for side in _SIDES}, "reset move")
+            self._run_arms_paired(
+                lambda side, paired_failed: self._move_j_blocking(
+                    side,
+                    self._arm_start_pose(side),
+                    self.config.reset_duration_s,
+                    path_checked=True,
+                    paired_failed=paired_failed,
+                ),
+                "reset move",
+            )
+            return
+
         with ThreadPoolExecutor(max_workers=2) as ex:
             futs = {side: ex.submit(self._reset_arm, side) for side in _SIDES}
             for side in _SIDES:
@@ -1203,9 +1276,7 @@ class BiEliteCS66RT(Robot):
 
     def _reset_arm(self, side: str) -> None:
         self._raise_servo_error_if_any(side)
-        if self.config.control_mode != BiEliteCS66RTControlMode.CARTESIAN_SERVO:
-            self._move_j_blocking(side, self._arm_start_pose(side), self.config.reset_duration_s)
-        elif self._start_tcp_pose[side] is not None and not self._driver[side].status().reset_active:
+        if self._start_tcp_pose[side] is not None and not self._driver[side].status().reset_active:
             self._driver[side].submit_target(_pose6_to_matrix(self._start_tcp_pose[side]), self.config.reset_duration_s)
             with self._servo_lock[side]:
                 self._last_tcp_command[side] = self._start_tcp_pose[side].copy()

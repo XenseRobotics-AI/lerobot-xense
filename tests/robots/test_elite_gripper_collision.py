@@ -174,6 +174,67 @@ class PublisherTests(unittest.TestCase):
         robot._return_home_arm.assert_not_called()
         self.assertFalse(robot.is_connected)
 
+    def test_joint_reset_checks_the_combined_sweep_once_before_moving(self):
+        robot = self.station_robot()
+        robot._is_connected = True
+        robot.cameras = {}
+        robot.config.control_mode = BiEliteCS66RTControlMode.JOINT_SERVO
+        robot.config.reset_duration_s = 2.0
+        robot.config.move_j_timeout_ms = 100
+        robot._servo_lock = {side: threading.Lock() for side in ("left", "right")}
+        robot._last_tcp_command = {}
+        robot._arm_start_pose = Mock(side_effect=lambda side: [0.1 if side == "left" else 0.2] * 6)
+        for side, rtsi in robot._rtsi.items():
+            rtsi.getActualJointPositions.return_value = [0.0] * 6
+            robot._driver[side].status.return_value = SimpleNamespace(running=False, error="")
+        robot._station.check_joint_path.return_value = SimpleNamespace(safe=True)
+        robot.reset_to_initial_position()
+        robot._station.check_joint_path.assert_called_once()
+        _, end = robot._station.check_joint_path.call_args.args
+        self.assertEqual(end["left"].tolist(), [0.1] * 6)
+        self.assertEqual(end["right"].tolist(), [0.2] * 6)
+        for side in ("left", "right"):
+            robot._driver[side].moveJ.assert_called_once()
+
+    def test_paired_failure_keeps_the_other_arm_from_starting_its_move(self):
+        robot = self.station_robot()
+        robot._servo_lock = {side: threading.Lock() for side in ("left", "right")}
+        robot._last_tcp_command = {}
+        robot.config.move_j_timeout_ms = 100
+        for driver in robot._driver.values():
+            driver.status.return_value = SimpleNamespace(running=False, error="")
+
+        def work(side, paired_failed):
+            if side == "left":
+                raise RuntimeError("Controller rejected/aborted MoveJ")
+            self.assertTrue(paired_failed.wait(1.0))
+            robot._move_j_blocking(side, [0.0] * 6, 1.0, path_checked=True, paired_failed=paired_failed)
+
+        with self.assertRaisesRegex(RuntimeError, "rejected/aborted"):
+            robot._run_arms_paired(work, "reset move")
+        robot._driver["right"].moveJ.assert_not_called()
+        logged = " ".join(c.args[0] for c in robot.logger.error.call_args_list)
+        self.assertIn("left arm: reset move failed", logged)
+        self.assertIn("right arm: reset move failed", logged)
+
+    def test_disconnect_surfaces_a_failed_return_home_after_teardown(self):
+        robot = self.station_robot()
+        robot._is_connected = True
+        robot._station = None
+        robot.cameras = {}
+        robot.config.command_timeout_ms = 100
+        dashboards = {side: Mock() for side in ("left", "right")}
+        robot._dashboard = dict(dashboards)
+        rtsis = dict(robot._rtsi)
+        robot._return_home_arm = Mock(side_effect=lambda side, _failed: (_ for _ in ()).throw(RuntimeError(side)))
+        with self.assertRaisesRegex(RuntimeError, "Return-to-home failed"):
+            robot.disconnect()
+        self.assertFalse(robot.is_connected)
+        for side in ("left", "right"):
+            dashboards[side].disconnect.assert_called_once()
+            rtsis[side].disconnect.assert_called_once()
+            self.assertIsNone(robot._driver[side])
+
     def test_publisher_runs_with_held_arms_without_observations_then_joins(self):
         robot = self.robot()
         station = robot._station
@@ -202,10 +263,11 @@ class PublisherTests(unittest.TestCase):
     def test_snapshot_exception_invalidates_the_whole_pair(self):
         robot = self.robot()
         station = robot._station
-        robot._station_gripper_readers = {"left": Mock()}
-        robot._station_gripper_readers["left"].read.side_effect = RuntimeError("sensor unavailable")
-        station.publish_gripper_snapshots.side_effect = lambda samples: robot._station_gripper_stop.set()
-        robot._station_gripper_loop(station)
+        readers = {"left": Mock()}
+        readers["left"].read.side_effect = RuntimeError("sensor unavailable")
+        stop = threading.Event()
+        station.publish_gripper_snapshots.side_effect = lambda samples: stop.set()
+        robot._station_gripper_loop(station, stop, readers)
         station.publish_gripper_snapshots.assert_called_once_with({})
         self.assertIn("sensor unavailable", robot._station_gripper_error)
 
@@ -219,6 +281,52 @@ class PublisherTests(unittest.TestCase):
             robot._stop_station_layer()
         self.assertFalse(thread.is_alive())
         self.assertIsNone(robot._station)
+
+    def test_stuck_reader_still_completes_cleanup_and_is_not_revived(self):
+        robot = self.robot()
+        release = threading.Event()
+        entered = threading.Event()
+
+        def stuck_read():
+            entered.set()
+            release.wait(5.0)
+            return Mock()
+
+        robot._start_station_gripper_publisher()
+        old_thread = robot._station_gripper_thread
+        old_stop = robot._station_gripper_stop
+        robot._station_gripper_readers["left"].read = Mock(side_effect=stuck_read)
+        self.assertTrue(entered.wait(1.0))
+        robot._coordinator = Mock()
+        with patch.object(old_thread, "join"), self.assertRaisesRegex(RuntimeError, "did not stop"):
+            robot._stop_station_layer()
+        self.assertIsNone(robot._coordinator)
+        self.assertIsNone(robot._station)
+        self.assertIsNone(robot._station_gripper_thread)
+        self.assertEqual(robot._station_gripper_readers, {})
+
+        # Reconnect: the new publisher gets its own Event; the stuck one stays stopped.
+        robot._station = Mock()
+        robot._start_station_gripper_publisher()
+        self.assertTrue(old_stop.is_set())
+        self.assertIsNot(robot._station_gripper_stop, old_stop)
+        release.set()
+        old_thread.join(1.0)
+        self.assertFalse(old_thread.is_alive())
+        robot._stop_station_layer()
+
+    def test_coordinator_stop_error_is_not_masked_by_stuck_reader(self):
+        robot = self.robot()
+        thread = Mock()
+        thread.is_alive.return_value = True
+        robot._station_gripper_thread = thread
+        robot._coordinator = Mock()
+        robot._coordinator.stop.side_effect = RuntimeError("stop failed")
+        with self.assertRaisesRegex(RuntimeError, "stop failed"):
+            robot._stop_station_layer()
+        self.assertIsNone(robot._coordinator)
+        self.assertIsNone(robot._station)
+        self.assertIsNone(robot._station_gripper_thread)
 
     def test_guard_disabled_does_not_start_snapshot_thread(self):
         robot = self.robot()
