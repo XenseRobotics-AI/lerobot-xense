@@ -81,7 +81,7 @@ def _configure_native_driver(cfg, config, tool, side=None, world_from_base=None)
     if not hasattr(cfg, "max_consecutive_write_failures"):
         raise RuntimeError(
             "Installed libpyelite predates max_consecutive_write_failures; rebuild it from "
-            "third_party/libpyelite (./setup_env.sh --elite)."
+            "third_party/libpyelite (./setup_env.sh --install --elite)."
         )
     fields = (
         "preserve_configuration",
@@ -93,7 +93,7 @@ def _configure_native_driver(cfg, config, tool, side=None, world_from_base=None)
         if not hasattr(cfg.planner, field):
             raise RuntimeError(
                 f"Installed libpyelite lacks PlannerConfig.{field}; rebuild it from "
-                "third_party/libpyelite (./setup_env.sh --elite)."
+                "third_party/libpyelite (./setup_env.sh --install --elite)."
             )
     from libpyelite.control_profile import configure_native_driver
 
