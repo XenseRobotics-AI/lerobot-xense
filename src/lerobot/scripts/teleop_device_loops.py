@@ -143,6 +143,9 @@ def run_cartesian_teleop_loop(
     start = time.perf_counter()
 
     prev_rt_moving = False
+    # Robots whose reset reports completion as a counter (Elite) re-sync once
+    # per finished reset however often rt_moving is read; others report None.
+    last_reset_generation = getattr(robot, "reset_generation", None)
     reset_display_cleared = False
 
     while True:
@@ -173,6 +176,7 @@ def run_cartesian_teleop_loop(
             continue
 
         # --- the arm is running its own trajectory --------------------------
+        reset_generation = getattr(robot, "reset_generation", None)
         if honour_rt_moving and getattr(robot, "rt_moving", False):
             if display_data and obs is not None:
                 log_rerun_data(observation=obs)
@@ -186,8 +190,9 @@ def run_cartesian_teleop_loop(
             continue
 
         # --- it just stopped: re-sync, and start the next frame clean -------
-        if prev_rt_moving:
+        if prev_rt_moving or reset_generation != last_reset_generation:
             prev_rt_moving = False
+            last_reset_generation = reset_generation
             reset_display_cleared = False
             try:
                 policy.resync(robot, teleop)

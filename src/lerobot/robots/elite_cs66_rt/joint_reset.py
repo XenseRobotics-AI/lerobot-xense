@@ -4,6 +4,7 @@ The worker supplies low-rate joint references; native senders and the station
 collision guard retain ownership of real-time planning and socket writes.
 """
 
+import logging
 import math
 import threading
 import time
@@ -69,11 +70,16 @@ class JointReset:
 
     Callers hold ``lock`` across normal sends and lifecycle transitions. The
     worker never holds it while checking paths, waiting, or joining a thread.
-    Failures stay visible until a new connection or an explicit reset retry.
+    A failure is logged once and stays in ``status()`` until the next reset or
+    connection; it does not block later commands, so a session can retry.
+    ``generation`` counts finished transactions (any outcome) so control loops
+    can re-sync their teleop target exactly once per reset, however often they
+    poll ``moving()``.
     """
 
-    def __init__(self, config):
+    def __init__(self, config, logger=None):
         self.config = config
+        self.logger = logger or logging.getLogger(__name__)
         self.lock = threading.RLock()
         self._thread: threading.Thread | None = None
         self._cancel = threading.Event()
@@ -81,7 +87,7 @@ class JointReset:
         self.closing = False
         self.state = "idle"
         self.error: Exception | None = None
-        self._completion_reads_remaining = 0
+        self.generation = 0
 
     def prepare_connection(self) -> None:
         self.close()
@@ -89,7 +95,6 @@ class JointReset:
             self.closing = False
             self.state = "idle"
             self.error = None
-            self._completion_reads_remaining = 0
 
     def check_error(self) -> None:
         if self.error is not None:
@@ -97,16 +102,7 @@ class JointReset:
 
     def moving(self) -> bool:
         with self.lock:
-            self.check_error()
-            if self.active:
-                return True
-            if self._completion_reads_remaining:
-                # Recording reads twice: hasattr(robot, "rt_moving") and
-                # robot.rt_moving. Keep the completion edge through both reads,
-                # including when the worker finishes between them.
-                self._completion_reads_remaining -= 1
-                return True
-            return False
+            return self.active
 
     def status(self) -> dict:
         with self.lock:
@@ -137,7 +133,6 @@ class JointReset:
             self.error = None
             self._cancel.clear()
             self.active = True
-            self._completion_reads_remaining = 0
             self.state = "settling"
             clear_targets()
             self._thread = threading.Thread(
@@ -165,6 +160,7 @@ class JointReset:
         previous = dict.fromkeys(goals)
         changed_at = dict.fromkeys(goals, begun)
         stable_since = None
+        stable_stamps = None
         origin = None
         motion_start = None
         endpoint_sent = False
@@ -181,7 +177,7 @@ class JointReset:
                 if now >= deadline:
                     raise TimeoutError("Joint reset timed out before measured angle/velocity settled")
                 samples = {}
-                fresh = True
+                stamps = {}
                 settled = True
                 for side, driver in drivers.items():
                     driver.check_error()
@@ -196,21 +192,28 @@ class JointReset:
                     if stamp != previous[side]:
                         previous[side] = stamp
                         changed_at[side] = now
-                    else:
-                        fresh = False
                     if now - changed_at[side] >= cfg.reset_feedback_timeout_s:
                         raise TimeoutError(f"{side} RTSI feedback stale during joint reset")
                     samples[side] = q
+                    stamps[side] = stamp
                     settled &= bool(np.max(np.abs(velocity)) <= cfg.reset_velocity_tolerance_rad_s)
                     if origin is not None:
                         # Direct, unwrapped error: q and q + 2*pi are different
                         # physical return configurations even if TCPs coincide.
                         settled &= bool(np.max(np.abs(q - goals[side])) <= cfg.reset_joint_tolerance_rad)
-                if not fresh or not settled:
+                # A repeated RTSI stamp (polling faster than rtsi_frequency, or
+                # jitter) neither restarts nor completes the dwell; staleness is
+                # bounded by reset_feedback_timeout_s above. Completion needs a
+                # newer settled sample from every arm than the one that began it.
+                if not settled:
                     stable_since = None
                 elif stable_since is None:
-                    stable_since = now
-                if stable_since is not None and now - stable_since >= cfg.reset_stable_dwell_s:
+                    stable_since, stable_stamps = now, stamps
+                if (
+                    stable_since is not None
+                    and now - stable_since >= cfg.reset_stable_dwell_s
+                    and all(stamps[side] > stable_stamps[side] for side in stamps)
+                ):
                     if origin is None:
                         preflight({side: q.tolist() for side, q in goals.items()})
                         if self._cancel.is_set():
@@ -256,7 +259,6 @@ class JointReset:
                 clear_targets()
                 self.state, self.error = outcome, error
                 self.active = False
-                # Always arm this after success: an active read could have
-                # been only hasattr's discarded value. This notification does
-                # not extend reset ownership or change the measured status.
-                self._completion_reads_remaining = 2 if outcome == "succeeded" else 0
+                self.generation += 1
+            if error is not None:
+                self.logger.error(f"Elite joint reset failed: {error}")
