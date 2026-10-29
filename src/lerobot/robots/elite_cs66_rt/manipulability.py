@@ -21,7 +21,7 @@ joint velocity past its ``JOINT_IGNORE_SPEED`` bound and drops external control.
 DH convention
 -------------
 The Elite controller uses **Modified (Craig) DH**. This must match
-``third_party/elite-robots-cs-sdk/plugin/kinematics/.../KdlKinematicsPlugin.cpp::setMDH``
+``third_party/libpyelite/vendor/elite_cs_sdk/plugin/kinematics/.../KdlKinematicsPlugin.cpp::setMDH``
 exactly: each link is ``Rx(alpha_i) · Tx(a_i) · Tz(d_i) · Rz(theta_i)`` with the per-joint
 parameters indexed as ``dh_alpha_[i], dh_a_[i], dh_d_[i]`` from ``KinematicsInfo``. A
 standard-DH or mis-indexed builder silently yields ``w≡0`` at *every* configuration (not a

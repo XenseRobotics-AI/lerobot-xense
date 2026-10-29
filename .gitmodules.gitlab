@@ -25,12 +25,6 @@
 [submodule "third_party/XGripper"]
 	path = third_party/XGripper
 	url = git@${XENSE_GITLAB_HOST}:physical-ai/grippersdk/xgripper.git
-[submodule "third_party/elite-robots-cs-sdk"]
-	path = third_party/elite-robots-cs-sdk
-	url = git@${XENSE_GITLAB_HOST}:physical-ai/robot_sdk/elite-robots-cs-sdk.git
-[submodule "third_party/elite-robots-cs-sdk-python"]
-	path = third_party/elite-robots-cs-sdk-python
-	url = git@${XENSE_GITLAB_HOST}:physical-ai/robot_sdk/elite-robots-cs-sdk-python.git
 [submodule "third_party/taccap-gripper"]
 	path = third_party/taccap-gripper
 	url = git@${XENSE_GITLAB_HOST}:physical-ai/grippersdk/taccap-gripper.git

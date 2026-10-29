@@ -7,15 +7,12 @@
 [submodule "third_party/XGripper"]
 	path = third_party/XGripper
 	url = git@github.com:XenseRobotics-AI/XGripper.git
-[submodule "third_party/elite-robots-cs-sdk"]
-	path = third_party/elite-robots-cs-sdk
-	url = git@github.com:XenseRobotics-AI/Elite_Robots_CS_SDK.git
-[submodule "third_party/elite-robots-cs-sdk-python"]
-	path = third_party/elite-robots-cs-sdk-python
-	url = git@github.com:XenseRobotics-AI/Elite_Robots_CS_SDK_Python.git
 [submodule "third_party/taccap-gripper"]
 	path = third_party/taccap-gripper
 	url = git@github.com:XenseRobotics-AI/TacCap-Gripper.git
 [submodule "third_party/libpyrebot"]
 	path = third_party/libpyrebot
 	url = git@github.com:XenseRobotics-AI/libpyrebot.git
+[submodule "third_party/libpyelite"]
+	path = third_party/libpyelite
+	url = git@github.com:XenseRobotics-AI/libpyelite.git

@@ -35,7 +35,7 @@ from lerobot.grippers import SerialGripperConfig, TaccapFollowerConfig, usb_topo
 from tests.utils import require_package
 
 HAS_FLEXIV = find_spec("flexiv_rt") is not None
-HAS_ELITE = find_spec("elite_cs_sdk") is not None
+HAS_ELITE = find_spec("libpyelite") is not None
 
 
 # ── Path parsing ────────────────────────────────────────────────────────────
@@ -269,7 +269,7 @@ def _config(robot_type: str):
 
         return BiFlexivRizon4RTConfig
     if not HAS_ELITE:
-        pytest.skip("elite_cs_sdk not importable")
+        pytest.skip("libpyelite not importable")
     from lerobot.robots.bi_elite_cs66_rt.config_bi_elite_cs66_rt import BiEliteCS66RTConfig
 
     return BiEliteCS66RTConfig

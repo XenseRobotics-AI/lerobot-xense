@@ -59,15 +59,14 @@ cd lerobot-xense
 
 This repository uses `third_party/` git submodules to manage hardware SDK dependencies:
 
-| Submodule                                | Installed package                               |
-| ---------------------------------------- | ----------------------------------------------- |
-| `third_party/ARX5_SDK`                   | `pyarx`                                         |
-| `third_party/libpyflexiv`                | `flexiv_rt`                                     |
-| `third_party/libpyrebot`                 | `rebot_rt`                                      |
-| `third_party/XGripper`                   | `xgripper`                                      |
-| `third_party/elite-robots-cs-sdk`        | Elite CS C++ SDK (builds `elite_cs_sdk`)        |
-| `third_party/elite-robots-cs-sdk-python` | `elite_cs_sdk` (Elite CS Python bindings)       |
-| `third_party/taccap-gripper`             | `xense.taccap` (TacCap UMI tactile gripper SDK) |
+| Submodule                    | Installed package                               |
+| ---------------------------- | ----------------------------------------------- |
+| `third_party/ARX5_SDK`       | `pyarx`                                         |
+| `third_party/libpyflexiv`    | `flexiv_rt`                                     |
+| `third_party/libpyrebot`     | `rebot_rt`                                      |
+| `third_party/XGripper`       | `xgripper`                                      |
+| `third_party/libpyelite`     | `libpyelite` (Elite CS SDK + native Pink IK)    |
+| `third_party/taccap-gripper` | `xense.taccap` (TacCap UMI tactile gripper SDK) |
 
 The [`libpyrebot`](https://github.com/xensedyl/libpyrebot) submodule provides C++ 100 Hz Cartesian control and IK for reBot B601 DM and RS arms. Build its pybind11 extension for the active Python environment before using the `rebot_b601_rt` or `bi_rebot_b601_rt` robot types (see the build steps below and its [README](third_party/libpyrebot/README.md)). It supports DM serial bridges and SocketCAN, and RS over SocketCAN. Complete DM and RS model assets are bundled. Platform **09** uses the identified `DM_TacCap00` v1 assembly: its `dm-taccap00-09.yaml` recipes explicitly set each arm's `urdf_path` and `end_frame: taccap_eef_link`. Other platforms must select the URDF/TCP matching their actual arm, mount and payload; DM does not imply TacCap00. The gripper uses its separate driver. These recipes enable model gravity plus matching `_offset.yaml` holding biases via `gravity_use_joint_offsets: true`. Legacy configurations without `urdf_path` retain the family/gripper fallback (`DM_TacCap00` for DM TacCap, `RS_TacCap05` for RS TacCap, otherwise the original DM/RS model).
 
@@ -204,8 +203,8 @@ regression coverage; validate them on your rig before a collection run.
 
 > `xensesdk` is **not** a submodule — it is installed from PyPI (`xensesdk==2.1.2`,
 > the published cp312 manylinux wheel, which bundles the patched `libxense_c.so`
-> flash reader). The Elite Python SDK is built against the local
-> `third_party/elite-robots-cs-sdk` C++ submodule (no network fetch of the C++ source).
+> flash reader). `libpyelite` vendors the Elite CS C++ SDK as its own submodule
+> (`third_party/libpyelite/vendor/elite_cs_sdk`), so no network fetch of the C++ source.
 
 > **`xensevr_pc_service_sdk` (Pico4 teleop/tracker) has no submodule either.** Its
 > pybind11 sources live in-repo under
@@ -244,7 +243,7 @@ This step will:
   [v0.2.1 release](https://github.com/XenseRobotics-AI/XenseVR-PC-Service/releases/tag/v0.2.1)
   into `/opt/apps/roboticsservice`; override with `XENSEVR_DEB_URL`, or point
   `XENSEVR_DEB` at a local file for offline installs) — only with `--pico4` / `--bi_pico4` or a full install
-- Build and install the SDK packages supported by `setup_env.sh`: `pyarx`, `rebot_rt`, `flexiv_rt`, `xensevr_pc_service_sdk` (built against the `.deb`'s client SDK), `xgripper`, `elite_cs_sdk` (Elite CS — built from the C++ + Python submodules), and `xense.taccap` (TacCap UMI gripper)
+- Build and install the SDK packages supported by `setup_env.sh`: `pyarx`, `rebot_rt`, `flexiv_rt`, `xensevr_pc_service_sdk` (built against the `.deb`'s client SDK), `xgripper`, `libpyelite` (Elite CS SDK + native Pink IK, built from its submodule), and `xense.taccap` (TacCap UMI gripper)
 - Configure SpaceMouse udev rules and HID permissions automatically
 
 > You will be prompted for `sudo` password during installation (for ARX5 real-time capability and udev rules).
@@ -311,7 +310,7 @@ bash ./setup_env.sh --install --help
 | ------------------------- | ---------------------------------------------- | ----------------------------------------- |
 | `--rebot`, `--bi_rebot`   | `rebot_rt` (isolated Pinocchio dependencies)   | `rebot_b601_rt`, `bi_rebot_b601_rt`       |
 | `--flexiv`, `--bi_flexiv` | `flexiv_rt` (+ `xense`)                        | `flexiv_rizon4_rt`, `bi_flexiv_rizon4_rt` |
-| `--elite`, `--bi_elite`   | `elite_cs_sdk` (+ `xense`)                     | `elite_cs66_rt`, `bi_elite_cs66_rt`       |
+| `--elite`, `--bi_elite`   | `libpyelite` (+ `xense`)                       | `elite_cs66_rt`, `bi_elite_cs66_rt`       |
 | `--taccap`, `--bi_taccap` | `xense.taccap` (+ `xense`)                     | `taccap_follower` gripper (on any arm)    |
 | `--xense`                 | `xensesdk` + `xgripper` (XGripper)             | `serial` gripper + tactile sensors        |
 | `--arx5`, `--bi_arx5`     | `pyarx`                                        | `arx5_follower`, `bi_arx5`                |
@@ -342,7 +341,7 @@ python -c 'import flexiv_rt; print("flexiv_rt OK ->", flexiv_rt.__file__)'
 python -c 'import xensevr_pc_service_sdk; print("xensevr_pc_service_sdk OK ->", xensevr_pc_service_sdk.__file__)'
 python -c 'import xensesdk; print("xensesdk OK ->", xensesdk.__file__)'
 python -c 'import xgripper; print("xgripper OK ->", xgripper.__file__)'
-python -c 'import elite_cs_sdk; print("elite_cs_sdk OK ->", elite_cs_sdk.__file__)'
+python -c 'import libpyelite; print("libpyelite OK ->", libpyelite.__file__, libpyelite.IK_BACKEND)'
 python -c 'import xense.taccap; print("xense.taccap OK ->", xense.taccap.__file__)'
 ```
 

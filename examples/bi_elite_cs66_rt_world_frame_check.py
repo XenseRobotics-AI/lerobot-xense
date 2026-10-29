@@ -46,7 +46,7 @@ import numpy as np
 from lerobot.robots.bi_elite_cs66_rt.bi_elite_cs66_rt import BiEliteCS66RT
 from lerobot.robots.bi_elite_cs66_rt.config_bi_elite_cs66_rt import BiEliteCS66RTConfig
 from lerobot.robots.elite_cs66_rt import elite_cs66_rt as _elite_mod
-from lerobot.robots.elite_cs66_rt.elite_cs66_rt import _import_elite_sdk
+from lerobot.robots.elite_cs66_rt.elite_cs66_rt import _controller_tcp_to_pose6, _import_elite_sdk
 from lerobot.utils.rotation import Rotation
 
 _SIDES = ("left", "right")
@@ -73,13 +73,16 @@ def _base_pose6_to_world(R_wb: np.ndarray, pose6: np.ndarray) -> np.ndarray:
 
 
 def _read_tcp_pose(rtsi, *, settle_s: float = 2.0) -> np.ndarray:
-    """Poll getActualTCPPose() until a non-zero packet arrives (or timeout)."""
+    """Poll getActualTCPPose() until a non-zero packet arrives (or timeout).
+
+    RTSI reports [x, y, z, roll, pitch, yaw]; the result is converted to rotvec.
+    """
     deadline = time.monotonic() + settle_s
     pose = np.zeros(6, dtype=np.float64)
     while time.monotonic() < deadline:
         pose = np.asarray(rtsi.getActualTCPPose(), dtype=np.float64)
         if np.linalg.norm(pose) > 1e-9:
-            return pose
+            return _controller_tcp_to_pose6(pose)
         time.sleep(0.05)
     return pose  # all-zero -> stream never populated (recipe/connection issue)
 

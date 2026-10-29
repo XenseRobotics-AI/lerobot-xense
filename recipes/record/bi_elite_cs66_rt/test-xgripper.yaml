@@ -11,6 +11,18 @@
 
 robot:
   type: bi_elite_cs66_rt
+  # Validated bench-08 serial-gripper assembly; overrides the legacy mount angles below.
+  native_assembly: diagonal-08
+  # Teach-pendant TCP in metres (tool0 <- TCP); zero TCP rotation on both arms.
+  # These measurements do not apply to bench 07 or to the TacCap gripper variant.
+  left_tool_transform: [1.0, 0.0, 0.0, 0.0068,
+                        0.0, 1.0, 0.0, -0.0063,
+                        0.0, 0.0, 1.0, 0.1941,
+                        0.0, 0.0, 0.0, 1.0]
+  right_tool_transform: [1.0, 0.0, 0.0, -0.0080,
+                         0.0, 1.0, 0.0, -0.0065,
+                         0.0, 0.0, 1.0, 0.1920,
+                         0.0, 0.0, 0.0, 1.0]
 
   # ── Bench hardware (diagonal-08) ────────────────────────────────────────────
   left_robot_ip: "192.168.8.53"
@@ -106,8 +118,8 @@ robot:
   joint_vel_limits_rad_s: [2.618, 2.618, 3.142, 4.014, 4.014, 4.014]
   joint_vel_limit_margin: 0.8 # enforce at 80% of the limits; lower (e.g. 0.6) for more headroom
   # Per-servo-tick velocity ceiling — smooths jumpy Pico4 wrist tracking at the source.
-  max_lin_speed: 0.25 # m/s
-  max_ang_speed: 1.0  # rad/s (matches the Bi-Pico4 max_rot_velocity default)
+  max_lin_speed: 0.25 # m/s; the native planner uses min(this, native_max_tcp_linear_velocity)
+  max_ang_speed: 1.0  # rad/s; the native planner uses min(this, native_max_tcp_angular_velocity)
 
   # NOTE: max_reach_radius intentionally left OFF (config default None). The 2026-07-09
   # trip was NOT a reach-boundary problem — the flange was at 0.82 m (well inside the

@@ -8,8 +8,9 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-"""Configuration for Elite Robots CS66 arms via elite_cs_sdk."""
+"""Configuration for Elite Robots CS66 arms via libpyelite."""
 
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -77,7 +78,7 @@ class EliteCS66RTConfig(RobotConfig):
     The default mode follows the LeRobot Cartesian convention:
     actions/observations use tcp.x/y/z plus 6D rotation tcp.r1..tcp.r6, and the
     driver converts that pose to Elite's native [x, y, z, rx, ry, rz] rotvec
-    format before calling writeServoj(..., cartesian=True).
+    format at the SDK boundary; native IK takes SE(3) and sends joint servoJ.
     """
 
     robot_ip: str = "192.168.1.200"
@@ -94,7 +95,7 @@ class EliteCS66RTConfig(RobotConfig):
     observe_joints: bool = False
 
     # Elite external control script. When unset, connect() resolves
-    # elite_cs_sdk/external_control.script from the installed SDK package.
+    # libpyelite/external_control.script from the installed SDK package.
     script_file_path: str | Path | None = None
 
     # Servo streaming parameters. servoj_time is the controller's inner
@@ -117,9 +118,20 @@ class EliteCS66RTConfig(RobotConfig):
     servoj_lookahead_time: float = 0.1
     servoj_gain: int = 300
     command_timeout_ms: int = 200
+    # Native streaming always runs; this flag selects async vs blocking reset.
     use_background_servo_loop: bool = True
     command_stale_timeout_s: float = 0.5
     reset_duration_s: float = 3.0
+
+    # Native libpyelite planner; coordinates are still converted by this adapter.
+    native_model_path: str | Path | None = None
+    native_ik_max_iterations: int = 500
+    native_max_tcp_linear_velocity: float = 0.5  # m/s, planning cap
+    native_max_tcp_angular_velocity: float = 1.0  # rad/s, planning cap
+    native_joint_velocity_scale: float = 1.0  # fraction of official URDF limit
+    # Row-major tool0 <- TCP SE(3). None reads the active teach-pendant TCP back at
+    # connect (FK_flange(q)^-1 @ measured TCP) and logs it; set it to pin the value.
+    tool_transform: list[float] | None = None
 
     # RTSI state stream.
     rtsi_frequency: float = 250.0
@@ -157,13 +169,9 @@ class EliteCS66RTConfig(RobotConfig):
     # fast handshakes don't pay the full sleep.
     external_control_settle_s: float = 1.0
 
-    # Number of consecutive writeServoj() failures the background servo
-    # loop tolerates before declaring itself dead. SDK reverse-socket writes
-    # can fail transiently right after the script comes up. Decoupled from
-    # external_control_settle_s so shrinking the connect-time settle doesn't
-    # also shrink the failure tolerance.
-    # 250 ticks * 0.004 s = 1 s of failure tolerance, matching the original
-    # tied-to-settle behavior.
+    # Consecutive reverse-socket write failures the native sender tolerates before
+    # faulting. Writes fail transiently right after the external control script comes
+    # up, which is when connect() starts the servo. 250 ticks * 0.004 s = 1 s.
     servo_failure_tolerance_ticks: int = 250
 
     # Trace every send_action and large per-step deltas to the spdlog file
@@ -179,19 +187,12 @@ class EliteCS66RTConfig(RobotConfig):
     # loop that's ~855°/s, well above normal leader-follower joint speeds.
     trace_joint_threshold: float = 0.3
 
-    # Opt-in Cartesian velocity ceiling for the background servo loop. Both None
-    # by default -> no PC-side clamp: the controller's pendant safety config and
-    # external_control.script's JOINT_IGNORE_SPEED=30 rad/s already bound the
-    # hardware envelope, and a clamp risks masking real safety incidents behind a
-    # "looks smooth" behavior. Set these when a jumpy leader (fast wrist rotation,
-    # VR tracking spike, clutch re-engage) feeds target steps that imply joint
-    # speed above that bound and trip a protective stop: the servo loop then slews
-    # the commanded TCP toward the latest target at no more than this speed,
-    # turning the step into a smooth bounded ramp. Expressed as a velocity ceiling
-    # (m/s, rad/s) applied per servoj_time tick — NOT a per-tick delta. Only the
-    # background servo loop honors these; the direct-write path is unaffected.
-    max_lin_speed: float | None = None  # m/s; None disables the linear cap
-    max_ang_speed: float | None = None  # rad/s; None disables the angular cap
+    # Recipe-level TCP speed caps (m/s, rad/s). The native planner limits its
+    # Cartesian path to min(this, native_max_tcp_*), so these only ever tighten the
+    # planner default; None leaves native_max_tcp_* as the effective cap. Set them to
+    # smooth a jumpy leader (fast wrist rotation, VR tracking spike, clutch re-engage).
+    max_lin_speed: float | None = None  # m/s; None keeps native_max_tcp_linear_velocity
+    max_ang_speed: float | None = None  # rad/s; None keeps native_max_tcp_angular_velocity
 
     # Workspace reachability guard. Distance (m) from the base-frame origin beyond
     # which a commanded TCP target is treated as unreachable: the driver then HOLDS
@@ -277,14 +278,29 @@ class EliteCS66RTConfig(RobotConfig):
     _serial_autodiscover: bool = field(default=False, init=False)
 
     def __post_init__(self):
+        if self.native_ik_max_iterations < 1:
+            raise ValueError("native_ik_max_iterations must be positive")
+        for name in (
+            "native_max_tcp_linear_velocity",
+            "native_max_tcp_angular_velocity",
+            "native_joint_velocity_scale",
+        ):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        if self.native_joint_velocity_scale > 1:
+            raise ValueError("native_joint_velocity_scale must not exceed 1")
+        for name in ("tool_transform",):
+            tool = getattr(self, name)
+            if tool is not None and (len(tool) != 16 or not all(math.isfinite(v) for v in tool)):
+                raise ValueError(f"{name} must be a finite row-major 4x4 transform")
         super().__post_init__()
 
-        if not 0.002 <= self.servoj_time <= 0.01:
-            # Below 2 ms the controller's inner servo loop can't keep up; above
-            # 10 ms the script's per-tick extrapolation window grows large and
-            # target updates feel laggy. Default 4 ms matches the SDK example
-            # (250 Hz, the CS-series RT controller's native rate).
-            raise ValueError(f"servoj_time must be in [0.002, 0.01] s (CS-series RT envelope), got {self.servoj_time}")
+        if not 0.004 <= self.servoj_time <= 0.01:
+            raise ValueError(
+                f"servoj_time must be in [0.004, 0.01] s, got {self.servoj_time}: the native planner "
+                "solves one IK step per servoj_time, and below 4 ms it overruns its period"
+            )
         if not 0.03 <= self.servoj_lookahead_time <= 0.2:
             # Elite SDK EliteDriver.hpp says lookahead time must lie in [0.03, 0.2];
             # values outside this range cause the external_control script to abort
@@ -350,11 +366,6 @@ class EliteCS66RTConfig(RobotConfig):
             raise ValueError(f"external_control_settle_s must be >= 0, got {self.external_control_settle_s}")
         if self.servo_failure_tolerance_ticks < 1:
             raise ValueError(f"servo_failure_tolerance_ticks must be >= 1, got {self.servo_failure_tolerance_ticks}")
-        if self.use_background_servo_loop and self.control_mode != EliteCS66RTControlMode.CARTESIAN_SERVO:
-            raise ValueError(
-                "use_background_servo_loop=True is only supported with control_mode=CARTESIAN_SERVO. "
-                "Set use_background_servo_loop=False for joint servo mode."
-            )
 
         # ── Cameras ── With auto-discovery on, the wrist + tactile cameras travel
         # with the gripper, so the robot sniffs them at connect (see
