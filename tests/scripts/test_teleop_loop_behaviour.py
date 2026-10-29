@@ -145,6 +145,19 @@ def test_the_teleop_is_resynced_once_the_trajectory_ends(case):
     assert teleop.names().count("reset_to_pose") == 1
 
 
+@pytest.mark.parametrize("case", CASES, ids=IDS)
+def test_a_reset_seen_only_as_a_finished_count_still_resyncs(case):
+    """A reset that finishes between two rt_moving reads (or fails fast) never
+    reads as moving; the reset_generation counter must still trigger the re-sync,
+    and the frame that re-syncs must not send a target computed before it."""
+    robot, teleop = case.robot(finished_reset_frames={1}), case.teleop()
+
+    case.run(robot, teleop)
+
+    assert teleop.names().count("reset_to_pose") == 1
+    assert robot.names().count("send_action") == ITERS - 1
+
+
 @pytest.mark.parametrize(
     ("case", "expected_getter"),
     [

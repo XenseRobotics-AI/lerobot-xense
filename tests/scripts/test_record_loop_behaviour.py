@@ -103,6 +103,22 @@ def test_the_keyboard_go_start_event_sends_the_arm_home(case):
     assert robot.names().count("reset_to_initial_position") >= 1
 
 
+def test_elite_record_resyncs_once_per_finished_reset_count():
+    """The re-sync follows reset_generation, not a count of rt_moving reads."""
+    case = CASES[1]
+    robot = FakeRobot(iterations=ITERS, finished_reset_frames={1})
+    dataset, events, teleop = FakeDataset(fps=FPS), fresh_events(), case.teleop()
+
+    case.run(robot, teleop, dataset, events)
+
+    assert teleop.names().count("reset_to_pose") == 1
+    names = robot.names()
+    resync_at = names.index("get_current_tcp_pose_euler")
+    sends = [i for i, name in enumerate(names) if name == "send_action"]
+    assert sends[0] < resync_at < sends[1], "the re-sync must precede frame 1's send"
+    assert len(dataset.frames) == ITERS
+
+
 def test_elite_record_also_accepts_the_spacemouse_button_reset():
     """The Elite loop adds device buttons on top of the keyboard event."""
     case = CASES[1]

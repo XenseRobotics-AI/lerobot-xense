@@ -140,6 +140,11 @@ robot:
   # Joint Ruckig after IK. Elite publishes no joint acceleration/jerk rating:
   # these only back the Cartesian limits up and should rarely bind.
   native_joint_motion_limits: true
+  # Preserve the startup IK configuration; hold orientation at reach boundaries.
+  native_preserve_configuration: true
+  native_configuration_margin: 0.05235987755982989  # radians (3 degrees)
+  native_configuration_joint_span: 3.140592653589793  # unwrapped half-span, pi - 0.001
+  native_boundary_orientation_tolerance: 0.01  # radians
   # Keep these velocity caps; at 4 ms, 2.6/3.1 rad/s yields 0.0104/0.0124 rad per step.
   # A 50 mm detection band minus 10 mm clearance leaves 40 mm; buffer and halving give ~19.5 mm per pair.
   # Subdivision depends on links, bounding spheres, pose, and both arms' motion; higher speeds increase

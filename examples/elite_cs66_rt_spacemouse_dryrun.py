@@ -44,7 +44,15 @@ class _FakeDriverConfig:
         self.tool = list(np.eye(4).ravel())
         self.ik = types.SimpleNamespace(max_iterations=500)
         self.planner = types.SimpleNamespace(
-            stale_timeout=0.5, max_linear_velocity=0.5, max_angular_velocity=1.0, velocity_scale=1.0
+            stale_timeout=0.5,
+            max_linear_velocity=0.5,
+            max_angular_velocity=1.0,
+            velocity_scale=1.0,
+            # Configuration-preservation fields EliteCS66RT checks for and sets.
+            preserve_configuration=False,
+            configuration_margin=0.0,
+            configuration_joint_span=0.0,
+            boundary_orientation_tolerance=0.0,
         )
         self.command_timeout_ms = 500
         self.max_consecutive_write_failures = 1
@@ -59,6 +67,8 @@ class _FakeDriver:
         self.running = False
         self.servo_targets: list[np.ndarray] = []
         self.move_j_targets: list[list[float]] = []
+        self.joint_targets: list[list[float]] = []
+        self.cancel_calls = 0
         self.stop_calls = 0
         self._pose = np.eye(4)
 
@@ -86,7 +96,10 @@ class _FakeDriver:
         self._pose = np.asarray(pose)
 
     def submit_joints(self, q):
-        pass
+        self.joint_targets.append(list(q))
+
+    def cancel(self):
+        self.cancel_calls += 1
 
     def commanded_pose(self):
         return self._pose.copy()
@@ -115,6 +128,12 @@ class _FakePinkIKModel:
         pose[:3, 3] = _FakeRtsi.POSE[:3]
         return pose
 
+    # Bounded joints with positive velocity limits, as configuration
+    # preservation requires of the control model.
+    lower_limits = [-2 * np.pi] * 6
+    upper_limits = [2 * np.pi] * 6
+    velocity_limits = [3.0] * 6
+
 
 class _FakeDashboard:
     def __init__(self):
@@ -141,6 +160,7 @@ class _FakeRtsi:
         self.output = output
         self.input = inp
         self.freq = freq
+        self._stamp = 0.0
 
     def connect(self, ip):
         return True
@@ -148,8 +168,17 @@ class _FakeRtsi:
     def disconnect(self):
         return True
 
+    def isConnected(self):
+        return True
+
     def getTimestamp(self):
-        return 1.0  # constant: every sample reads as coherent
+        # Advance on every other read: a joint sample brackets its reads with two
+        # getTimestamp calls (equal -> coherent), and the joint reset needs the
+        # stamp to keep moving or it reports stale feedback.
+        self._reads = getattr(self, "_reads", 0) + 1
+        if self._reads % 2:
+            self._stamp += 0.004
+        return self._stamp
 
     def getActualTCPPose(self):
         return list(self.POSE)
@@ -185,6 +214,13 @@ def install_elite_sdk_stub():
     mod.__file__ = str(script)  # _resolve_sdk_resource uses parent dir
 
     sys.modules["libpyelite"] = mod
+
+    # The real control_profile maps the recipe onto the native config; the stub
+    # config already carries everything the fake driver reads.
+    control_profile = types.ModuleType("libpyelite.control_profile")
+    control_profile.configure_native_driver = lambda cfg, config, tool, side=None, world_from_base=None: None
+    mod.control_profile = control_profile
+    sys.modules["libpyelite.control_profile"] = control_profile
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +285,7 @@ def main():
     cfg = EliteCS66RTConfig(
         robot_ip="127.0.0.1",
         use_background_servo_loop=False,  # blocking reset, so the test is deterministic
+        reset_duration_s=0.2,  # keep the blocking joint reset short
     )
     robot = EliteCS66RT(cfg)
     robot.connect()
@@ -307,6 +344,13 @@ def main():
     driver = robot._driver
     assert driver is not None and len(driver.servo_targets) > 0, "no native targets observed"
     print(f"[ok] driver received {len(driver.servo_targets)} native targets")
+
+    status = robot.get_reset_status()
+    assert status["state"] == "succeeded", f"both-buttons reset did not succeed: {status}"
+    assert driver.joint_targets, "reset sent no joint targets"
+    assert driver.joint_targets[-1] == [0.0] * 6, "reset did not end on the saved startup joints"
+    assert not robot.rt_moving
+    print(f"[ok] both-buttons reset succeeded via {len(driver.joint_targets)} native joint targets")
 
     robot.disconnect()
     assert driver.stop_calls >= 1, "stopControl not called on disconnect"

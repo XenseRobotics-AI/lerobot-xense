@@ -59,7 +59,9 @@ from lerobot.robots.elite_cs66_rt.elite_cs66_rt import (
     _quaternion_to_rotvec,
     _reach_exceeded,
     _rotvec_to_quaternion,
+    _validate_configuration_model,
 )
+from lerobot.robots.elite_cs66_rt.joint_reset import JointReset, joint_sample
 from lerobot.robots.robot import Robot
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 from lerobot.utils.robot_utils import (
@@ -133,7 +135,8 @@ class BiEliteCS66RT(Robot):
         self._servo_lock: dict[str, threading.Lock] = {s: threading.Lock() for s in _SIDES}
         # Monotonic time each arm's _last_tcp_command was submitted.
         self._last_submit_time: dict[str, float] = dict.fromkeys(_SIDES, 0.0)
-        self._start_tcp_pose: dict[str, np.ndarray | None] = dict.fromkeys(_SIDES)
+        self._q_start: dict[str, np.ndarray | None] = dict.fromkeys(_SIDES)
+        self._joint_reset = JointReset(config, self.logger)
         self._reach_warn_time: dict[str, float] = dict.fromkeys(_SIDES, 0.0)  # workspace-guard warn throttle
 
         # Prefixed key tuples (built once).
@@ -430,6 +433,7 @@ class BiEliteCS66RT(Robot):
         )
         if self._assembly is not None:
             cfg.model_path = self._assembly.control_model_path(side)
+        _validate_configuration_model(self._cs, cfg)
         if tool is None:
             assert self._rtsi[side] is not None
             cfg.tool = _derive_controller_tool(self._cs, self._rtsi[side], cfg.model_path or self._cs.model_path())
@@ -460,6 +464,8 @@ class BiEliteCS66RT(Robot):
             # or gripper enable. Actual TCP transforms are obtained later.
             preflight = StationLayer(self._assembly, self.config.native_collision_profile, [np.eye(4), np.eye(4)])
             self._configure_station_grippers(preflight)
+        self._joint_reset.prepare_connection()
+        self._q_start = dict.fromkeys(_SIDES)
         self._cs = _import_elite_sdk()
         # Native workers own the high-rate path; preserve the Python station logic.
 
@@ -521,7 +527,6 @@ class BiEliteCS66RT(Robot):
             if self.config.control_mode == BiEliteCS66RTControlMode.CARTESIAN_SERVO:
                 current_tcp = _controller_tcp_to_pose6(self._rtsi[side].getActualTCPPose())
                 self._last_tcp_command[side] = current_tcp.copy()
-                self._start_tcp_pose[side] = current_tcp.copy()
             self._start_servo_loop(side)
 
         try:
@@ -534,6 +539,9 @@ class BiEliteCS66RT(Robot):
             self._check_station_health()
             for side in _SIDES:
                 self._driver[side].check_error()
+            # Publish the pair only after both startups succeed. Each side
+            # keeps its actual unwrapped configuration, including reattachment.
+            self._q_start = {side: joint_sample(self._rtsi[side])[1] for side in _SIDES}
         except BaseException:
             with best_effort(self.logger, "logging connection fault diagnostics"):
                 self._log_native_fault_diagnostics()
@@ -609,6 +617,9 @@ class BiEliteCS66RT(Robot):
             gripper.connect()
 
     def _cleanup_after_failed_connect(self) -> None:
+        self._joint_reset.close()
+        self._q_start = dict.fromkeys(_SIDES)
+        self._clear_reset_targets()
         for side in _SIDES:
             # A servo loop may already be running if the other arm's bring-up
             # failed after this one handed off; stop it before tearing down.
@@ -650,6 +661,9 @@ class BiEliteCS66RT(Robot):
             self.logger.warn(f"{self} is not connected, skipping disconnect.")
             return
 
+        self._joint_reset.close()
+        self._q_start = dict.fromkeys(_SIDES)
+        self._clear_reset_targets()
         for cam in self.cameras.values():
             if cam.is_connected:
                 cam.disconnect()
@@ -779,9 +793,6 @@ class BiEliteCS66RT(Robot):
     def _stop_servo_loop(self, side: str) -> None:
         if self._driver[side] is not None:
             self._driver[side].stopServo()
-
-    def _is_reset_moving_locked(self, side: str, now: float) -> bool:
-        return self._driver[side] is not None and self._driver[side].status().reset_active
 
     def _check_station_health(self) -> None:
         if self._coordinator is None:
@@ -1194,6 +1205,41 @@ class BiEliteCS66RT(Robot):
             self.logger.warn(f"LARGE JOINT STEP {msg}")
 
     def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
+        with self._joint_reset.lock:
+            if self._joint_reset.closing:
+                raise DeviceNotConnectedError(f"{self} is disconnecting.")
+            if self._joint_reset.active:
+                return self._action_during_reset(action)
+            return self._send_action(action)
+
+    def _action_during_reset(self, action: dict[str, Any]) -> dict[str, Any]:
+        """While a reset owns both arms, forward only the grippers and report what is held.
+
+        The arm entries are the measured poses, with the keys and world frame of
+        get_observation, so a caller that records the returned action always
+        gets every action key.
+        """
+        held: dict[str, Any] = {}
+        for side in _SIDES:
+            rtsi = self._rtsi[side]
+            assert rtsi is not None
+            if self.config.control_mode == BiEliteCS66RTControlMode.CARTESIAN_SERVO:
+                tcp_world = self._base_pose6_to_world(side, _controller_tcp_to_pose6(rtsi.getActualTCPPose()))
+                held.update(self._tcp_rotvec_to_feature_values(side, tcp_world))
+            else:
+                joints = rtsi.getActualJointPositions()
+                held.update({k: float(v) for k, v in zip(self._joint_pos_keys[side], joints, strict=True)})
+            gripper = self._gripper[side]
+            gripper_key = self._gripper_key[side]
+            if gripper is not None:
+                if gripper_key in action:
+                    gripper.set_gripper_position(float(action[gripper_key]))
+                    held[gripper_key] = float(action[gripper_key])
+                else:
+                    held[gripper_key] = gripper.get_gripper_position()
+        return held
+
+    def _send_action(self, action: dict[str, Any]) -> dict[str, Any]:
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
@@ -1211,12 +1257,6 @@ class BiEliteCS66RT(Robot):
         gripper_key = self._gripper_key[side]
 
         if self.config.control_mode == BiEliteCS66RTControlMode.CARTESIAN_SERVO:
-            if driver.status().reset_active:
-                if gripper is not None and gripper_key in action:
-                    gripper.set_gripper_position(float(action[gripper_key]))
-                    sent[gripper_key] = float(action[gripper_key])
-                return
-
             target_tcp = self._cartesian_action_to_tcp_pose(side, action)
             self._trace_send_action(side, action, target_tcp)
             driver.submit_target(_pose6_to_matrix(target_tcp))
@@ -1251,40 +1291,19 @@ class BiEliteCS66RT(Robot):
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
-        if self.config.control_mode != BiEliteCS66RTControlMode.CARTESIAN_SERVO:
-            # Check the combined both-arm sweep once, like connect/disconnect;
-            # per-arm checks would each treat the other arm as parked.
-            for side in _SIDES:
-                self._raise_servo_error_if_any(side)
-            self._check_joint_move({side: self._arm_start_pose(side) for side in _SIDES}, "reset move")
-            self._run_arms_paired(
-                lambda side, paired_failed: self._move_j_blocking(
-                    side,
-                    self._arm_start_pose(side),
-                    self.config.reset_duration_s,
-                    path_checked=True,
-                    paired_failed=paired_failed,
-                ),
-                "reset move",
-            )
-            return
+        self._joint_reset.start(
+            self._driver,
+            self._rtsi,
+            self._q_start,
+            lambda targets: self._check_joint_move(targets, "reset"),
+            self._clear_reset_targets,
+        )
 
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            futs = {side: ex.submit(self._reset_arm, side) for side in _SIDES}
-            for side in _SIDES:
-                futs[side].result()
-
-    def _reset_arm(self, side: str) -> None:
-        self._raise_servo_error_if_any(side)
-        if self._start_tcp_pose[side] is not None and not self._driver[side].status().reset_active:
-            self._driver[side].submit_target(_pose6_to_matrix(self._start_tcp_pose[side]), self.config.reset_duration_s)
+    def _clear_reset_targets(self) -> None:
+        for side in _SIDES:
             with self._servo_lock[side]:
-                self._last_tcp_command[side] = self._start_tcp_pose[side].copy()
-                self._last_submit_time[side] = time.monotonic()
-            if not self.config.use_background_servo_loop:
-                while self._driver[side].status().reset_active:
-                    self._raise_servo_error_if_any(side)
-                    time.sleep(0.01)
+                self._last_tcp_command[side] = None
+                self._last_submit_time[side] = 0.0
 
     # =========================================================================
     # RT status + pose getters
@@ -1303,11 +1322,16 @@ class BiEliteCS66RT(Robot):
 
     @property
     def rt_moving(self) -> bool:
-        moving = False
-        for side in _SIDES:
-            with self._servo_lock[side]:
-                moving = moving or self._is_reset_moving_locked(side, time.monotonic())
-        return moving
+        return self._joint_reset.moving()
+
+    @property
+    def reset_generation(self) -> int:
+        """Count of finished resets (any outcome); loops re-sync teleop when it changes."""
+        return self._joint_reset.generation
+
+    def get_reset_status(self) -> dict:
+        """One measured reset outcome for both independently saved arm targets."""
+        return self._joint_reset.status()
 
     def _arm_tcp_pose_quat(self, side: str) -> np.ndarray:
         rtsi = self._rtsi[side]

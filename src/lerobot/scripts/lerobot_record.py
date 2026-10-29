@@ -596,6 +596,9 @@ def run_rt_record_loop(
     timestamp = 0
     start_episode_t = time.perf_counter()
     prev_rt_moving = False
+    # Robots whose reset reports completion as a counter (Elite) re-sync once
+    # per finished reset however often rt_moving is read; others report None.
+    last_reset_generation = getattr(robot, "reset_generation", None)
     prev_observation_frame = None  # for shifted-frame logic during RT reset
 
     while timestamp < control_time_s:
@@ -640,12 +643,14 @@ def run_rt_record_loop(
         if dataset is not None:
             current_observation_frame = build_dataset_frame(dataset.features, current_observation, prefix=OBS_STR)
 
-        robot_is_moving = hasattr(robot, "rt_moving") and robot.rt_moving
+        reset_generation = getattr(robot, "reset_generation", None)
+        robot_is_moving = getattr(robot, "rt_moving", False)
         if robot_is_moving:
             prev_rt_moving = True
 
-        if prev_rt_moving and not robot_is_moving:
+        if not robot_is_moving and (prev_rt_moving or reset_generation != last_reset_generation):
             prev_rt_moving = False
+            last_reset_generation = reset_generation
             try:
                 policy.resync(robot, teleop)
                 logger.info("Synced teleop to robot pose after RT reset")

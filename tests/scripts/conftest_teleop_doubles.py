@@ -52,6 +52,7 @@ class FakeRobot:
         iterations: int,
         action_features=None,
         rt_moving_frames=(),
+        finished_reset_frames=(),
         name: str = "fake_robot",
         bimanual: bool = False,
     ):
@@ -60,6 +61,9 @@ class FakeRobot:
         # Frames (0-based) on which rt_moving reports True, so a test can drive
         # the "background trajectory owns the arm" branch deterministically.
         self._rt_moving_frames = set(rt_moving_frames)
+        # Frames on which a reset finishes as counted by reset_generation (the
+        # Elite completion signal), whether or not rt_moving was seen True.
+        self._finished_reset_frames = set(finished_reset_frames)
         self.action_features = action_features or {
             "tcp.x": float,
             "tcp.y": float,
@@ -98,6 +102,10 @@ class FakeRobot:
     def rt_moving(self) -> bool:
         # _obs_count has already been incremented for the current frame.
         return (self._obs_count - 1) in self._rt_moving_frames
+
+    @property
+    def reset_generation(self) -> int:
+        return sum(1 for frame in self._finished_reset_frames if frame <= self._obs_count - 1)
 
     def reset_to_initial_position(self) -> None:
         self.calls.append(("reset_to_initial_position",))

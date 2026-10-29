@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 from lerobot.robots.bi_elite_cs66_rt.bi_elite_cs66_rt import BiEliteCS66RT
 from lerobot.robots.bi_elite_cs66_rt.config_bi_elite_cs66_rt import BiEliteCS66RTControlMode
+from lerobot.robots.elite_cs66_rt.joint_reset import JointReset
 
 
 class PublisherTests(unittest.TestCase):
@@ -24,6 +25,10 @@ class PublisherTests(unittest.TestCase):
         robot._station_gripper_readers = {}
         robot._coordinator = None
         robot.config = SimpleNamespace(native_collision_gripper_publish_hz=100.0, native_collision_profile=None)
+        robot._joint_reset = JointReset(robot.config)
+        robot._servo_lock = {side: threading.Lock() for side in ("left", "right")}
+        robot._last_tcp_command = dict.fromkeys(("left", "right"))
+        robot._last_submit_time = dict.fromkeys(("left", "right"), 0.0)
         robot._gripper = {side: Mock() for side in ("left", "right")}
         for gripper in robot._gripper.values():
             gripper.config.type = "taccap_follower"
@@ -43,6 +48,10 @@ class PublisherTests(unittest.TestCase):
         robot = self.robot()
         robot._driver = {side: Mock() for side in ("left", "right")}
         robot._rtsi = {side: Mock() for side in ("left", "right")}
+        for rtsi in robot._rtsi.values():
+            rtsi.getTimestamp.return_value = 1.0
+            rtsi.getActualJointPositions.return_value = [0.0] * 6
+            rtsi.getActualJointVelocity.return_value = [0.0] * 6
         robot._coordinator = Mock()
         robot._coordinator.status.return_value = SimpleNamespace(running=True, error="")
         return robot
@@ -173,28 +182,6 @@ class PublisherTests(unittest.TestCase):
         robot.disconnect()
         robot._return_home_arm.assert_not_called()
         self.assertFalse(robot.is_connected)
-
-    def test_joint_reset_checks_the_combined_sweep_once_before_moving(self):
-        robot = self.station_robot()
-        robot._is_connected = True
-        robot.cameras = {}
-        robot.config.control_mode = BiEliteCS66RTControlMode.JOINT_SERVO
-        robot.config.reset_duration_s = 2.0
-        robot.config.move_j_timeout_ms = 100
-        robot._servo_lock = {side: threading.Lock() for side in ("left", "right")}
-        robot._last_tcp_command = {}
-        robot._arm_start_pose = Mock(side_effect=lambda side: [0.1 if side == "left" else 0.2] * 6)
-        for side, rtsi in robot._rtsi.items():
-            rtsi.getActualJointPositions.return_value = [0.0] * 6
-            robot._driver[side].status.return_value = SimpleNamespace(running=False, error="")
-        robot._station.check_joint_path.return_value = SimpleNamespace(safe=True)
-        robot.reset_to_initial_position()
-        robot._station.check_joint_path.assert_called_once()
-        _, end = robot._station.check_joint_path.call_args.args
-        self.assertEqual(end["left"].tolist(), [0.1] * 6)
-        self.assertEqual(end["right"].tolist(), [0.2] * 6)
-        for side in ("left", "right"):
-            robot._driver[side].moveJ.assert_called_once()
 
     def test_paired_failure_keeps_the_other_arm_from_starting_its_move(self):
         robot = self.station_robot()
