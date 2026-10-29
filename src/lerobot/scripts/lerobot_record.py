@@ -120,9 +120,11 @@ from lerobot.robots import (  # noqa: F401
     RobotConfig,
     bi_elite_cs66_rt,
     bi_flexiv_rizon4_rt,
+    bi_rebot_b601_rt,
     elite_cs66_rt,
     flexiv_rizon4_rt,
     make_robot_from_config,
+    rebot_b601_rt,
 )
 from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
@@ -528,6 +530,40 @@ class EliteRecordPolicy(RtRecordPolicy):
         _sync_elite_teleop_to_robot_pose(robot, teleop)
 
 
+class B601RecordPolicy(RtRecordPolicy):
+    """Single/dual B601 reset buttons and commanded TCP re-sync."""
+
+    label = "B601 reset to initial position"
+
+    def __init__(self, robot: Robot, teleop: Teleoperator | None):
+        from lerobot.scripts.teleop_device_loops import BiPico4Policy, Pico4Policy, SpaceMousePolicy
+
+        supported = {"bi_pico4"} if robot.name == "bi_rebot_b601_rt" else {"pico4", "spacemouse"}
+        if getattr(teleop, "name", None) not in supported:
+            raise ValueError(f"{robot.name} recording requires teleop.type in {sorted(supported)}")
+        if not robot.action_features.keys() <= robot.observation_features.keys():
+            raise ValueError("B601 RT recording requires use_joint_observation=false on each arm for reset frames")
+        if teleop.name == "spacemouse":
+            self.device_policy = SpaceMousePolicy()
+        else:
+            policy = BiPico4Policy if teleop.name == "bi_pico4" else Pico4Policy
+            self.device_policy = policy(use_commanded_pose=True)
+        self.reset_pending = False
+
+    def reset_requested(self, events: dict, teleop) -> bool:
+        # The shared loop checks reset before get_action; refresh cached Pico buttons first.
+        if hasattr(teleop, "poll_buttons"):
+            teleop.poll_buttons()
+        button_reset = self.device_policy.reset_requested(teleop)
+        requested = bool(events["go_start"] or button_reset)
+        self.reset_pending = self.reset_pending or requested
+        return requested
+
+    def resync(self, robot: Robot, teleop) -> None:
+        self.reset_pending = False
+        self.device_policy.resync(robot, teleop)
+
+
 @safe_stop_image_writer
 def run_rt_record_loop(
     robot: Robot,
@@ -743,6 +779,45 @@ def elite_cs66_rt_record_loop(
     )
 
 
+def rebot_b601_rt_record_loop(
+    robot: Robot,
+    events: dict,
+    fps: int,
+    dataset: LeRobotDataset | None = None,
+    teleop: Teleoperator | None = None,
+    control_time_s: int | None = None,
+    single_task: str | None = None,
+    display_data: bool = False,
+):
+    """Single/dual B601 recording through the shared RT loop."""
+    from lerobot.robots.rebot_b601_rt.tactile_camera import wait_for_fresh_camera_frames
+
+    if fps <= 0:
+        raise ValueError("B601 recording fps must be positive")
+    policy = B601RecordPolicy(robot, teleop)
+    if dataset is not None:
+        # Encoder warmup can delay camera readers beyond the frame-age limit.
+        # Wait before the episode clock starts, keeping the RT loop unchanged.
+        wait_for_fresh_camera_frames(robot.cameras)
+    run_rt_record_loop(
+        robot,
+        policy,
+        events,
+        fps,
+        dataset=dataset,
+        teleop=teleop,
+        control_time_s=control_time_s if control_time_s is not None else float("inf"),
+        single_task=single_task,
+        display_data=display_data,
+    )
+    # A phase may end mid-reset. Finish it before the generic preparation loop
+    # sends commands, and keep the native command watchdog refreshed while waiting.
+    if policy.reset_pending:
+        while robot.rt_moving:
+            time.sleep(0.01)
+        policy.resync(robot, teleop)
+
+
 @parser.wrap()
 def record(cfg: RecordConfig) -> LeRobotDataset:
     init_logging()
@@ -790,6 +865,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
     dataset = None
     listener = None
+    record_error: BaseException | None = None
 
     try:
         if cfg.resume:
@@ -876,6 +952,16 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             elif cfg.robot.type == "elite_cs66_rt" and teleop_type == "pico4":
                 teleop.connect(current_tcp_pose_quat=robot.get_current_tcp_pose_quat())
                 logger.info("Elite CS66 + Pico4: teleop seeded from current TCP pose")
+            elif cfg.robot.type == "rebot_b601_rt" and teleop_type == "spacemouse":
+                teleop.connect(current_tcp_pose_euler=robot.get_commanded_tcp_pose_euler())
+                logger.info("B601 + SpaceMouse: teleop seeded from commanded TCP pose")
+            elif cfg.robot.type == "rebot_b601_rt" and teleop_type == "pico4":
+                teleop.connect(current_tcp_pose_quat=robot.get_commanded_tcp_pose_quat())
+                logger.info("B601 + Pico4: teleop seeded from commanded TCP pose")
+            elif cfg.robot.type == "bi_rebot_b601_rt" and teleop_type == "bi_pico4":
+                left_pose, right_pose = robot.get_commanded_tcp_pose_quat()
+                teleop.connect(left_tcp_pose_quat=left_pose, right_tcp_pose_quat=right_pose)
+                logger.info("BiB601 + BiPico4: teleop seeded from both commanded TCP poses")
             else:
                 teleop.connect()
 
@@ -957,6 +1043,17 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         single_task=cfg.dataset.single_task,
                         display_data=cfg.display_data,
                     )
+                elif cfg.robot.type in {"rebot_b601_rt", "bi_rebot_b601_rt"}:
+                    rebot_b601_rt_record_loop(
+                        robot=robot,
+                        events=events,
+                        fps=cfg.dataset.fps,
+                        teleop=teleop,
+                        dataset=dataset,
+                        control_time_s=cfg.dataset.episode_time_s,
+                        single_task=cfg.dataset.single_task,
+                        display_data=cfg.display_data,
+                    )
                 else:
                     record_loop(
                         robot=robot,
@@ -1003,7 +1100,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         # main() suppresses on the way out.
         logger.info("Recording interrupted by user (Ctrl+C)")
         raise
-    except BaseException:
+    except BaseException as error:
+        record_error = error
         # Say why the recording stopped. Without this the only trace is the
         # "Stop recording" line below, and a session that died one second in
         # looks exactly like one the operator ended — the log carried neither
@@ -1016,7 +1114,14 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         if dataset:
             dataset.finalize()
 
-        if robot.is_connected:
+        if cfg.robot.type in {"rebot_b601_rt", "bi_rebot_b601_rt"}:
+            # B601 is_connected also requires every camera/gripper, so a dropped
+            # peripheral must not skip closing the arm. disconnect() is idempotent
+            # and applies the same exit-reset policy as lerobot-teleoperate.
+            from lerobot.robots.rebot_b601_rt.exit_policy import exit_reset_allowed
+
+            robot.disconnect(reset=exit_reset_allowed(record_error))
+        elif robot.is_connected:
             robot.disconnect()
         if teleop and teleop.is_connected:
             teleop.disconnect()

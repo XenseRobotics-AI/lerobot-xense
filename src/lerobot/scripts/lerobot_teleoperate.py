@@ -138,10 +138,12 @@ from lerobot.robots import (  # noqa: F401
     bi_arx5,
     bi_elite_cs66_rt,
     bi_flexiv_rizon4_rt,
+    bi_rebot_b601_rt,
     elite_cs66_rt,
     flexiv_rizon4_rt,
     make_robot_from_config,
     mock_robot,
+    rebot_b601_rt,
 )
 from lerobot.scripts.teleop_device_loops import (
     BiPico4Policy,
@@ -929,6 +931,58 @@ def teleoperate(cfg: TeleoperateConfig):
                     duration=cfg.teleop_time_s,
                     debug_timing=cfg.debug_timing,
                 )
+
+        # --- B601 RT + Cartesian teleoperators ---
+        elif cfg.robot.type in ("rebot_b601_rt", "bi_rebot_b601_rt"):
+            from lerobot.robots.rebot_b601_rt.exit_policy import exit_reset_allowed
+
+            b601_error: BaseException | None = None
+            bimanual = cfg.robot.type == "bi_rebot_b601_rt"
+            supported = ("bi_pico4",) if bimanual else ("pico4", "spacemouse")
+            if cfg.teleop.type not in supported:
+                raise ValueError(f"{cfg.robot.type} supports teleop types {supported}, got {cfg.teleop.type!r}")
+            logger.info(f"Detected {cfg.robot.type} + {cfg.teleop.type}")
+            # Resolve the B601 SDK before starting peripherals. Construction does
+            # not enable the arm; connect still waits until VR is ready below.
+            robot = make_robot_from_config(cfg.robot)
+            teleop = make_teleoperator_from_config(cfg.teleop)
+            if bimanual:
+                teleop.pre_init()
+            try:
+                robot.connect(go_to_start=not cfg.dryrun)
+                if bimanual:
+                    left_pose, right_pose = (
+                        robot.get_current_tcp_pose_quat() if cfg.dryrun else robot.get_commanded_tcp_pose_quat()
+                    )
+                    teleop.connect(left_tcp_pose_quat=left_pose, right_tcp_pose_quat=right_pose)
+                    policy = BiPico4Policy(use_commanded_pose=True)
+                elif cfg.teleop.type == "pico4":
+                    pose = robot.get_current_tcp_pose_quat() if cfg.dryrun else robot.get_commanded_tcp_pose_quat()
+                    teleop.connect(current_tcp_pose_quat=pose)
+                    policy = Pico4Policy(use_commanded_pose=True)
+                else:
+                    pose = robot.get_current_tcp_pose_euler() if cfg.dryrun else robot.get_commanded_tcp_pose_euler()
+                    teleop.connect(current_tcp_pose_euler=pose)
+                    policy = SpaceMousePolicy()
+                with contextlib.suppress(KeyboardInterrupt):
+                    run_cartesian_teleop_loop(
+                        teleop=teleop,
+                        robot=robot,
+                        fps=cfg.fps,
+                        policy=policy,
+                        display_data=cfg.display_data,
+                        duration=cfg.teleop_time_s,
+                        dryrun=cfg.dryrun,
+                        debug_timing=cfg.debug_timing,
+                    )
+            except BaseException as error:
+                b601_error = error
+                raise
+            finally:
+                # A teleop/VR, camera or pose-input failure leaves the arm healthy;
+                # disabling it in place would drop it. Only an arm/controller fault
+                # (or a dry run, which never commands the arm) skips the return.
+                robot.disconnect(reset=not cfg.dryrun and exit_reset_allowed(b601_error))
 
         # --- flexiv_rizon4_rt + spacemouse ---
         elif cfg.robot.type == "flexiv_rizon4_rt" and cfg.teleop.type == "spacemouse":
