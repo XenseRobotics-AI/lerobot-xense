@@ -19,8 +19,13 @@ import shutil
 from pathlib import Path
 
 import datasets
+import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import tqdm
+from datasets.features.features import generate_from_arrow_type
+from datasets.table import cast_array_to_feature
 
 from lerobot.datasets.compute_stats import aggregate_stats
 from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
@@ -40,7 +45,11 @@ from lerobot.datasets.utils import (
     write_stats,
     write_tasks,
 )
-from lerobot.datasets.video_utils import concatenate_video_files, get_video_duration_in_s
+from lerobot.datasets.video_utils import (
+    concatenate_video_files,
+    get_common_video_time_base,
+    get_video_duration_in_s,
+)
 from lerobot.utils.robot_utils import get_logger
 
 logger = get_logger("aggregate")
@@ -78,6 +87,39 @@ def validate_all_metadata(all_metadata: list[LeRobotDatasetMetadata]):
             raise ValueError(f"Same features is expected, but got features={meta.features} instead of {features}.")
 
     return fps, robot_type, features
+
+
+def validate_video_time_bases(all_metadata: list[LeRobotDatasetMetadata], video_keys: list[str]) -> None:
+    """Checks, before anything is written, that every source video of a key shares one time base.
+
+    `concatenate_video_files` refuses to stream-copy videos whose time bases differ. Without this
+    preflight, a mismatch in a later source would surface midway through `aggregate_videos`,
+    leaving a half-built aggregated dataset whose existing root blocks a re-run.
+
+    This is deliberately stricter than the concatenations that will actually happen (a source that
+    rotates to a fresh destination file would not be concatenated), so the outcome does not depend
+    on file size limits.
+
+    Raises:
+        VideoTimeBaseError: If the video files of a key do not share one 1/N time base.
+        ValueError: If a video file has no video stream.
+    """
+    for key in video_keys:
+        paths = [
+            meta.root / DEFAULT_VIDEO_PATH.format(video_key=key, chunk_index=chunk_idx, file_index=file_idx)
+            for meta in all_metadata
+            for chunk_idx, file_idx in sorted(
+                set(
+                    zip(
+                        meta.episodes[f"videos/{key}/chunk_index"],
+                        meta.episodes[f"videos/{key}/file_index"],
+                        strict=True,
+                    )
+                )
+            )
+        ]
+        if paths:
+            get_common_video_time_base(paths)
 
 
 def update_data_df(df, src_meta, dst_meta):
@@ -270,6 +312,7 @@ def aggregate_datasets(
     )
     fps, robot_type, features = validate_all_metadata(all_metadata)
     video_keys = [key for key in features if features[key]["dtype"] == "video"]
+    validate_video_time_bases(all_metadata, video_keys)
 
     dst_meta = LeRobotDatasetMetadata.create(
         repo_id=aggr_repo_id,
@@ -447,7 +490,8 @@ def aggregate_data(src_meta, dst_meta, data_idx, data_files_size_in_mb, chunk_si
     unique_chunk_file_ids = sorted(unique_chunk_file_ids)
     contains_images = len(dst_meta.image_keys) > 0
 
-    # Preserve numeric array lengths as well as image types when writing parquet.
+    # Preserve numeric array lengths (and image types) when writing parquet; see
+    # append_or_create_parquet_file for how columns and features are reconciled.
     hf_features = get_hf_features_from_features(dst_meta.features)
 
     # Track source to destination file mapping for metadata update
@@ -565,9 +609,14 @@ def append_or_create_parquet_file(
         max_mb: Maximum allowed file size in MB before rotation.
         chunk_size: Maximum number of files per chunk before incrementing chunk index.
         default_path: Format string for generating file paths.
-        contains_images: Whether the data contains images requiring special handling.
+        contains_images: Whether the data contains images requiring special handling. Image data
+            is written through HF datasets with the full ``hf_features`` schema.
         aggr_root: Root path for the aggregated dataset.
-        hf_features: Optional HuggingFace Features schema preserving array lengths and image types.
+        hf_features: Optional HuggingFace Features schema preserving array lengths. For non-image
+            data the frame is written straight through Arrow (see `dataframe_to_arrow_table`):
+            declared columns are cast to their feature type, undeclared columns are kept with
+            their inferred type, and declared features absent from the frame are not added.
+            Without it the frame is written with plain pandas.
 
     Returns:
         tuple: (updated_idx, (dst_chunk, dst_file)) where updated_idx is the index dict
@@ -575,10 +624,13 @@ def append_or_create_parquet_file(
     """
     dst_chunk, dst_file = idx["chunk"], idx["file"]
     dst_path = aggr_root / default_path.format(chunk_index=dst_chunk, file_index=dst_file)
+    use_arrow = hf_features is not None and not contains_images
 
     if not dst_path.exists():
         dst_path.parent.mkdir(parents=True, exist_ok=True)
-        if contains_images or hf_features is not None:
+        if use_arrow:
+            pq.write_table(dataframe_to_arrow_table(df, hf_features), dst_path)
+        elif contains_images:
             to_parquet_with_hf_images(df, dst_path, features=hf_features)
         else:
             df.to_parquet(dst_path)
@@ -594,6 +646,13 @@ def append_or_create_parquet_file(
         new_path.parent.mkdir(parents=True, exist_ok=True)
         final_df = df
         target_path = new_path
+    elif use_arrow:
+        # Append in Arrow: the existing file was written by this function with the same schema.
+        table = pa.concat_tables(
+            [pq.read_table(dst_path), dataframe_to_arrow_table(df, hf_features)], promote_options="permissive"
+        )
+        pq.write_table(table, dst_path)
+        return idx, (dst_chunk, dst_file)
     else:
         if contains_images:
             # Use HuggingFace datasets to read existing data to preserve image format
@@ -604,12 +663,75 @@ def append_or_create_parquet_file(
         final_df = pd.concat([existing_df, df], ignore_index=True)
         target_path = dst_path
 
-    if contains_images or hf_features is not None:
+    if use_arrow:
+        pq.write_table(dataframe_to_arrow_table(final_df, hf_features), target_path)
+    elif contains_images:
         to_parquet_with_hf_images(final_df, target_path, features=hf_features)
     else:
         final_df.to_parquet(target_path)
 
     return idx, (dst_chunk, dst_file)
+
+
+def _dense_cell(value):
+    """Collapse a nested cell (an object ndarray of ndarrays, as pandas reads list<list<...>>) to one ndarray."""
+    if isinstance(value, np.ndarray) and value.dtype == object:
+        return np.stack([_dense_cell(item) for item in value])
+    return np.asarray(value)
+
+
+def _series_to_arrow(series: pd.Series) -> pa.Array:
+    """Convert a DataFrame column to Arrow, including columns pyarrow cannot convert on its own.
+
+    pyarrow handles scalars and object columns of 1-D arrays. Cells holding N-D arrays (from
+    HF ``ArrayND`` features read back through pandas) are stacked into nested fixed-size lists.
+    """
+    try:
+        array = pa.array(series, from_pandas=True)
+    except (pa.ArrowInvalid, pa.ArrowTypeError):
+        cells = [None if value is None else _dense_cell(value) for value in series]
+        try:
+            stacked = np.stack(cells)
+        except (ValueError, TypeError):  # ragged shapes or missing values
+            array = pa.array([None if cell is None else cell.tolist() for cell in cells])
+        else:
+            array = pa.array(stacked.reshape(-1))
+            for dim in reversed(stacked.shape[1:]):
+                array = pa.FixedSizeListArray.from_arrays(array, dim)
+    if isinstance(array, pa.ChunkedArray):
+        array = array.combine_chunks()
+    return array
+
+
+def dataframe_to_arrow_table(df: pd.DataFrame, hf_features: datasets.Features) -> pa.Table:
+    """Build a parquet-ready Arrow table from ``df``, typed by ``hf_features`` where it applies.
+
+    Parquet columns and info.json features are not guaranteed to agree, so rather than fail:
+    - columns declared in ``hf_features`` are cast to the declared type (e.g. ``list<double>``
+      written by plain pandas becomes ``fixed_size_list<float>[N]``),
+    - columns not declared are kept as-is with their inferred type,
+    - declared features missing from ``df`` are simply absent from the table.
+
+    The HF features metadata is attached so `datasets` restores the same feature types on load.
+    """
+    arrays = []
+    features = {}
+    for name in df.columns:
+        array = _series_to_arrow(df[name])
+        if name in hf_features:
+            feature = hf_features[name]
+            array = cast_array_to_feature(array, feature)
+        else:
+            feature = generate_from_arrow_type(array.type)
+        arrays.append(array)
+        features[name] = feature
+
+    undeclared = [name for name in df.columns if name not in hf_features]
+    if undeclared:
+        logger.warn(f"Copying parquet columns not declared in the dataset features: {undeclared}")
+
+    table = pa.Table.from_arrays(arrays, names=list(df.columns))
+    return table.replace_schema_metadata(datasets.Features(features).arrow_schema.metadata)
 
 
 def finalize_aggregation(aggr_meta, all_metadata):

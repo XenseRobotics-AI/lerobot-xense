@@ -481,6 +481,55 @@ def encode_video_frames(
         raise OSError(f"Video encoding did not work. File not found: {video_path}.")
 
 
+class VideoTimeBaseError(ValueError):
+    """Raised when videos cannot be stream-copied together because of their time bases."""
+
+
+def get_video_time_bases(video_path: Path | str) -> list[Fraction]:
+    """Return the time base of every video stream in ``video_path``.
+
+    Raises:
+        ValueError: If the file has no video stream.
+    """
+    with av.open(str(video_path), mode="r") as container:
+        time_bases = [stream.time_base for stream in container.streams.video]
+    if not time_bases:
+        raise ValueError(f"No video stream found in {video_path}.")
+    return time_bases
+
+
+def get_common_video_time_base(video_paths: list[Path | str]) -> Fraction:
+    """Check that all video streams of ``video_paths`` share one 1/N time base and return it.
+
+    `concatenate_video_files` writes a single MP4 track timescale for all video streams, so
+    every video stream of every input must already use it, or timestamps would be rescaled.
+
+    Raises:
+        VideoTimeBaseError: If a time base is not of the form 1/N, or the time bases differ.
+        ValueError: If a file has no video stream.
+    """
+    if len(video_paths) == 0:
+        raise FileNotFoundError("No video paths provided.")
+
+    common_time_base = None
+    first_path = None
+    for path in video_paths:
+        for stream_index, time_base in enumerate(get_video_time_bases(path)):
+            if time_base is None or time_base.numerator != 1:
+                raise VideoTimeBaseError(
+                    f"Unsupported video time_base for {path} (video stream {stream_index}): {time_base}; expected 1/N."
+                )
+            if common_time_base is None:
+                common_time_base, first_path = time_base, path
+            elif time_base != common_time_base:
+                raise VideoTimeBaseError(
+                    f"Video time_base mismatch: {path} (video stream {stream_index}) has {time_base}, "
+                    f"expected {common_time_base} from {first_path}. "
+                    "Rebuild from the original videos or normalize the inputs before concatenating."
+                )
+    return common_time_base
+
+
 def concatenate_video_files(input_video_paths: list[Path | str], output_video_path: Path, overwrite: bool = True):
     """
     Concatenate multiple video files into a single video file using pyav.
@@ -511,21 +560,7 @@ def concatenate_video_files(input_video_paths: list[Path | str], output_video_pa
         raise FileNotFoundError("No input video paths provided.")
 
     input_video_paths = [Path(path) for path in input_video_paths]
-    video_time_base = None
-    for input_path in input_video_paths:
-        with av.open(str(input_path), mode="r") as container:
-            current_time_base = container.streams.video[0].time_base
-
-        if current_time_base is None or current_time_base.numerator != 1:
-            raise ValueError(f"Unsupported video time_base for {input_path}: {current_time_base}; expected 1/N.")
-        if video_time_base is None:
-            video_time_base = current_time_base
-        elif current_time_base != video_time_base:
-            raise ValueError(
-                f"Video time_base mismatch: {input_path} has {current_time_base}, "
-                f"expected {video_time_base} from {input_video_paths[0]}. "
-                "Rebuild from the original videos or normalize the inputs before concatenating."
-            )
+    video_time_base = get_common_video_time_base(input_video_paths)
 
     output_video_path.parent.mkdir(parents=True, exist_ok=True)
 
