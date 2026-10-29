@@ -19,6 +19,29 @@ class TestRebotTeleoperate(unittest.TestCase):
         self.enterContext(isolated_rebot_assets())
         self.enterContext(patch.object(cli, "logger"))
 
+    def test_recipes_switch_to_position_velocity_with_only_the_mode_override(self):
+        for robot_type in ("rebot_b601_rt", "bi_rebot_b601_rt"):
+            for recipe in ("dm-taccap00-09.yaml", "dm-taccap00-10.yaml", "rs-taccap05.yaml"):
+                with self.subTest(robot_type=robot_type, recipe=recipe):
+                    prefixes = (
+                        ("robot.left_arm_config", "robot.right_arm_config")
+                        if robot_type == "bi_rebot_b601_rt"
+                        else ("robot",)
+                    )
+                    config = draccus.parse(
+                        cli.TeleoperateConfig,
+                        config_path=ROOT / "recipes/teleop" / robot_type / recipe,
+                        args=[f"--{prefix}.control_mode=pos_vel" for prefix in prefixes],
+                    )
+                    arms = (
+                        (config.robot.left_arm_config, config.robot.right_arm_config)
+                        if robot_type == "bi_rebot_b601_rt"
+                        else (config.robot,)
+                    )
+                    for arm in arms:
+                        self.assertEqual(arm.control_mode, "pos_vel")
+                        self.assertEqual(arm.gravity_compensation_scale, 0.0)
+
     def test_single_arm_recipe_and_pico4_startup(self):
         config = draccus.parse(
             cli.TeleoperateConfig,

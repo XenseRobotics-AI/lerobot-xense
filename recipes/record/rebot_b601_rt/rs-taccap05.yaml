@@ -27,7 +27,7 @@ robot:
 
   # ── Control ─────────────────────────────────────────────────────────────
   control_mode: mit # mit, pos_vel; PD + torque feedforward / position-velocity loop
-  # pos_vel requires gravity_compensation_scale: 0.0.
+  # pos_vel automatically disables gravity feedforward; the MIT scale below can stay configured.
   interpolate_cartesian_targets: true # true, false; 100 Hz TCP interpolation / synchronous IK
   coordinate_cartesian_speed: true # true, false; coordinate TCP speed when interpolation is on
   mit_velocity_feedforward: false # true, false; command velocity / dq=0 with damping (MIT only)

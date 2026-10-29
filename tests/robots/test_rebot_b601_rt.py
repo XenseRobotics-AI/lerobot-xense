@@ -100,7 +100,6 @@ class TestRebotB601RT(unittest.TestCase):
             {"gravity_compensation_scale": -0.1},
             {"gravity_compensation_scale": float("nan")},
             {"gravity_compensation_scale": 1.1},
-            {"control_mode": "pos_vel", "gravity_compensation_scale": 0.5, "gravity_torque_limits_nm": [1] * 6},
             {"control_mode": "mit", "gravity_compensation_scale": 0.5},
             {"gravity_torque_limits_nm": [1] * 5},
             {"gravity_torque_limits_nm": [-1] * 6},
@@ -248,6 +247,21 @@ class TestRebotB601RT(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "gravity compensation"):
             robot.connect()
         self.native.connect.assert_not_called()
+
+    def test_position_velocity_mode_skips_gravity_and_offset_setup(self):
+        self.native.configure_gravity_compensation = Mock()
+        robot = self.make_robot(
+            control_mode="pos_vel",
+            gravity_compensation_scale=1.0,
+            gravity_use_joint_offsets=True,
+        )
+        with patch.object(driver, "load_joint_torque_offsets") as load_offsets:
+            robot.connect()
+        self.assertEqual(robot.config.gravity_compensation_scale, 0.0)
+        self.assertEqual(self.native_factory.call_args.args[9], "pos_vel")
+        self.native.configure_gravity_compensation.assert_not_called()
+        load_offsets.assert_not_called()
+        self.native.connect.assert_called_once()
 
     def test_identified_offsets_are_loaded_before_connect_and_missing_file_is_rejected(self):
         self.native.configure_gravity_compensation = Mock()

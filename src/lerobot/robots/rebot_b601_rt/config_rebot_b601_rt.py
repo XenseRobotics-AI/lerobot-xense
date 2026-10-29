@@ -1,5 +1,6 @@
 """Cartesian C++ RT driver configuration for the DM and RS B601 arms."""
 
+import logging
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -9,6 +10,8 @@ from lerobot.grippers import GripperConfig
 from lerobot.robots.config import RobotConfig
 
 from .dm_serial_discovery import AUTO_DM_CHANNELS
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_DM_TACCAP_URDF = "DM_TacCap00/urdf/rebot_b601_dm_taccap_v1_gripper.urdf"
 DEFAULT_RS_TACCAP_URDF = "RS_TacCap05/urdf/rebot_b601_rs_taccap_v2_gripper.urdf"
@@ -24,7 +27,7 @@ class RebotB601RTConfig(RobotConfig):
     control_mode: str = "pos_vel"  # position/velocity loop, or mit
     interpolate_cartesian_targets: bool = True  # native timed Cartesian substeps, in both modes
     mit_velocity_feedforward: bool = True  # False sends MIT dq=0 while retaining position interpolation/Kd
-    gravity_compensation_scale: float = 0.0  # [0, 1]; zero disables model gravity feedforward (MIT only)
+    gravity_compensation_scale: float = 0.0  # [0, 1]; automatically set to zero in pos_vel mode
     gravity_torque_limits_nm: list[float] | None = None  # required when enabled; six FF caps, not total torque
     gravity_slew_rate_nm_s: float = 5.0  # maximum FF change per second, including startup
     gravity_vector: list[float] = field(default_factory=lambda: [0.0, 0.0, -9.81])  # URDF root frame, m/s^2
@@ -73,11 +76,16 @@ class RebotB601RTConfig(RobotConfig):
             raise ValueError("control_mode must be 'mit' or 'pos_vel'")
         if not math.isfinite(self.gravity_compensation_scale) or not 0 <= self.gravity_compensation_scale <= 1:
             raise ValueError("gravity_compensation_scale must be finite and in [0, 1]")
-        if self.gravity_compensation_scale > 0:
-            if self.control_mode != "mit":
-                raise ValueError("gravity compensation requires MIT mode")
-            if self.gravity_torque_limits_nm is None:
-                raise ValueError("Set gravity_torque_limits_nm before enabling gravity compensation")
+        if self.control_mode == "pos_vel" and self.gravity_compensation_scale > 0:
+            logger.warning(
+                "B601 %s: control_mode=pos_vel automatically disables gravity feedforward "
+                "(gravity_compensation_scale=%s -> 0.0).",
+                self.id or self.channel,
+                self.gravity_compensation_scale,
+            )
+            self.gravity_compensation_scale = 0.0
+        if self.gravity_compensation_scale > 0 and self.gravity_torque_limits_nm is None:
+            raise ValueError("Set gravity_torque_limits_nm before enabling gravity compensation")
         if self.gravity_torque_limits_nm is not None and (
             len(self.gravity_torque_limits_nm) != 6
             or any(not math.isfinite(v) or v < 0 for v in self.gravity_torque_limits_nm)

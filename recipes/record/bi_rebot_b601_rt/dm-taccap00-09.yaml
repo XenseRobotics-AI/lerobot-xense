@@ -50,7 +50,7 @@ robot:
 
     # ── Control ───────────────────────────────────────────────────────────
     control_mode: mit # mit, pos_vel; PD + torque feedforward / position-velocity loop
-    # pos_vel requires gravity_compensation_scale: 0.0.
+    # pos_vel automatically disables gravity feedforward; the MIT scale below can stay configured.
     # MIT gains based on lerobot-robot-seeed-b601-rt DM defaults.
     # Its J1-J3 Kd=8 exceeds the DM encoder range; use the upper limit of 5.
     # Validate tracking and oscillation on hardware before further tuning.
@@ -129,7 +129,7 @@ robot:
 
     # ── Control ───────────────────────────────────────────────────────────
     control_mode: mit # mit, pos_vel; PD + torque feedforward / position-velocity loop
-    # pos_vel requires gravity_compensation_scale: 0.0.
+    # pos_vel automatically disables gravity feedforward; the MIT scale below can stay configured.
     # MIT gains based on lerobot-robot-seeed-b601-rt DM defaults.
     # Its J1-J3 Kd=8 exceeds the DM encoder range; use the upper limit of 5.
     # Validate tracking and oscillation on hardware before further tuning.
