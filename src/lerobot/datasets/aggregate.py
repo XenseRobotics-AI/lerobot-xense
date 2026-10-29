@@ -45,7 +45,11 @@ from lerobot.datasets.utils import (
     write_stats,
     write_tasks,
 )
-from lerobot.datasets.video_utils import concatenate_video_files, get_video_duration_in_s
+from lerobot.datasets.video_utils import (
+    concatenate_video_files,
+    get_common_video_time_base,
+    get_video_duration_in_s,
+)
 from lerobot.utils.robot_utils import get_logger
 
 logger = get_logger("aggregate")
@@ -83,6 +87,39 @@ def validate_all_metadata(all_metadata: list[LeRobotDatasetMetadata]):
             raise ValueError(f"Same features is expected, but got features={meta.features} instead of {features}.")
 
     return fps, robot_type, features
+
+
+def validate_video_time_bases(all_metadata: list[LeRobotDatasetMetadata], video_keys: list[str]) -> None:
+    """Checks, before anything is written, that every source video of a key shares one time base.
+
+    `concatenate_video_files` refuses to stream-copy videos whose time bases differ. Without this
+    preflight, a mismatch in a later source would surface midway through `aggregate_videos`,
+    leaving a half-built aggregated dataset whose existing root blocks a re-run.
+
+    This is deliberately stricter than the concatenations that will actually happen (a source that
+    rotates to a fresh destination file would not be concatenated), so the outcome does not depend
+    on file size limits.
+
+    Raises:
+        VideoTimeBaseError: If the video files of a key do not share one 1/N time base.
+        ValueError: If a video file has no video stream.
+    """
+    for key in video_keys:
+        paths = [
+            meta.root / DEFAULT_VIDEO_PATH.format(video_key=key, chunk_index=chunk_idx, file_index=file_idx)
+            for meta in all_metadata
+            for chunk_idx, file_idx in sorted(
+                set(
+                    zip(
+                        meta.episodes[f"videos/{key}/chunk_index"],
+                        meta.episodes[f"videos/{key}/file_index"],
+                        strict=True,
+                    )
+                )
+            )
+        ]
+        if paths:
+            get_common_video_time_base(paths)
 
 
 def update_data_df(df, src_meta, dst_meta):
@@ -275,6 +312,7 @@ def aggregate_datasets(
     )
     fps, robot_type, features = validate_all_metadata(all_metadata)
     video_keys = [key for key in features if features[key]["dtype"] == "video"]
+    validate_video_time_bases(all_metadata, video_keys)
 
     dst_meta = LeRobotDatasetMetadata.create(
         repo_id=aggr_repo_id,
