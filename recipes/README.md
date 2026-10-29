@@ -56,6 +56,76 @@ value you had — verify before trimming.)
 The `robot:` and `teleop:` blocks are **identical** between a robot's record and
 teleop recipe (same hardware, same teleop device) — keep the two in sync.
 
+### Rebot platform 09: DM + TacCap00
+
+Platform 09 uses TacCap00. Its single-arm and bimanual recipes are named
+`dm-taccap00-09.yaml` under both `record/` and `teleop/`; these replace the old
+`dm-taccap.yaml` filenames. The paired recipes use the same robot hardware settings.
+
+Run from the `lerobot-xense` repository root:
+
+```bash
+lerobot-record \
+  --config_path=recipes/record/bi_rebot_b601_rt/dm-taccap00-09.yaml \
+  --dataset.repo_id=Xense/bi_dm_taccap00_09_pick_cube_001 \
+  --dataset.single_task="Pick up the cube and place it in the box" \
+  --dataset.num_episodes=10
+
+lerobot-teleoperate \
+  --config_path=recipes/teleop/bi_rebot_b601_rt/dm-taccap00-09.yaml
+```
+
+The external `head` camera is a RealSense D415, serial **249322063436** as
+reported by librealsense, recording RGB at 640×480 and 30 Hz. Depth is disabled.
+On the bimanual robot, `robot.cameras.head` is shared and recorded once as
+`observation.images.head`; wrist and tactile cameras are still discovered from
+each gripper. Adding `head` changes the dataset features: start a new dataset
+instead of resuming one recorded without it.
+
+Each arm explicitly sets `urdf_path` and `end_frame`. Paths in these recipes are
+relative to the repository root and point into `third_party/libpyrebot/rebot_rt/assets`.
+An absolute path to a separately installed/custom URDF also works. The selected
+model is used for both kinematics and gravity compensation. With
+`gravity_use_joint_offsets: true`, its matching `<URDF stem>_offset.yaml` must be
+beside the URDF.
+
+For another platform, copy and rename a recipe, update the robot/dataset IDs and
+camera serial, and set **each arm's** URDF and TCP frame to match its motor family,
+mount and actual payload. TacCap00 is platform 09's assembly, not a property of
+all DM arms. Legacy configurations that omit `urdf_path` still use the driver's
+family/gripper fallback; new platform recipes should specify the model explicitly.
+
+### Rebot RS + TacCap05
+
+The RS single-arm and bimanual recording/teleoperation recipes are named
+`rs-taccap05.yaml`. Each arm explicitly sets
+`urdf_path: third_party/libpyrebot/rebot_rt/assets/RS_TacCap05/urdf/rebot_b601_rs_taccap_v2_gripper.urdf`
+and `end_frame: taccap_eef_link`. Run from the repository root, or use an absolute
+URDF path. For a different mount or payload, replace the model path and TCP frame
+in both the recording and teleoperation recipes.
+
+### Rebot DM serial connection order
+
+The DM TacCap recipes use `channel: auto:first` for the right arm and
+`channel: auto:second` for the left. Connect the **right DM bridge first**, wait
+until it appears under `/dev/ttyACM*`, then connect the left bridge and start
+recording or teleoperation. The single-arm recipe selects the first bridge.
+
+The driver filters HDSC bridges by USB vendor/product `2e88:4603`, excluding
+TacCap and other serial devices, and sorts by udev's `USEC_INITIALIZED` timestamp.
+It does not sort ACM numbers or bind to USB ports. Both arms are resolved from
+one snapshot before either controller connects, and startup logs show the mapping.
+Missing devices, unavailable/tied timestamps and more than two matching bridges
+stop automatic selection instead of falling back to ACM numbering. No udev rules
+or root privileges are needed; normal serial-device permissions still apply.
+
+This convention does not identify the physical arms: after rebooting with both
+bridges attached, reconnect **both** in right-then-left order before starting.
+Also repeat that sequence if either bridge is unplugged; reconnecting only the
+right bridge while leaving the left attached reverses the order. Keep the USB
+connections unchanged while a program is running. Explicit `/dev/...` paths and
+SocketCAN channels remain supported, including for other bridge hardware.
+
 ### Grippers
 
 The gripper is one typed block, not a pile of flat knobs:

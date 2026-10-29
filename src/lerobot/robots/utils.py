@@ -67,6 +67,14 @@ def make_robot_from_config(config: RobotConfig) -> Robot:
         from .mock_robot import MockRobot
 
         return MockRobot(config)
+    elif config.type == "rebot_b601_rt":
+        from .rebot_b601_rt import RebotB601RT
+
+        return RebotB601RT(config)
+    elif config.type == "bi_rebot_b601_rt":
+        from .bi_rebot_b601_rt import BiRebotB601RT
+
+        return BiRebotB601RT(config)
     else:
         try:
             return cast(Robot, make_device_from_device_class(config))

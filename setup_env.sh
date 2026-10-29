@@ -468,6 +468,15 @@ install_arx5() {
     echo "[arx5] Done. Verify with: python -c 'import pyarx; print(pyarx)'"
 }
 
+# ── Hardware module: reBot B601 ───────────────────────────────────────────────
+
+install_rebot() {
+    # Pinocchio's Boost version conflicts with the ROS stack in this environment.
+    # The standalone installer owns a separate dependency prefix and verifies
+    # the built wheel with this environment's Python before returning success.
+    REBOT_PYTHON="$(command -v python)" bash "$PROJECT_ROOT/scripts/install_rebot.sh"
+}
+
 # ── Hardware module: Flexiv ───────────────────────────────────────────────────
 
 install_flexiv() {
@@ -1133,7 +1142,7 @@ elif [[ "$1" == "--install" ]]; then
     SELECTED=""
     add_key() { case " $SELECTED " in *" $1 "*) ;; *) SELECTED="$SELECTED $1" ;; esac; }
     is_sel()  { case " $SELECTED " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
-    select_all_hw() { local k; for k in arx5 flexiv pico4 xense taccap elite spacemouse dynamixel; do add_key "$k"; done; }
+    select_all_hw() { local k; for k in arx5 rebot flexiv pico4 xense taccap elite spacemouse dynamixel; do add_key "$k"; done; }
     print_install_usage() {
         cat <<'USAGE'
 Usage: ./setup_env.sh --install [hardware selectors]
@@ -1141,6 +1150,7 @@ Usage: ./setup_env.sh --install [hardware selectors]
   --all                 core + ALL hardware SDKs (explicit)
   --core, --none        core only (no hardware SDK bindings)
 Per-hardware-family selectors (arms auto-include the xense gripper stack):
+  --rebot,   --bi_rebot      reBot B601 DM/RS    (add --taccap for TacCap)
   --flexiv,  --bi_flexiv     Flexiv Rizon4 RT    (+ xense)
   --elite,   --bi_elite      Elite CS66 RT       (+ xense)
   --taccap,  --bi_taccap     TacCap gripper      (+ xense)
@@ -1162,6 +1172,7 @@ USAGE
             case "$_a" in
                 --all)                    select_all_hw ;;
                 --core|--none)            : ;;  # no-op: core is always installed
+                --rebot|--bi_rebot)       add_key rebot ;;
                 --flexiv|--bi_flexiv)     add_key flexiv; add_key xense ;;
                 --elite|--bi_elite)       add_key elite;  add_key xense ;;
                 --taccap|--bi_taccap)     add_key taccap; add_key xense ;;
@@ -1299,6 +1310,7 @@ USAGE
     echo ""
 
     if is_sel arx5;       then install_arx5      || echo "[WARN] arx5 installation skipped or failed (see above)"; fi
+    if is_sel rebot;      then install_rebot     || echo "[WARN] rebot installation skipped or failed (see above)"; fi
     if is_sel flexiv;     then install_flexiv    || echo "[WARN] flexiv installation skipped or failed (see above)"; fi
     if is_sel pico4;      then ( install_pico4 ) || echo "[WARN] pico4 installation skipped or failed (see above)"; fi
     if is_sel xense;      then install_xense     || echo "[WARN] xense installation skipped or failed (see above)"; fi
@@ -1317,6 +1329,7 @@ USAGE
     # spacemouse has no verify probe today — kept that way.
     _VERIFY_LINES='lerobot|import importlib.metadata as M, lerobot; print("v"+M.version("lerobot"), "->", lerobot.__file__)'
     if is_sel arx5;      then _VERIFY_LINES+=$'\n''pyarx|import importlib.metadata as M, pyarx; print("v"+M.version("pyarx"), "->", pyarx.__file__)'; fi
+    if is_sel rebot;     then _VERIFY_LINES+=$'\n''rebot_rt|import importlib.metadata as M, rebot_rt; print("v"+M.version("rebot-rt"), "->", rebot_rt.__file__)'; fi
     if is_sel flexiv;    then _VERIFY_LINES+=$'\n''flexiv_rt|import importlib.metadata as M, flexiv_rt; print("v"+M.version("flexiv_rt"), "->", flexiv_rt.__file__)'; fi
     if is_sel pico4;     then _VERIFY_LINES+=$'\n''xensevr_pc_service_sdk|import importlib.metadata as M, xensevr_pc_service_sdk; print("v"+M.version("xensevr_pc_service_sdk"), "->", xensevr_pc_service_sdk.__file__)'; fi
     if is_sel xense;     then _VERIFY_LINES+=$'\n''xensesdk|import importlib.metadata as M, xensesdk; print("v"+M.version("xensesdk"), "->", xensesdk.__file__)'; fi

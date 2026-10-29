@@ -3,7 +3,7 @@
 🤗 This repository is a fork of [`lerobot`](https://github.com/huggingface/lerobot)
 by XenseRobotics, used for Xense's multimodal tactile data acquisition system.
 This branch tracks **upstream lerobot v5.1**, with Xense-specific robots
-(Flexiv Rizon4 RT, Elite CS66 RT, and ARX5 — each single-arm and bimanual;
+(Flexiv Rizon4 RT, Elite CS66 RT, reBot B601 RT, and ARX5 — each single-arm and bimanual;
 plus TacCap tactile grippers), teleoperators (Pico4 VR,
 dual SpaceMouse, TRLC leader, gamepad) and tactile cameras
 layered on top. For generic lerobot usage (datasets, policies, training
@@ -45,7 +45,8 @@ cd lerobot-xense
 > developers can instead point the submodules at the internal GitLab server;
 > the internal URLs live in [`.gitmodules.gitlab`](.gitmodules.gitlab) and a
 > helper repoints your **local** remotes without touching the committed
-> `.gitmodules` (every submodule pin exists on both remotes):
+> `.gitmodules` (the submodules listed in `.gitmodules.gitlab` have matching pins
+> on both remotes; `libpyrebot` currently stays on GitHub):
 >
 > ```bash
 > XENSE_GITLAB_HOST=<host> scripts/submodule-remote.sh gitlab   # `github` switches back
@@ -62,10 +63,144 @@ This repository uses `third_party/` git submodules to manage hardware SDK depend
 | ---------------------------------------- | ----------------------------------------------- |
 | `third_party/ARX5_SDK`                   | `pyarx`                                         |
 | `third_party/libpyflexiv`                | `flexiv_rt`                                     |
+| `third_party/libpyrebot`                 | `rebot_rt`                                      |
 | `third_party/XGripper`                   | `xgripper`                                      |
 | `third_party/elite-robots-cs-sdk`        | Elite CS C++ SDK (builds `elite_cs_sdk`)        |
 | `third_party/elite-robots-cs-sdk-python` | `elite_cs_sdk` (Elite CS Python bindings)       |
 | `third_party/taccap-gripper`             | `xense.taccap` (TacCap UMI tactile gripper SDK) |
+
+The [`libpyrebot`](https://github.com/xensedyl/libpyrebot) submodule provides C++ 100 Hz Cartesian control and IK for reBot B601 DM and RS arms. Build its pybind11 extension for the active Python environment before using the `rebot_b601_rt` or `bi_rebot_b601_rt` robot types (see the build steps below and its [README](third_party/libpyrebot/README.md)). It supports DM serial bridges and SocketCAN, and RS over SocketCAN. Complete DM and RS model assets are bundled. Platform **09** uses the identified `DM_TacCap00` v1 assembly: its `dm-taccap00-09.yaml` recipes explicitly set each arm's `urdf_path` and `end_frame: taccap_eef_link`. Other platforms must select the URDF/TCP matching their actual arm, mount and payload; DM does not imply TacCap00. The gripper uses its separate driver. These recipes enable model gravity plus matching `_offset.yaml` holding biases via `gravity_use_joint_offsets: true`. Legacy configurations without `urdf_path` retain the family/gripper fallback (`DM_TacCap00` for DM TacCap, `RS_TacCap05` for RS TacCap, otherwise the original DM/RS model).
+
+Platform 09 recording includes the RealSense D415 `head` camera (RGB 640×480 at 30 Hz), plus the discovered wrist and tactile cameras. Use [the bimanual recording recipe](recipes/record/bi_rebot_b601_rt/dm-taccap00-09.yaml) and [matching teleoperation recipe](recipes/teleop/bi_rebot_b601_rt/dm-taccap00-09.yaml); see [platform/model configuration](recipes/README.md#rebot-platform-09-dm--taccap00) for commands and adapting a recipe to another platform.
+
+Both control modes use native timed Cartesian interpolation by default (`interpolate_cartesian_targets: true`): translation is linear, orientation uses SLERP, and each 100 Hz substep runs IK from the last limited command. The DM and RS TacCap recipes select `mit`; `pos_vel` uses the same interpolation. Their joint command caps are 1.5 rad/s, with A reset capped at 0.5 rad/s.
+
+Switching an arm to `control_mode: pos_vel` automatically sets its effective `gravity_compensation_scale` to `0.0` during configuration parsing and logs the override. The recipe's MIT gravity settings can remain in the YAML; gravity and identified torque offsets are not configured in the native controller in `pos_vel` mode. For dual-arm recipes, this is applied independently to each arm. MIT mode still requires explicit `gravity_torque_limits_nm` when gravity feedforward is enabled.
+
+DM and RS share the same Cartesian interpolation and joint coordination. For TCP speed, set `max_cartesian_linear_speed` (m/s) and `max_cartesian_angular_speed` (rad/s) under each robot/arm config. All DM TacCap recipes use **1.0 m/s** and **6.28 rad/s**, with `coordinate_cartesian_speed: true`. Each 100 Hz step scales translation and rotation together; joint constraints can reduce the whole step further. `max_joint_speed: 1.5` remains the joint cap in rad/s, and reset remains 0.5 rad/s. TCP limits apply to the native commanded trajectory, including catch-up, and require `interpolate_cartesian_targets: true`. They are distinct from the Pico output filters `teleop.max_pos_velocity` / `max_rot_velocity`; actual speed can be lower under joint constraints. Both robot fields default to `None` (disabled) for existing configurations. Rebuild `libpyrebot` to use these fields.
+
+Streaming Cartesian tracking approaches unreachable targets with bounded local IK steps instead of rejecting the entire waypoint. Each accepted step reduces the sampled pose error and stays within joint position limits and the per-cycle speed bound. At a local boundary it holds when no improving step is available; returning targets are followed from the last command without queuing a distant joint solution. This preserves the Pico pose mapping and applies independently to both arms in either control mode. It is a local approximation, not a global nearest-pose or collision-avoidance planner. Rebuild `libpyrebot` to use this behavior; tracking logs expose `tracking_limited` and `tracking_progress` with the updated native library.
+
+The teleoperation and recording recipes set `reset_position_rad: [0, 0.8, 0.8, -0.5, 0, 0]` (J1..J6 in radians) for startup and the A-button reset. Their `reset_tolerance_rad: 0.06` allows the observed MIT steady-state joint offsets of about 0.04–0.05 rad at this pose. The command must reach the target and all measured joints must remain within tolerance for 0.1 s. This changes the completion criterion; the commanded pose is unchanged. The B601 driver waits for completion before `connect()` returns, so Pico is seeded from the measured pose after startup movement. Both arms connect before moving together. `connect(go_to_start=False)` skips startup movement, as does teleoperation `dryrun`.
+
+These recipes enable `robot.reset_on_exit: true`: after Ctrl+C or normal completion, the arm(s) return to six zero joint angles at `reset_joint_speed` (0.5 rad/s), then disconnect. This also applies to Ctrl+C or a settling timeout during startup movement, after the arm(s) have connected. The exit target is independent of `reset_position_rad`. MIT and position/velocity modes use the same reset path. Exit feedback must settle within the separate `exit_reset_tolerance_rad` (0.03 rad); `reset_timeout_sec` bounds the wait. While waiting, the driver reports measured joint errors and the CAN channel every two seconds, including the joints outside tolerance. A second Ctrl+C aborts the return and disconnects immediately. Connection failures before startup movement, teleoperation errors and dry runs skip the exit reset; a fault during reset stops it. Use `--robot.reset_on_exit=false` to disable this behavior. The driver handles the return in `disconnect()`; `disconnect(reset=False)` closes without returning.
+
+The RS TacCap recipes set `mit_velocity_feedforward: false`: MIT tracks the interpolated position with desired velocity `dq=0`, retaining its configured stiffness and damping. This follows `libtron2rt`'s Cartesian command behavior and avoids sending waypoint-boundary finite-difference velocity pulses into MIT's velocity term. `--robot.mit_velocity_feedforward=true` restores the previous behavior for comparison. This option does not affect `pos_vel`; native API and general robot-config defaults remain `true` for compatibility. Tracking logs distinguish `velocity` (position-ramp slope) from `mit_dq` (MIT desired velocity before encoding). Physical smoothness and load tracking still require a hardware check.
+
+B601 uses local tactile-camera adapters for cached observations and bounded USB
+reopen retries, plus local TacCap discovery for gripper hubs sharing an upstream
+USB hub. Other robots retain the original shared camera and USB grouping behavior.
+The B601 native SDK is loaded only when its driver is requested.
+
+B601 DM and RobStride (RS) motor zeros can be set separately from RT control. Install
+`motorbridge>=0.5.6,<0.6` (or the `rebot-calibration` extra), then run:
+
+```bash
+lerobot-calibrate \
+  --robot.type=rebot_b601_rt \
+  --robot.motor_family=dm \
+  --robot.channel=/dev/ttyACM0 \
+  --robot.id=follower1 \
+  --robot.has_gripper=false
+
+# RobStride / 灵足, over SocketCAN
+lerobot-calibrate \
+  --robot.type=rebot_b601_rt \
+  --robot.motor_family=rs \
+  --robot.channel=can0 \
+  --robot.id=follower1 \
+  --robot.has_gripper=false
+```
+
+For both arms, run the sequential calibration script with a bimanual teleop or recording recipe:
+
+```bash
+python -m lerobot.robots.bi_rebot_b601_rt.bi_calibration \
+  --config_path=recipes/teleop/bi_rebot_b601_rt/dm-taccap00-09.yaml
+```
+
+or
+
+```bash
+python -m lerobot.robots.bi_rebot_b601_rt.bi_calibration \
+  --config_path=recipes/teleop/bi_rebot_b601_rt/dm-taccap00-10.yaml
+```
+
+It calibrates the **right arm first, then the left**, with a separate mechanical-zero confirmation for each arm.
+An error or interrupt stops the sequence; a completed right-arm calibration remains saved if the left arm fails.
+It uses the recipe's motor settings and `<robot.id>_right` / `<robot.id>_left` record IDs without starting RT control or peripherals.
+
+The calibration path in `rebot_b601_rt` disables the selected motors, checks their
+communication, then waits for you to manually place the arm in its mechanical
+zero pose before sending zero commands. It does not enable motors, switch control
+modes, or automatically move the arm. It reuses `channel`, `dm_serial_baud`,
+`motor_configs`, and `has_gripper` from the RT configuration. The example above
+calibrates the six arm motors with a separate USB/TacCap gripper; use
+`--robot.has_gripper=true` to include CAN gripper motor 7. Calibration records are
+stored separately under `calibration/robots/rebot_b601_rt/dm/` and `rs/`.
+An existing `follower1.json` is kept unless you enter `c` at the recalibration prompt.
+After setting zeros, calibration requests a fresh position register reply from
+each motor (DM `p_m`, RS `mechPos`) and prints its position in radians/degrees and
+PASS/FAIL. Keep the arm supported in the mechanical zero pose until this finishes.
+All positions must be finite and within **±0.01 rad (about ±0.57°)** before the
+record is saved; this check is independent of `reset_tolerance_rad`. A read timeout
+or out-of-tolerance position fails calibration and leaves any existing JSON intact,
+although the hardware zero commands have already been sent. This readback verifies
+the current zero, not persistence across a power cycle or correct manual alignment.
+The JSON uses the legacy Seeed format;
+its range fields are placeholders, not measured travel limits. Use
+`rebot_b601_rt` / `bi_rebot_b601_rt` for teleoperation and recording.
+
+B601 recording recipes are available for
+[one arm](recipes/record/rebot_b601_rt/rs-taccap05.yaml) and
+[two arms](recipes/record/bi_rebot_b601_rt/rs-taccap05.yaml). Both explicitly select the RS + TacCap05 v2 URDF and use MIT with
+TacCap camera discovery; the recording recipe maps the left arm to `can1` and
+the right arm to `can0`. Set these to match your adapters. For example:
+
+```bash
+lerobot-record \
+  --config_path=recipes/record/bi_rebot_b601_rt/rs-taccap05.yaml \
+  --dataset.repo_id=Xense/bi_rebot_pick_cube_001 \
+  --dataset.single_task="Pick up the cube and place it in the box" \
+  --dataset.num_episodes=10
+```
+
+The recipes save locally (`push_to_hub: false`); use a new dataset name for a new
+run, or `--resume=true` to append to a compatible existing dataset. Recording
+uses `dataset.fps`, with a default of 30. Single-arm recording also supports
+SpaceMouse by overriding `--teleop.type=spacemouse`.
+
+For B601 recording, right arrow ends the current recording/preparation phase,
+left arrow requests a retake, and Esc stops the session. During recording,
+Space or the Pico A button returns the arm(s) to the configured joint pose;
+SpaceMouse uses both buttons. B/X/Y are not mapped to episode controls. The
+preparation interval uses the same generic loop as other robots: teleoperation
+without adding frames or handling reset buttons. Startup and reset completion seed
+the teleoperator from the measured TCP pose(s), and no VR commands are sent
+during a native reset. An active reset finishes before saving or leaving a
+phase, which can extend that phase beyond its configured duration.
+
+Normal frames pair the current observation/images with the accepted action
+returned by `send_action`; native Cartesian interpolation can accept it
+asynchronously. B601 uses the shared `run_rt_record_loop` with a device policy;
+after reset it resynchronizes the teleoperator before reading the next action.
+During reset, the action is the measured
+TCP and gripper, paired with the previous observation as in the other RT
+recording loops; the reset-trigger frame is skipped. Single-arm actions have
+10 values and dual-arm actions have 20 (position, two rotation columns, and
+gripper per arm). Keep `use_joint_observation: false` on each arm, as in the
+recipes: the shared reset-frame logic requires TCP observation keys.
+
+Normal completion, Esc, and Ctrl+C honor `robot.reset_on_exit`. Like the other
+robots, Ctrl+C interrupts recording without saving the current episode; previously
+saved episodes are retained. A second Ctrl+C during the return aborts it.
+Recording uses the common cleanup order: video encoding, dataset finalization,
+then `disconnect()` for connected devices. B601's driver handles the configured
+exit return and checks the controller for faults before starting it; the recording
+script does not select a different disconnect mode based on the exception.
+Image-writer cleanup uses the same exception decorator as the other recording loops.
+These recording paths have offline
+regression coverage; validate them on your rig before a collection run.
 
 > `xensesdk` is **not** a submodule — it is installed from PyPI (`xensesdk==2.1.2`,
 > the published cp312 manylinux wheel, which bundles the patched `libxense_c.so`
@@ -94,7 +229,7 @@ mamba activate lerobot-xense
 > but the rest of this README and the openpi project assume
 > `lerobot-xense-py312`.
 
-**Step 3:** 📦 Install LeRobot-Xense and all hardware SDK bindings:
+**Step 3:** 📦 Install LeRobot-Xense and hardware SDK bindings:
 
 ```bash
 bash ./setup_env.sh --install
@@ -109,14 +244,51 @@ This step will:
   [v0.2.1 release](https://github.com/XenseRobotics-AI/XenseVR-PC-Service/releases/tag/v0.2.1)
   into `/opt/apps/roboticsservice`; override with `XENSEVR_DEB_URL`, or point
   `XENSEVR_DEB` at a local file for offline installs) — only with `--pico4` / `--bi_pico4` or a full install
-- Build and install all `third_party` SDK packages: `pyarx`, `flexiv_rt`, `xensevr_pc_service_sdk` (built against the `.deb`'s client SDK), `xgripper`, `elite_cs_sdk` (Elite CS — built from the C++ + Python submodules), and `xense.taccap` (TacCap UMI gripper)
+- Build and install the SDK packages supported by `setup_env.sh`: `pyarx`, `rebot_rt`, `flexiv_rt`, `xensevr_pc_service_sdk` (built against the `.deb`'s client SDK), `xgripper`, `elite_cs_sdk` (Elite CS — built from the C++ + Python submodules), and `xense.taccap` (TacCap UMI gripper)
 - Configure SpaceMouse udev rules and HID permissions automatically
 
 > You will be prompted for `sudo` password during installation (for ARX5 real-time capability and udev rules).
 
+For **reBot B601 DM/RS**, an existing LeRobot environment can install or rebuild
+just `rebot_rt` with the following command from the repository root:
+
+```bash
+git submodule update --init --recursive third_party/libpyrebot
+bash scripts/install_rebot.sh
+```
+
+On Linux x86_64, the installer creates a separate conda-forge environment for
+Pinocchio 3.9 and its build tools (GCC 12 for Ubuntu 22.04/24.04 compatibility),
+compiles for the active Python ABI, builds a wheel locally with
+`--no-build-isolation --no-deps --no-index`, then installs and verifies it in the
+LeRobot environment. Verification loads both DM/RS models and computes gravity
+without connecting to hardware. Pinocchio 3.9 needs Boost 1.88, which conflicts
+with the ROS Jazzy dependencies; **do not install it into the LeRobot conda
+environment**. No ROS/CUDA packages are changed by this standalone installer.
+If the target interpreter loads an older system C++ runtime first, the installer
+validates a compatible runtime and writes `lerobot_rebot_runtime.pth` into that
+Python environment to preload it before NumPy. It prefers the target conda
+environment's own runtime, then the isolated dependency environment's runtime;
+it does not replace `sitecustomize.py` or any system library.
+
+The dependency environment defaults to
+`~/.local/share/lerobot-xense/rebot-rt-deps/py<major.minor>` (under `XDG_DATA_HOME` when
+set). **Keep this directory after installation**: the compiled module links to
+its shared libraries. Override it with `REBOT_DEPS_PREFIX`, or use
+`--skip-deps` to reuse an already provisioned environment. A complete dependency
+environment is reused without network access. The first run needs access to
+conda-forge; this avoids the failing PyPI build-dependency download but does not
+repair a broken network connection.
+
+Re-run the installer after changing the submodule or Python version, and on
+each new computer. Build directories and native binaries from another computer
+are not reused. `pip install -e third_party/libpyrebot` alone does not compile
+the extension. For a full reBot + TacCap + Pico4 station install, use
+`bash ./setup_env.sh --install --rebot --taccap --pico4`.
+
 #### 🎛️ Selective hardware install (build only the SDKs you need)
 
-By default `--install` builds **every** hardware SDK. On a station that only uses one
+By default `--install` builds every hardware SDK supported by the script. On a station that only uses one
 or two devices, pass per-hardware-family selectors after `--install` to build
 **core + only those** SDKs — faster, and it skips SDKs you can't (or don't want to)
 build on that host:
@@ -137,6 +309,7 @@ bash ./setup_env.sh --install --help
 
 | Selector                  | Builds                                         | Robots / teleoperators enabled            |
 | ------------------------- | ---------------------------------------------- | ----------------------------------------- |
+| `--rebot`, `--bi_rebot`   | `rebot_rt` (isolated Pinocchio dependencies)   | `rebot_b601_rt`, `bi_rebot_b601_rt`       |
 | `--flexiv`, `--bi_flexiv` | `flexiv_rt` (+ `xense`)                        | `flexiv_rizon4_rt`, `bi_flexiv_rizon4_rt` |
 | `--elite`, `--bi_elite`   | `elite_cs_sdk` (+ `xense`)                     | `elite_cs66_rt`, `bi_elite_cs66_rt`       |
 | `--taccap`, `--bi_taccap` | `xense.taccap` (+ `xense`)                     | `taccap_follower` gripper (on any arm)    |

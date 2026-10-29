@@ -72,7 +72,7 @@ class DevicePolicy(Protocol):
         """True on the frame a reset is asked for (edge, not level)."""
 
     def resync(self, robot: Robot, teleop: Teleoperator) -> None:
-        """Snap the teleoperator's target to where the arm actually is."""
+        """Sync the teleoperator's target to the arm's control reference."""
 
     def dryrun_resync(self, robot: Robot, teleop: Teleoperator) -> None:
         """Same, for a dry run, where the arm is not commanded at all."""
@@ -89,8 +89,8 @@ class DevicePolicy(Protocol):
 # --------------------------------------------------------------------------- #
 
 
-def _resync_from_quat(robot: Robot, teleop: Teleoperator) -> None:
-    pose = robot.get_current_tcp_pose_quat()
+def _resync_from_quat(robot: Robot, teleop: Teleoperator, *, use_commanded_pose: bool = False) -> None:
+    pose = robot.get_commanded_tcp_pose_quat() if use_commanded_pose else robot.get_current_tcp_pose_quat()
     teleop.reset_to_pose(pose[:7], pose[7])
 
 
@@ -99,17 +99,19 @@ def _resync_from_euler(robot: Robot, teleop: Teleoperator) -> np.ndarray:
     # controller believes it is heading, which is what the teleop integrates
     # from. Near an orientation singularity the measured rotvec is unstable and
     # can read 100°+ off what has actually been commanded, which would make the
-    # next send_action jump and trip the joint-velocity limit. Only elite_cs66_rt
-    # and bi_elite_cs66_rt expose the commanded pose; flexiv and arx5 fall back
-    # to the measured one and pay a servo cycle of lag.
+    # next send_action jump and trip the joint-velocity limit. B601 also uses
+    # this reference to avoid accumulating MIT tracking error after a reset.
+    # Arms without a commanded pose getter fall back to the measured one.
     source = getattr(robot, "get_commanded_tcp_pose_euler", None) or robot.get_current_tcp_pose_euler
     pose = source()
     teleop.reset_to_pose(pose[:6], pose[6])
     return pose
 
 
-def _resync_bimanual(robot: Robot, teleop: Teleoperator) -> None:
-    left_pose, right_pose = robot.get_current_tcp_pose_quat()
+def _resync_bimanual(robot: Robot, teleop: Teleoperator, *, use_commanded_pose: bool = False) -> None:
+    left_pose, right_pose = (
+        robot.get_commanded_tcp_pose_quat() if use_commanded_pose else robot.get_current_tcp_pose_quat()
+    )
     teleop.reset_to_pose(left_pose[:7], right_pose[:7], left_pose[7], right_pose[7])
 
 
@@ -253,13 +255,17 @@ class Pico4Policy(_NoBeforeSend):
 
     reset_source = "A button"
 
+    def __init__(self, *, use_commanded_pose: bool = False) -> None:
+        self._use_commanded_pose = use_commanded_pose
+
     def reset_requested(self, teleop: Teleoperator) -> bool:
         return bool(teleop.get_reset_button())
 
     def resync(self, robot: Robot, teleop: Teleoperator) -> None:
-        _resync_from_quat(robot, teleop)
+        _resync_from_quat(robot, teleop, use_commanded_pose=self._use_commanded_pose)
 
-    dryrun_resync = resync
+    def dryrun_resync(self, robot: Robot, teleop: Teleoperator) -> None:
+        _resync_from_quat(robot, teleop)
 
     def status_line(self, teleop, action, loop_s, dryrun) -> str:
         enabled = "ENABLED" if getattr(teleop, "_enabled", False) else "DISABLED"
@@ -274,9 +280,10 @@ class BiPico4Policy(Pico4Policy):
     """Bimanual Pico4: both sides re-sync together, status shows each side."""
 
     def resync(self, robot: Robot, teleop: Teleoperator) -> None:
-        _resync_bimanual(robot, teleop)
+        _resync_bimanual(robot, teleop, use_commanded_pose=self._use_commanded_pose)
 
-    dryrun_resync = resync
+    def dryrun_resync(self, robot: Robot, teleop: Teleoperator) -> None:
+        _resync_bimanual(robot, teleop)
 
     def status_line(self, teleop, action, loop_s, dryrun) -> str:
         def side(handle) -> str:

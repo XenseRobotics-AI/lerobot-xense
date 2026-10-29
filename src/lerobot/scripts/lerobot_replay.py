@@ -64,9 +64,11 @@ from lerobot.robots import (  # noqa: F401
     RobotConfig,
     bi_elite_cs66_rt,
     bi_flexiv_rizon4_rt,
+    bi_rebot_b601_rt,
     elite_cs66_rt,
     flexiv_rizon4_rt,
     make_robot_from_config,
+    rebot_b601_rt,
 )
 from lerobot.utils.constants import ACTION
 from lerobot.utils.import_utils import register_third_party_plugins
