@@ -75,7 +75,9 @@ class RecordingRobot(FakeRobot):
 
     def reset_to_initial_position(self):
         super().reset_to_initial_position()
-        self.reset_polls = 5
+        # run_rt_record_loop reads rt_moving once per frame, so the reset
+        # spans the next two frames.
+        self.reset_polls = 2
 
     @property
     def rt_moving(self):
