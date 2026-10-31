@@ -116,10 +116,21 @@ class JointReset:
         if worker is not None and worker is not threading.current_thread():
             worker.join()
 
-    def start(self, drivers, feedback, targets, preflight: Callable, clear_targets: Callable) -> None:
+    def start(
+        self,
+        drivers,
+        feedback,
+        targets,
+        preflight: Callable,
+        clear_targets: Callable,
+        *,
+        check_ready: Callable | None = None,
+    ) -> None:
         with self.lock:
             if self.closing:
                 raise RuntimeError("Elite adapter is disconnecting")
+            if check_ready is not None:
+                check_ready()
             if self.active:
                 return
             goals = {}

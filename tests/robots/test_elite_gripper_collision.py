@@ -2,13 +2,18 @@
 
 import sys
 import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import pytest
+
 from lerobot.robots.bi_elite_cs66_rt.bi_elite_cs66_rt import BiEliteCS66RT
-from lerobot.robots.bi_elite_cs66_rt.config_bi_elite_cs66_rt import BiEliteCS66RTControlMode
+from lerobot.robots.bi_elite_cs66_rt.config_bi_elite_cs66_rt import BiEliteCS66RTConfig, BiEliteCS66RTControlMode
+from lerobot.robots.bi_elite_cs66_rt.gripper_snapshots import GripperSnapshot
 from lerobot.robots.elite_cs66_rt.joint_reset import JointReset
+from tests.robots.test_elite_joint_reset import Feedback
 
 
 class PublisherTests(unittest.TestCase):
@@ -390,6 +395,186 @@ class PublisherTests(unittest.TestCase):
         self.assertIsNone(robot._station)
         for gripper in robot._gripper.values():
             gripper.disconnect.assert_called_once()
+
+
+@pytest.fixture
+def robot():
+    config = BiEliteCS66RTConfig(
+        cameras={},
+        reset_duration_s=0.04,
+        reset_stable_dwell_s=0.02,
+        reset_timeout_s=0.2,
+        reset_feedback_timeout_s=0.04,
+        connect_timeout_s=0.06,
+    )
+    config.left_world_rotation = config.right_world_rotation = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    arm = BiEliteCS66RT(config)
+    arm._is_connected = True
+    arm.logger = Mock()
+    arm._station = Mock()
+    arm._coordinator = Mock()
+    status = SimpleNamespace(running=True, error="")
+    arm._coordinator.status.return_value = status
+    arm._coordinator.stop.side_effect = lambda: setattr(status, "running", False)
+    arm._coordinator.start.side_effect = lambda: setattr(status, "running", True)
+    for side in ("left", "right"):
+        driver = Mock()
+        state = SimpleNamespace(running=True, error="", planner=SimpleNamespace(idle=True))
+        driver.status.return_value = state
+        driver.stopServo.side_effect = lambda state=state: setattr(state, "running", False)
+        driver.startServo.side_effect = lambda _, state=state: setattr(state, "running", True)
+        driver.writeIdle.return_value = True
+        driver.isRobotConnected.return_value = True
+        arm._driver[side] = driver
+        arm._rtsi[side] = Feedback([0.0] * 6)
+    yield arm
+    arm._is_connected = False
+    arm._driver = arm._rtsi = dict.fromkeys(("left", "right"))
+
+
+def test_pause_brakes_under_supervision_then_parks_both_arms(robot):
+    events = []
+    wait_idle = robot._wait_recording_idle
+
+    def wait(deadline):
+        assert robot._coordinator.status().running
+        assert all(d.status().running for d in robot._driver.values())
+        wait_idle(deadline)
+        events.append("settled")
+
+    robot._wait_recording_idle = wait
+    stop = robot._coordinator.stop.side_effect
+    robot._coordinator.stop.side_effect = lambda: (events.append("stop_coordinator"), stop())
+    robot.pause_for_recording()
+    assert events == ["settled", "stop_coordinator"]
+    for driver in robot._driver.values():
+        driver.cancel.assert_called_once()
+        driver.stopServo.assert_called_once()
+        driver.writeIdle.assert_called_once_with(0)
+        assert not driver.status().running
+    assert robot.config.native_collision_gripper_max_age_s == 0.1
+    with pytest.raises(RuntimeError, match="recording preparation"):
+        robot.send_action({})
+    with pytest.raises(RuntimeError, match="recording preparation"):
+        robot.reset_to_initial_position()
+    robot.pause_for_recording()  # adjacent save/cleanup is idempotent
+    robot._coordinator.stop.assert_called_once()
+
+
+@pytest.mark.parametrize("failure", ["moving", "feedback_stale", "planner_busy", "disconnected"])
+def test_failed_settling_parks_both_arms_and_never_resumes(robot, failure):
+    if failure == "moving":
+        robot._rtsi["right"].velocity[:] = 0.2
+    elif failure == "feedback_stale":
+        robot._rtsi["right"].freeze = True
+    elif failure == "planner_busy":
+        robot._driver["right"].status().planner.idle = False
+    else:
+        robot._rtsi["right"].isConnected.return_value = False
+    with pytest.raises((TimeoutError, ConnectionError)):
+        robot.pause_for_recording()
+    assert all(not d.status().running for d in robot._driver.values())
+    with pytest.raises(RuntimeError, match="reconnect required"):
+        robot.resume_after_recording()
+    robot._coordinator.start.assert_not_called()
+
+
+def test_old_station_fault_is_not_cleared_by_preparation(robot):
+    robot._coordinator.status().error = "Left gripper collision state is stale"
+    robot._log_native_fault_diagnostics = Mock()
+    with pytest.raises(RuntimeError, match="is stale"):
+        robot.pause_for_recording()
+    with pytest.raises(RuntimeError, match="reconnect required"):
+        robot.resume_after_recording()
+    robot._coordinator.start.assert_not_called()
+
+
+def test_resume_requires_fresh_grippers_before_starting_any_sender(robot):
+    robot.pause_for_recording()
+    events = []
+
+    def fresh():
+        assert not robot._coordinator.status().running
+        assert all(not d.status().running for d in robot._driver.values())
+        events.append("fresh")
+
+    robot._wait_recording_grippers = fresh
+    for side, driver in robot._driver.items():
+        start = driver.startServo.side_effect
+        driver.startServo.side_effect = lambda feed, side=side, start=start: (events.append(side), start(feed))
+    robot.resume_after_recording()
+    assert events[0] == "fresh"
+    assert sorted(events[1:]) == ["left", "right"]
+    assert not robot._recording_paused
+    assert robot.config.native_collision_gripper_max_age_s == 0.1
+
+
+@pytest.mark.parametrize("failure", ["no_sample", "old_sample", "invalid_sample"])
+def test_resume_waits_for_new_valid_samples_and_times_out_stationary(robot, failure):
+    robot.pause_for_recording()
+    if failure == "old_sample":
+        sample = GripperSnapshot(0.5, time.monotonic() - 1, 1, True)
+        robot._station_gripper_samples = (time.monotonic(), dict.fromkeys(("left", "right"), sample))
+    elif failure == "invalid_sample":
+        # Future-dated/malformed publication also has to pass native validation.
+        sample = GripperSnapshot(0.5, time.monotonic() + 10, 1, True)
+        robot._station_gripper_samples = (time.monotonic() + 10, dict.fromkeys(("left", "right"), sample))
+        robot._station.station_q.side_effect = RuntimeError("gripper state is invalid")
+    with pytest.raises(TimeoutError, match="No fresh calibrated gripper states"):
+        robot.resume_after_recording()
+    robot._coordinator.start.assert_not_called()
+    assert robot._recording_paused
+    assert all(not d.status().running for d in robot._driver.values())
+
+
+def test_readiness_wait_recovers_only_after_new_samples_pass_native_validation(robot, monkeypatch):
+    robot.pause_for_recording()
+    calls = []
+    real_sleep = time.sleep
+
+    def publish_after_wait(duration):
+        real_sleep(duration)
+        now = time.monotonic()
+        sample = GripperSnapshot(0.5, now, len(calls) + 1, True)
+        robot._station_gripper_samples = (now, dict.fromkeys(("left", "right"), sample))
+        calls.append(now)
+
+    monkeypatch.setattr("lerobot.robots.bi_elite_cs66_rt.bi_elite_cs66_rt.time.sleep", publish_after_wait)
+    robot._station.station_q.side_effect = [RuntimeError("stale"), [0.0] * 12]
+    robot.resume_after_recording()
+    assert len(calls) >= 2
+    assert robot._station.station_q.call_count == 2
+    assert not robot._recording_paused
+
+
+def test_partial_resume_failure_stops_both_senders_and_stays_latched(robot):
+    robot.pause_for_recording()
+    robot._wait_recording_grippers = Mock()
+    robot._driver["right"].startServo.side_effect = RuntimeError("cannot restart right arm")
+    with pytest.raises(RuntimeError, match="cannot restart"):
+        robot.resume_after_recording()
+    assert robot._recording_paused
+    assert not robot._coordinator.status().running
+    assert all(not d.status().running for d in robot._driver.values())
+    with pytest.raises(RuntimeError, match="reconnect required"):
+        robot.resume_after_recording()
+
+
+def test_disconnect_revalidates_after_camera_teardown_without_restarting_servo(robot):
+    robot.pause_for_recording()
+    events = []
+    camera = Mock(is_connected=True)
+    camera.disconnect.side_effect = lambda: events.append("camera_closed")
+    robot.cameras = {"head": camera}
+    robot._wait_recording_grippers = Mock(side_effect=lambda: events.append("fresh"))
+    robot._check_joint_move = Mock(side_effect=lambda *args: events.append("home_checked"))
+    robot._return_home_arm = Mock()
+    drivers = dict(robot._driver)
+    robot.disconnect()
+    assert events == ["camera_closed", "fresh", "home_checked"]
+    assert robot._return_home_arm.call_count == 2
+    for driver in drivers.values():
+        driver.startServo.assert_not_called()
 
 
 if __name__ == "__main__":

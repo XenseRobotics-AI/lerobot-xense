@@ -122,6 +122,8 @@ class BiEliteCS66RT(Robot):
         self._station_gripper_error: str | None = None
         self._station_gripper_samples: tuple[float, dict[str, GripperSnapshot]] | None = None
         self._station_gripper_readers: dict[str, TaccapGripperSnapshotReader] = {}
+        self._recording_paused = False
+        self._recording_pause_error: BaseException | None = None
         self._native_tools: dict[str, list[float] | None] = dict.fromkeys(_SIDES)
         self._dashboard: dict[str, Any] = dict.fromkeys(_SIDES)
         self._rtsi: dict[str, Any] = dict.fromkeys(_SIDES)
@@ -465,6 +467,8 @@ class BiEliteCS66RT(Robot):
             preflight = StationLayer(self._assembly, self.config.native_collision_profile, [np.eye(4), np.eye(4)])
             self._configure_station_grippers(preflight)
         self._joint_reset.prepare_connection()
+        self._recording_paused = False
+        self._recording_pause_error = None
         self._q_start = dict.fromkeys(_SIDES)
         self._cs = _import_elite_sdk()
         # Native workers own the high-rate path; preserve the Python station logic.
@@ -677,6 +681,10 @@ class BiEliteCS66RT(Robot):
         home_error: Exception | None = None
         if self._station is not None:
             try:
+                if getattr(self, "_recording_paused", False):
+                    # Camera/encoder teardown finished while the arms were idle.
+                    # Revalidate geometry before home, without resuming teleop.
+                    self.resume_after_recording(resume_servos=False)
                 self._check_joint_move({side: self._arm_home_pose(side) for side in _SIDES}, "return-to-home")
             except Exception as exc:
                 go_home = False
@@ -776,6 +784,168 @@ class BiEliteCS66RT(Robot):
     # =========================================================================
     # Servo loop (per arm)
     # =========================================================================
+
+    @contextlib.contextmanager
+    def recording_cleanup(self):
+        """Park before encoder cleanup, preserving a recording error or Ctrl+C."""
+        try:
+            yield
+        except BaseException:
+            with best_effort(self.logger, "parking Elite before encoder cleanup", level="error"):
+                self.pause_for_recording()
+            raise
+        else:
+            self.pause_for_recording()
+
+    def pause_for_recording(self) -> None:
+        """Park both arms before GIL-blocking encoder/file IO, keeping sockets open.
+
+        The 100 ms gripper watchdog remains active throughout braking. Only
+        after fresh feedback proves both arms idle do we stop the coordinator
+        and send MODE_IDLE with an indefinite *next-command* receive timeout.
+        This is the SDK's stationary waiting mode, never an unmonitored servo.
+        """
+        if self._coordinator is None:
+            return
+        with self._joint_reset.lock:
+            if self._recording_paused:
+                return
+            self._recording_paused = True  # exclude new teleop/reset submissions
+
+        error = None
+        try:
+            deadline = time.monotonic() + self.config.reset_timeout_s
+            while self._joint_reset.active:
+                self._raise_servo_error_if_any("left")
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Elite reset did not finish before recording preparation")
+                time.sleep(0.01)
+            self._raise_servo_error_if_any("left")
+            for driver in self._driver.values():
+                driver.cancel()
+            self._wait_recording_idle(deadline)
+            self._clear_reset_targets()
+        except BaseException as exc:
+            error = exc
+
+        # Also stop on failed preparation; encoder cleanup must never leave a
+        # moving arm without its planner. Keep the original fault latched.
+        try:
+            self._park_recording_drivers()
+        except BaseException as exc:
+            error = error or exc
+        self._recording_pause_error = error
+        if error is not None:
+            raise error
+        self.logger.info("Recording preparation: both arms idle; waiting for encoder/file IO.")
+
+    def _wait_recording_idle(self, deadline: float) -> None:
+        previous, changed_at = {}, dict.fromkeys(_SIDES, time.monotonic())
+        stable_since = None
+        stable_stamps = {}
+        while time.monotonic() < deadline:
+            self._raise_servo_error_if_any("left")
+            now, stamps, settled = time.monotonic(), {}, True
+            for side in _SIDES:
+                driver, rtsi = self._driver[side], self._rtsi[side]
+                if not driver.isRobotConnected() or not rtsi.isConnected():
+                    raise ConnectionError(f"{side} disconnected during recording preparation")
+                stamp, _, velocity = joint_sample(rtsi)
+                if side in previous and stamp < previous[side]:
+                    raise RuntimeError(f"{side} RTSI timestamp moved backwards during recording preparation")
+                if stamp != previous.get(side):
+                    previous[side], changed_at[side] = stamp, now
+                if now - changed_at[side] >= self.config.reset_feedback_timeout_s:
+                    raise TimeoutError(f"{side} RTSI feedback stale during recording preparation")
+                stamps[side] = stamp
+                status = driver.status()
+                if not status.running:
+                    raise RuntimeError(f"{side} servo stopped during recording preparation")
+                settled &= status.planner.idle and bool(
+                    np.max(np.abs(velocity)) <= self.config.reset_velocity_tolerance_rad_s
+                )
+            if not settled:
+                stable_since = None
+            elif stable_since is None:
+                stable_since, stable_stamps = now, stamps
+            if (
+                stable_since is not None
+                and now - stable_since >= self.config.reset_stable_dwell_s
+                and all(stamps[side] > stable_stamps[side] for side in _SIDES)
+            ):
+                return
+            time.sleep(0.01)
+        raise TimeoutError("Elite arms did not settle before recording preparation")
+
+    def _park_recording_drivers(self) -> None:
+        error = None
+        try:
+            self._coordinator.stop()
+        except BaseException as exc:
+            error = exc
+        for side in _SIDES:
+            try:
+                self._stop_servo_loop(side)
+                # The send loop's final idle uses the normal 500 ms timeout.
+                # Replace it immediately, before any encoder can hold the GIL.
+                if not self._driver[side].writeIdle(0):
+                    raise ConnectionError(f"{side} failed to enter recording idle mode")
+            except BaseException as exc:
+                error = error or exc
+        if error is not None:
+            raise error
+
+    def resume_after_recording(self, *, resume_servos: bool = True) -> None:
+        """Require new, valid gripper samples before restoring normal supervision."""
+        if not self._recording_paused:
+            return
+        if self._recording_pause_error is not None:
+            raise RuntimeError(
+                "Elite recording preparation failed; reconnect required"
+            ) from self._recording_pause_error
+        try:
+            # start()/startServo() clear native errors: never use them to revive
+            # a faulted station. Only our intentional, healthy pause may resume.
+            error = self._coordinator.status().error
+            if error:
+                raise RuntimeError(f"Elite station collision layer failed: {error}")
+            for driver in self._driver.values():
+                driver.check_error()
+            self._wait_recording_grippers()
+            self._coordinator.start()
+            if resume_servos:
+                self._run_arms_paired(lambda side, _failed: self._start_servo_loop(side), "recording resume")
+            self._check_station_health()
+            for driver in self._driver.values():
+                driver.check_error()
+            self._clear_reset_targets()
+        except BaseException as exc:
+            self._recording_pause_error = exc
+            with best_effort(self.logger, "parking both arms after recording resume failed"):
+                self._park_recording_drivers()
+            raise
+        with self._joint_reset.lock:
+            self._recording_paused = False
+        self.logger.info("Recording ready: fresh gripper states; normal collision watchdog restored.")
+
+    def _wait_recording_grippers(self) -> None:
+        after = time.monotonic()
+        deadline = after + self.config.connect_timeout_s
+        while time.monotonic() < deadline:
+            publication = self._station_gripper_samples
+            if publication is not None:
+                published_at, samples = publication
+                if published_at >= after and all(samples[side].sampled_at >= after for side in _SIDES):
+                    try:
+                        # Native validation retains the configured 100 ms age,
+                        # validity, sequence and joint-limit checks unchanged.
+                        q = self._measured_joints()
+                        self._station.station_q(q["left"], q["right"])
+                        return
+                    except RuntimeError:
+                        pass  # allow the publisher to recover from encoder IO
+            time.sleep(0.01)
+        raise TimeoutError("No fresh calibrated gripper states after recording preparation; arms remain idle")
 
     def _start_servo_loop(self, side: str) -> None:
         assert self._driver[side] is not None and self._rtsi[side] is not None
@@ -1208,6 +1378,7 @@ class BiEliteCS66RT(Robot):
         with self._joint_reset.lock:
             if self._joint_reset.closing:
                 raise DeviceNotConnectedError(f"{self} is disconnecting.")
+            self._check_recording_ready()
             if self._joint_reset.active:
                 return self._action_during_reset(action)
             return self._send_action(action)
@@ -1290,14 +1461,18 @@ class BiEliteCS66RT(Robot):
     def reset_to_initial_position(self) -> None:
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
-
         self._joint_reset.start(
             self._driver,
             self._rtsi,
             self._q_start,
             lambda targets: self._check_joint_move(targets, "reset"),
             self._clear_reset_targets,
+            check_ready=self._check_recording_ready,
         )
+
+    def _check_recording_ready(self) -> None:
+        if getattr(self, "_recording_paused", False):
+            raise RuntimeError("Elite arms are idle for recording preparation")
 
     def _clear_reset_targets(self) -> None:
         for side in _SIDES:
