@@ -12,8 +12,10 @@ from unittest.mock import Mock, patch
 import draccus
 import numpy as np
 import pyarrow.parquet as pq
+import pytest
 
 from lerobot.datasets.utils import hw_to_dataset_features
+from lerobot.robots.bi_elite_cs66_rt.bi_elite_cs66_rt import BiEliteCS66RT
 from lerobot.robots.rebot_b601_rt.exit_policy import B601ControlFaultError
 from lerobot.scripts import lerobot_record as cli
 from tests.scripts.conftest_teleop_doubles import (
@@ -523,7 +525,7 @@ class TestB601RecordEntrypoint(unittest.TestCase):
 class TestExistingRobotRecordEntrypoint(unittest.TestCase):
     """Adding B601 must preserve the other robots' connection and exit order."""
 
-    def check_existing_robots(self, error=None):
+    def check_existing_robots(self, error=None, *, stop_during_warmup=False):
         cases = (
             ("so100_follower", "so100_leader", "record_loop"),
             ("flexiv_rizon4_rt", "pico4", "flexiv_rizon4_rt_record_loop"),
@@ -537,6 +539,8 @@ class TestExistingRobotRecordEntrypoint(unittest.TestCase):
                 dual = robot_type.startswith("bi_")
                 robot, teleop = RecordingRobot(dual), teleoperator(dual)
                 robot.name, teleop.name = robot_type, teleop_type
+                robot.pause_for_recording = Mock(side_effect=AssertionError("Unexpected Elite preparation"))
+                robot.resume_after_recording = Mock(side_effect=AssertionError("Unexpected Elite preparation"))
                 teleop.pre_init = Mock()
                 cfg = cli.RecordConfig(
                     robot=SimpleNamespace(type=robot_type),
@@ -547,6 +551,11 @@ class TestExistingRobotRecordEntrypoint(unittest.TestCase):
                     play_sounds=False,
                 )
                 dataset = Mock(num_episodes=0)
+                events = fresh_events()
+                if stop_during_warmup:
+                    dataset.prepare_episode_recording.side_effect = lambda events=events: events.update(
+                        stop_recording=True
+                    )
                 order, phases = [], []
                 dataset.save_episode.side_effect = lambda order=order: order.append("save")
                 dataset.finalize.side_effect = lambda order=order: order.append("finalize")
@@ -570,7 +579,7 @@ class TestExistingRobotRecordEntrypoint(unittest.TestCase):
                     ("make_robot_from_config", Mock(return_value=robot)),
                     ("make_teleoperator_from_config", Mock(return_value=teleop)),
                     ("VideoEncodingManager", video_manager),
-                    ("init_keyboard_listener", Mock(return_value=(None, fresh_events()))),
+                    ("init_keyboard_listener", Mock(return_value=(None, events))),
                     ("is_headless", Mock(return_value=True)),
                     ("init_logging", Mock()),
                     ("log_say", Mock()),
@@ -595,17 +604,26 @@ class TestExistingRobotRecordEntrypoint(unittest.TestCase):
                 with self.assertRaises(type(error)) if error is not None else contextlib.nullcontext():
                     cli.record(cfg)
 
-                expected = ["capture"] if error is not None else ["capture", "prepare", "save", "capture", "save"]
+                if error is not None:
+                    expected = ["capture"]
+                elif stop_during_warmup:
+                    expected = ["capture", "save"]
+                else:
+                    expected = ["capture", "prepare", "save", "capture", "save"]
                 self.assertEqual(
                     order, [*expected, "encoder_cleanup", "finalize", "robot_disconnect", "teleop_disconnect"]
                 )
-                self.assertEqual(phases, [dataset] if error is not None else [dataset, None, dataset])
+                self.assertEqual(
+                    phases, [dataset] if error is not None or stop_during_warmup else [dataset, None, dataset]
+                )
                 self.assertGreater(loops[record_loop].call_count, 0)
                 for name, loop in loops.items():
                     if name not in {record_loop, "record_loop"}:
                         loop.assert_not_called()
                 b601_loop.assert_not_called()
                 b601_policy.assert_not_called()
+                robot.pause_for_recording.assert_not_called()
+                robot.resume_after_recording.assert_not_called()
                 dataset.stop_image_writer.assert_not_called()
                 robot.connect.assert_called_once_with(
                     **({} if robot_type == "so100_follower" else {"go_to_start": True})
@@ -634,6 +652,9 @@ class TestExistingRobotRecordEntrypoint(unittest.TestCase):
 
     def test_ctrl_c_keeps_existing_cleanup_order(self):
         self.check_existing_robots(KeyboardInterrupt())
+
+    def test_warmup_stop_keeps_existing_flow_without_elite_collision_mode(self):
+        self.check_existing_robots(stop_during_warmup=True)
 
 
 class TestB601DatasetRoundTrip(unittest.TestCase):
@@ -697,6 +718,194 @@ class TestB601DatasetRoundTrip(unittest.TestCase):
             self.assertEqual(sum(len(table["action"]) for table in tables), 4)
             np.testing.assert_allclose(tables[0]["action"][0][0], 0.055)
             self.assertTrue(list(root.glob("videos/**/*.mp4")))
+
+
+@pytest.fixture
+def session(monkeypatch):
+    robot, teleop = RecordingRobot(True), teleoperator(True)
+    robot.name, teleop.name = "bi_elite_cs66_rt", "bi_pico4"
+    robot.logger = Mock()
+    robot.recording_cleanup = lambda: BiEliteCS66RT.recording_cleanup(robot)
+    robot.is_connected = False
+    teleop.pre_init = Mock()
+    cfg = cli.RecordConfig(
+        robot=SimpleNamespace(type=robot.name, native_collision_profile="auto"),
+        teleop=SimpleNamespace(type=teleop.name, ori_sensitivity=0.5),
+        dataset=cli.DatasetRecordConfig(
+            repo_id="test/record",
+            single_task="test",
+            num_episodes=2,
+            push_to_hub=False,
+        ),
+        play_sounds=False,
+    )
+    dataset = Mock(num_episodes=0)
+    events, order = fresh_events(), []
+    state = SimpleNamespace(active=False, encoders=False, warmups=0, captures=0, retake=False)
+
+    def connect(**_kwargs):
+        assert state.encoders, "first warmup must precede robot connection"
+        robot.is_connected = True
+        state.active = True
+        order.append("connect")
+
+    def pause():
+        if state.active:
+            order.append("pause")
+        state.active = False
+
+    def resume():
+        assert not state.active and state.encoders
+        state.active = True
+        order.append("resume")
+
+    def warmup():
+        if state.encoders:
+            return
+        assert not state.active, "encoder initialization while collision watchdog is active"
+        state.encoders = True
+        state.warmups += 1
+        order.append("warmup")
+
+    def save():
+        assert not state.active, "encoder release while collision watchdog is active"
+        state.encoders = False
+        dataset.num_episodes += 1
+        order.append("save")
+
+    def clear():
+        assert not state.active
+        state.encoders = False
+        order.append("clear")
+
+    def finalize():
+        assert not state.active
+        order.append("finalize")
+
+    def capture(**kwargs):
+        assert state.active
+        state.captures += 1
+        order.append("capture")
+        if state.retake and state.captures == 1:
+            events["rerecord_episode"] = True
+
+    def reset(**kwargs):
+        assert state.active, "manual environment reset still permits monitored teleoperation"
+        order.append("reset")
+
+    @contextlib.contextmanager
+    def manager(_dataset):
+        try:
+            yield
+        finally:
+            assert not state.active, "exception cleanup ran before parking the arms"
+            state.encoders = False
+            order.append("encoder_cleanup")
+
+    robot.connect.side_effect = connect
+    robot.pause_for_recording = Mock(side_effect=pause)
+    robot.resume_after_recording = Mock(side_effect=resume)
+    robot.disconnect.side_effect = lambda: (order.append("disconnect"), setattr(robot, "is_connected", False))
+    dataset.prepare_episode_recording.side_effect = warmup
+    dataset.save_episode.side_effect = save
+    dataset.clear_episode_buffer.side_effect = clear
+    dataset.finalize.side_effect = finalize
+    for name, value in {
+        "make_robot_from_config": Mock(return_value=robot),
+        "VideoEncodingManager": manager,
+        "init_keyboard_listener": Mock(return_value=(None, events)),
+        "is_headless": Mock(return_value=True),
+        "init_logging": Mock(),
+        "log_say": Mock(),
+        "logger": Mock(),
+        "flexiv_rizon4_rt_record_loop": Mock(side_effect=capture),
+        "record_loop": Mock(side_effect=reset),
+    }.items():
+        monkeypatch.setattr(cli, name, value)
+    monkeypatch.setattr(cli.LeRobotDataset, "create", Mock(return_value=dataset))
+    monkeypatch.setattr(
+        "lerobot.robots.bi_elite_cs66_rt.pico4.make_elite_pico4_teleoperator",
+        Mock(return_value=teleop),
+    )
+    return SimpleNamespace(
+        cfg=cfg, robot=robot, teleop=teleop, dataset=dataset, state=state, events=events, order=order
+    )
+
+
+def test_each_episode_prepares_then_enables_control_and_parks_before_saving(session):
+    cli.record(session.cfg)
+    assert session.order == [
+        "warmup",
+        "connect",
+        "pause",
+        "resume",
+        "capture",
+        "reset",
+        "pause",
+        "save",
+        "warmup",
+        "resume",
+        "capture",
+        "pause",
+        "save",
+        "encoder_cleanup",
+        "finalize",
+        "disconnect",
+    ]
+    assert session.teleop.names().count("reset_to_pose") == 2
+
+
+def test_retake_cancels_encoders_only_while_parked(session):
+    session.state.retake = True
+    cli.record(session.cfg)
+    assert session.state.warmups == session.state.captures == 3
+    assert session.order.count("clear") == 1
+    assert session.order.count("save") == 2
+
+
+@pytest.mark.parametrize("error", [RuntimeError("record fault"), KeyboardInterrupt()])
+def test_record_failure_parks_before_encoder_cleanup(session, error):
+    cli.flexiv_rizon4_rt_record_loop.side_effect = error
+    with pytest.raises(type(error)):
+        cli.record(session.cfg)
+    assert session.order[-4:] == ["pause", "encoder_cleanup", "finalize", "disconnect"]
+    session.dataset.save_episode.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", ["warmup", "save", "readiness"])
+def test_preparation_failure_never_reenters_record_loop(session, failure):
+    if failure == "warmup":
+        warmup = session.dataset.prepare_episode_recording.side_effect
+
+        def fail_second_warmup():
+            if session.state.warmups == 1 and not session.state.encoders:
+                raise RuntimeError("warmup failed")
+            warmup()
+
+        session.dataset.prepare_episode_recording.side_effect = fail_second_warmup
+    elif failure == "save":
+        session.dataset.save_episode.side_effect = RuntimeError("save failed")
+    else:
+        session.robot.resume_after_recording.side_effect = RuntimeError("freshness readiness failed")
+    with pytest.raises(RuntimeError, match="failed"):
+        cli.record(session.cfg)
+    assert session.state.captures == (0 if failure == "readiness" else 1)
+    assert not session.state.active
+    assert session.order[-1] == "disconnect"
+
+
+def test_stop_during_warmup_does_not_resume_teleoperation(session):
+    warmup = session.dataset.prepare_episode_recording.side_effect
+
+    def stop_second_warmup():
+        warmup()
+        if session.state.warmups == 2:
+            session.events["stop_recording"] = True
+
+    session.dataset.prepare_episode_recording.side_effect = stop_second_warmup
+    cli.record(session.cfg)
+    assert session.state.captures == 1
+    assert session.robot.resume_after_recording.call_count == 1
 
 
 if __name__ == "__main__":

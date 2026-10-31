@@ -145,7 +145,7 @@ from lerobot.utils.control_utils import (
     sanity_check_dataset_robot_compatibility,
 )
 from lerobot.utils.import_utils import register_third_party_plugins
-from lerobot.utils.robot_utils import busy_wait, get_logger, precise_sleep
+from lerobot.utils.robot_utils import best_effort, busy_wait, get_logger, precise_sleep
 from lerobot.utils.utils import (
     init_logging,
     log_say,
@@ -853,6 +853,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         teleop = make_teleoperator_from_config(cfg.teleop) if cfg.teleop is not None else None
 
     teleop_type = cfg.teleop.type if cfg.teleop is not None else None
+    station_preparation = (
+        cfg.robot.type == "bi_elite_cs66_rt" and getattr(cfg.robot, "native_collision_profile", None) is not None
+    )
     use_raw_passthrough = _use_raw_passthrough_record(cfg.robot.type, teleop_type)
 
     if use_raw_passthrough:
@@ -904,6 +907,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 encoder_threads=cfg.dataset.encoder_threads,
             )
 
+        if station_preparation:
+            dataset.prepare_episode_recording()
+
         # Vendor-specific robot.connect dispatch
         if teleop_type == "pico4" and cfg.robot.type == "flexiv_rizon4_rt":
             robot.connect(go_to_start=True)
@@ -933,6 +939,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             logger.info("Start pose: " + ", ".join(f"{k}={start_obs[k]:.6f}" for k in tcp_keys))
         else:
             robot.connect()
+
+        if station_preparation:
+            robot.pause_for_recording()
 
         # Vendor-specific teleop.connect dispatch
         if teleop is not None:
@@ -972,13 +981,23 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 "Streaming encoding is disabled. If you have capable hardware, consider enabling it for way faster episode saving. --dataset.streaming_encoding=true --dataset.encoder_threads=2 # --dataset.vcodec=auto. More info in the documentation: https://huggingface.co/docs/lerobot/streaming_video_encoding"
             )
 
-        with VideoEncodingManager(dataset):
+        # Exit right-to-left: park Elite before closing encoders, also on errors.
+        with (
+            VideoEncodingManager(dataset),
+            robot.recording_cleanup() if station_preparation else contextlib.nullcontext(),
+        ):
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
                 # Warm up the streaming encoder before the loop so the first frame
                 # doesn't overrun on encoder/codec initialization.
                 if dataset is not None:
                     dataset.prepare_episode_recording()
+
+                if station_preparation:
+                    if events["stop_recording"]:
+                        break
+                    robot.resume_after_recording()
+                    _sync_rt_teleop_to_robot_pose(robot, teleop)
 
                 # Discard any exit request that arrived while nothing was
                 # reading events. The keyboard listener runs for the whole
@@ -1084,6 +1103,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         display_data=cfg.display_data,
                     )
 
+                if station_preparation:
+                    robot.pause_for_recording()
+
                 if events["rerecord_episode"]:
                     log_say("Re-record episode", cfg.play_sounds)
                     events["rerecord_episode"] = False
@@ -1109,6 +1131,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         logger.error(f"Recording stopped by an error:\n{traceback.format_exc()}")
         raise
     finally:
+        if station_preparation and robot.is_connected:
+            with best_effort(logger, "parking Elite before finalization", level="error"):
+                robot.pause_for_recording()
         log_say("Stop recording", cfg.play_sounds, blocking=True)
 
         if dataset:
