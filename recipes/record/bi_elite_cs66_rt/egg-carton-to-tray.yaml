@@ -189,7 +189,9 @@ teleop:
   ori_sensitivity: 1.0
 
 dataset:
-  repo_id: Xense/bi_elite_cs66_rt_egg_carton_to_tray_1016
+  # TEMP: the right-gripper-fixed copy (HF @29ef4076 with right_gripper.pos = 1.0),
+  # the dataset the 2026-10-27 training used. Raw recordings: Xense/bi_elite_cs66_rt_egg_carton_to_tray_1016.
+  repo_id: Xense/bi_elite_cs66_rt_egg_carton_to_tray_1016_fixed
   single_task: "Open the egg carton, then take out the eggs one by one and place them in the egg tray."
   fps: 30 # must equal teleop fps
   episode_time_s: 1200
