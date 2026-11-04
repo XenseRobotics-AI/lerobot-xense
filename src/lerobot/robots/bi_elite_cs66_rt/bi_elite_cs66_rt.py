@@ -1010,6 +1010,9 @@ class BiEliteCS66RT(Robot):
             )
         if self._station_gripper_error is not None:
             self.logger.error(f"[station] gripper publisher error: {self._station_gripper_error}")
+        if self._station is not None:
+            for publication in self._station.gripper_snapshot_history:
+                self.logger.error(f"[station] gripper publication before native validation: {publication}")
         if self._station_gripper_samples is not None:
             published_at, samples = self._station_gripper_samples
             now = time.monotonic()
@@ -1067,6 +1070,7 @@ class BiEliteCS66RT(Robot):
         station.configure_grippers(
             self.config.native_collision_gripper_calibration,
             self.config.native_collision_gripper_max_age_s,
+            opening_tolerance=self.config.native_collision_gripper_opening_tolerance,
         )
 
     def _start_station_gripper_publisher(self) -> None:

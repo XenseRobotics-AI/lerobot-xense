@@ -45,6 +45,7 @@ class PublisherTests(unittest.TestCase):
                 running=True, observation=SimpleNamespace(raw_pos=0.2, age_ms=1.0, seq=2, valid=True)
             )
         robot._station = Mock()
+        robot._station.gripper_snapshot_history = ()
         robot.logger = Mock()
         self.addCleanup(setattr, robot, "_is_connected", False)
         return robot
@@ -327,6 +328,25 @@ class PublisherTests(unittest.TestCase):
         for gripper in robot._gripper.values():
             gripper._gripper.get_gripper_config.assert_not_called()
             gripper._loop.snapshot.assert_not_called()
+
+    def test_configured_tolerance_reaches_collision_layer(self):
+        robot = self.robot()
+        robot.config = BiEliteCS66RTConfig(native_collision_gripper_opening_tolerance=0.002)
+        robot._configure_station_grippers(robot._station)
+        self.assertEqual(robot._station.configure_grippers.call_args.kwargs["opening_tolerance"], 0.002)
+
+    def test_negative_or_nonfinite_tolerance_is_rejected(self):
+        for value in (-0.001, float("nan"), float("inf")):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "tolerance"):
+                BiEliteCS66RTConfig(native_collision_gripper_opening_tolerance=value)
+
+    def test_fault_diagnostics_include_prior_publications(self):
+        robot = self.robot()
+        robot._driver = {"left": None, "right": None}
+        robot._station.gripper_snapshot_history = ("sequence=6209 opening=1.02 raw=-1.22",)
+        robot._log_native_fault_diagnostics()
+        messages = [call.args[0] for call in robot.logger.error.call_args_list]
+        self.assertTrue(any("sequence=6209" in message and "opening=1.02" in message for message in messages))
 
     def test_retired_backend_is_rejected_even_with_a_custom_station(self):
         robot = self.robot()

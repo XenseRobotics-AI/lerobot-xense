@@ -50,6 +50,19 @@ class SnapshotTests(unittest.TestCase):
         gripper._loop.snapshot.return_value.observation.raw_pos = 0.6
         self.assertAlmostEqual(TaccapGripperSnapshotReader(gripper).read().position, 0.5)
 
+    def test_invalid_snapshot_keeps_the_source_reason(self):
+        gripper = self.follower()
+        reader = TaccapGripperSnapshotReader(gripper)
+        gripper._loop.snapshot.return_value.observation.age_ms = -0.1
+        sample = reader.read()
+        self.assertFalse(sample.valid)
+        self.assertIn("age_ms=-0.1", sample.error)
+        self.assertEqual(sample.sequence, 3)
+        gripper._loop.snapshot.side_effect = RuntimeError("snapshot unavailable")
+        sample = reader.read()
+        self.assertFalse(sample.valid)
+        self.assertIn("snapshot unavailable", sample.error)
+
     def test_reading_same_sensor_sample_does_not_refresh_timestamp(self):
         gripper = self.follower()
         reader = TaccapGripperSnapshotReader(gripper)
