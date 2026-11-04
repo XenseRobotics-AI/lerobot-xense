@@ -23,6 +23,7 @@ class GripperSnapshot:
     sequence: int = 0
     valid: bool = False
     raw_position: float | None = None
+    error: str = ""
 
 
 class TaccapGripperSnapshotReader:
@@ -62,7 +63,7 @@ class TaccapGripperSnapshotReader:
             or self._gripper._gripper is not self._hardware
             or self._gripper._loop is not self._loop
         ):
-            return GripperSnapshot()
+            return GripperSnapshot(error="gripper disconnected or SDK session replaced")
         try:
             before = time.monotonic()
             snapshot = self._loop.snapshot()
@@ -79,6 +80,10 @@ class TaccapGripperSnapshotReader:
                 and math.isfinite(age)
                 and age >= 0
             )
-            return GripperSnapshot(position, before - age, int(obs.seq), valid, raw)
-        except Exception:
-            return GripperSnapshot()
+            error = "" if valid else (
+                f"running={snapshot.running}, observation_valid={obs.valid}, "
+                f"sequence={obs.seq}, raw={raw!r}, opening={position!r}, age_ms={obs.age_ms!r}"
+            )
+            return GripperSnapshot(position, before - age, int(obs.seq), valid, raw, error)
+        except Exception as exc:
+            return GripperSnapshot(error=f"{type(exc).__name__}: {exc}")

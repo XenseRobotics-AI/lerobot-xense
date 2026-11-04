@@ -192,6 +192,9 @@ class BiEliteCS66RTConfig(RobotConfig):
     # {left: {left_tool_taccap_right_finger_joint: [[opening, rad], ...]}, right: {...}}
     # Must be measured; URDF limits do not establish motor/finger gearing.
     native_collision_gripper_calibration: dict[str, dict[str, list[list[float]]]] | None = None
+    # Absolute opening allowance beyond calibration endpoints; budget its
+    # mapped finger displacement within the station's collision margins.
+    native_collision_gripper_opening_tolerance: float = 0.0
     native_collision_gripper_max_age_s: float = 0.1
     native_collision_gripper_publish_hz: float = 100.0
     left_native_contact_monitor: dict | None = None  # per-arm overrides (fitted gravity, friction)
@@ -332,6 +335,9 @@ class BiEliteCS66RTConfig(RobotConfig):
             raise ValueError("native_model_path and native_assembly are mutually exclusive")
         if self.native_collision_profile is not None and self.native_assembly is None:
             raise ValueError("native_collision_profile needs native_assembly (the station the profile models)")
+        tolerance = self.native_collision_gripper_opening_tolerance
+        if not math.isfinite(tolerance) or tolerance < 0:
+            raise ValueError("native_collision_gripper_opening_tolerance must be finite and nonnegative")
         for name in ("native_collision_gripper_max_age_s", "native_collision_gripper_publish_hz"):
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
