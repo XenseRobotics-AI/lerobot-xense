@@ -13,9 +13,15 @@ grippers/
   usb_topology.py   shared USB-hub helpers (used by both discoveries)
   serial/           SerialGripper   — USB-serial parallel jaw
   taccap/           TaccapFollower  — centric TacCap gripper
+  dh_ag95/         DHAG95Gripper   — AG-95 Modbus RTU (YAML type: dh-ag95)
 ```
 
-## The two backends
+## Backends
+
+For AG-95, see [the DH integration guide](dh_ag95/README.md) for the validated
+Dobot defaults, Elite tool RS485 setup, command-cache observation semantics,
+intentional corrections, and hardware acceptance steps. The driver has no
+proprietary gripper SDK dependency. Cameras must be configured explicitly.
 
 |                  | `serial`                            | `taccap_follower`                            |
 | ---------------- | ----------------------------------- | -------------------------------------------- |

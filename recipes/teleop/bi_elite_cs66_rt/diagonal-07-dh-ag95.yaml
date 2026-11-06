@@ -1,0 +1,172 @@
+# Elite bench 07 + DH AG-95. Hardware validation pending.
+# Arm/mount settings are inherited from diagonal-07-xgripper.yaml.
+# Before use: configure the installed AG-95 TCP and payload on BOTH pendants.
+# Run examples/elite_dh_ag95.py first; this recipe also moves the arms.
+# lerobot-teleoperate --config_path=recipes/teleop/bi_elite_cs66_rt/diagonal-07-dh-ag95.yaml
+
+robot:
+  type: bi_elite_cs66_rt
+
+  # ── Bench hardware (diagonal-07) ────────────────────────────────────────────
+  left_robot_ip: "192.168.207.129"
+  right_robot_ip: "192.168.207.108"
+  left_local_ip: "" # "" lets the OS route; set to pin the host NIC for RTSI
+  right_local_ip: ""
+  # Joint angles in RADIANS (J1..J6), the units the Elite SDK takes.
+  left_start_position_rad: [-1.3963, -0.5236, 1.5708, -0.5236, 1.5708, -0.7854]
+  right_start_position_rad: [-1.7453, -2.618, -1.5708, -2.618, -1.5708, -0.7854]
+  left_home_position_rad: [-1.3963, -0.5236, 1.5708, -0.5236, 1.5708, -0.7854]
+  right_home_position_rad: [-1.7453, -2.618, -1.5708, -2.618, -1.5708, -0.7854]
+
+  # ── Mounting ────────────────────────────────────────────────────────────────
+  # The two CS66 arms are mounted diagonally/opposed. Each arm's world<-base
+  # rotation R lifts its base-frame TCP poses into ONE SHARED gravity-aligned
+  # world frame (x = facing, y = left, z = up), matching the Flexiv convention so
+  # recorded data is comparable across robots.
+  #
+  # The *_mount_*_deg angles below build R = Rz(world_yaw)·Rz(zrot)·Rx(tilt):
+  #   tilt_deg (α)      tilt about base-X    ┐ BOTH read off the teach pendant
+  #   zrot_deg (β)      rotation about Z     ┘ (both controllers read α=45, β=90).
+  #                     These two only fix the gravity vector in base (recover
+  #                     "z up"); they do NOT fix the heading.
+  #   world_yaw_deg (γ) extra yaw about world-Z aligning each arm's heading into
+  #                     the one shared world frame. The arms are mounted
+  #                     point-symmetrically and so face opposite directions:
+  #                     right γ=0° (defines the world), left γ=180°. The teach
+  #                     pendant CANNOT show this 180° — it is the residual yaw
+  #                     about gravity.
+  #
+  # *_world_rotation (rows = world X/Y/Z axes in base) OVERRIDES the angle build,
+  # and is what is actually in force on this bench. The pendant's 45/90 assumed a
+  # tilt about base-X, but the LEFT arm is actually tilted 45° about base-Y —
+  # verified two ways: a freedrive-probe measurement, and the base-link geometry.
+  # The matrix below == base rotated about Z by 90° then about Y by 45°, giving
+  # world X(fwd) = base +Y and world Z(up) = [.707, 0, .707].
+  #
+  # RIGHT is the point-symmetric partner of the (validated) LEFT:
+  #   R_right = Rz(180)·R_left   forward flips to base -Y, up stays [.707,0,.707]
+  # Earlier, Rz(90°)·Rx(45°) for the right arm was validated empirically (a base-X
+  # 130° pose put the tool +Z approach axis straight down).
+  #
+  # The angles are kept even though the matrices make them inert: they record what
+  # the pendant actually reads, which is what you need when re-deriving a bench.
+  left_mount_tilt_deg: 45.0
+  left_mount_zrot_deg: 90.0
+  left_mount_world_yaw_deg: 180.0
+  right_mount_tilt_deg: 45.0
+  right_mount_zrot_deg: 90.0
+  right_mount_world_yaw_deg: 0.0
+  left_world_rotation:
+    - [0.0, 1.0, 0.0]
+    - [-0.70710678, 0.0, 0.70710678]
+    - [0.70710678, 0.0, 0.70710678]
+  right_world_rotation:
+    - [0.0, -1.0, 0.0]
+    - [0.70710678, 0.0, -0.70710678]
+    - [0.70710678, 0.0, 0.70710678]
+
+  # ── Cameras ─────────────────────────────────────────────────────────────────
+  # AG-95 has no USB camera hub. Add any external wrist/tactile cameras explicitly.
+  cameras:
+    head:
+      type: intelrealsense
+      serial_number_or_name: "347522071393"
+      fps: 30
+      width: 640
+      height: 480
+      warmup_s: 1
+      use_depth: false
+
+  # ── Control ─────────────────────────────────────────────────────────────────
+  control_mode: cartesian_servo # cartesian_servo | joint_servo
+  servoj_gain: 300 # [100, 2000]
+  # Keep the payload measured/configured on the pendant; XGripper values do not apply.
+  payload_mass: null
+
+  # Values from BiDobotNova5DHConfig's actual per-arm overrides, not driver defaults.
+  gripper:
+    type: dh-ag95
+    slave_id: 1
+    baudrate: 115200
+    gripper_force: 33
+    init_open: true
+    init_timeout: 10.0
+    worker_frequency: 50.0
+    position_poll_frequency: 0.0 # acknowledged command cache, NOT measured opening
+    binary_gripper_actions: true
+    gripper_open_threshold: 0.5
+    auto_discover_cameras: false
+    enable_tactile: false
+    # side: null               # stamped per arm, bound to that controller's RS485
+  tool_rs485:
+    tcp_port: 54321            # Elite SDK default, on each robot IP
+    ssh_password_env: ELITE_SSH_PASSWORD
+    transaction_timeout_s: 1.0 # Elite DH.Gripper plugin's serial transaction timeout
+  left_use_gripper: true
+  right_use_gripper: true
+
+  # Singularity / joint overspeed are handled by the native planner below (Pink IK
+  # Hessian damping + native joint velocity/acceleration/jerk limits). The old Python
+  # singularity_* / joint_vel_* guards protected the controller's own Cartesian IK,
+  # which the Pink path no longer uses (only joint servoJ reaches the controller),
+  # and their w-band hold locked the right arm in normal workspace (2026-10-15,
+  # w=0.048 -> s=0). They have been removed; those keys are now rejected.
+  # Per-servo-tick velocity ceiling — smooths jumpy Pico4 wrist tracking at the source.
+  max_lin_speed: 0.25 # m/s; the native planner uses min(this, native_max_tcp_linear_velocity)
+  max_ang_speed: 1.0 # rad/s; the native planner uses min(this, native_max_tcp_angular_velocity)
+
+  # ── Native motion planning & safety (libpyelite) ────────────────────────────
+  # Same keys as third_party/libpyelite/examples/sim_safety.json. The simulator
+  # reads this block too, so the same file can be checked there first:
+  #   python -m libpyelite.sim --recipe <this file>
+  # The TCP speed cap is max_lin_speed / max_ang_speed above.
+  # Cartesian smoothing before IK; limits are magnitudes of the TCP twist, so a
+  # straight drag stays straight and a rotation turns about the TCP.
+  native_cartesian_motion_limits: true
+  native_max_linear_acceleration: 5.0    # m/s²
+  native_max_angular_acceleration: 10.0  # rad/s²
+  native_max_linear_jerk: 1000.0         # m/s³
+  native_max_angular_jerk: 2500.0        # rad/s³
+  # Joint Ruckig after IK. Elite publishes no joint acceleration/jerk rating:
+  # these only back the Cartesian limits up and should rarely bind.
+  native_joint_motion_limits: true
+  # Preserve the startup IK configuration; hold orientation at reach boundaries.
+  native_preserve_configuration: true
+  native_configuration_margin: 0.05235987755982989  # radians (3 degrees)
+  native_configuration_joint_span: 3.140592653589793  # unwrapped half-span, pi - 0.001
+  native_boundary_orientation_tolerance: 0.01  # radians
+  # Keep these velocity caps; at 4 ms, 2.6/3.1 rad/s yields 0.0104/0.0124 rad per step.
+  # A 50 mm detection band minus 10 mm clearance leaves 40 mm; buffer and halving give ~19.5 mm per pair.
+  # Subdivision depends on links, bounding spheres, pose, and both arms' motion; higher speeds increase
+  # subdivision or conservative holds, even at defaults; this is not a universal safety threshold.
+  # See third_party/libpyelite/docs/safety_simulation.md.
+  native_max_joint_velocity: [2.6, 2.6, 3.1, 3.1, 3.1, 3.1]  # rad/s; datasheet, wrist capped by the URDF's pi
+  native_max_joint_acceleration: [40.0, 40.0, 40.0, 40.0, 40.0, 40.0]  # rad/s²
+  native_max_joint_jerk: [5000.0, 5000.0, 5000.0, 5000.0, 5000.0, 5000.0]  # rad/s³
+  # Reject a target that jumps this far from the previous accepted one (0 = off).
+  # A rejection is a fault: the arms stop with a latched error.
+  native_max_target_translation_jump: 0.5  # m
+  native_max_target_rotation_jump: 1.5     # rad
+  native_max_target_joint_jump: 0.3        # rad, joint targets only
+  # No DH AG-95 collision geometry/opening calibration is supplied yet.
+  # Elite collision checking currently supports TacCap followers only.
+  native_collision_profile: null
+  # Joint-current contact stop (any link). Off until its thresholds are tuned on
+  # the bench; see third_party/libpyelite/examples/contact_monitor.json.
+  native_contact_monitor: null
+
+  # NOTE: max_reach_radius intentionally left OFF (config default None). The 2026-07-09
+  # trip was NOT a reach-boundary problem — the flange was at 0.82 m (well inside the
+  # ~0.91 m reach) in a near-singular direction (w=0.051), and a base-origin sphere is
+  # the wrong model anyway; verify the installed AG-95 TCP before motion.
+  # That trip came from the controller's Cartesian IK, which the native Pink path
+  # replaced.
+
+teleop:
+  type: bi_pico4
+  pos_sensitivity: 1.0
+  ori_sensitivity: 1.0
+
+# ── Teleoperate loop (top level) ──
+fps: 30
+display_data: true
