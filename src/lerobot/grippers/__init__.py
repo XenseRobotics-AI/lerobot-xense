@@ -26,10 +26,11 @@ SDKs at import time and fails if that happens again — it has happened twice.
 """
 
 from .configs import GripperConfig  # noqa: F401
+from .dh_ag95.configuration_dh_ag95 import DHAG95GripperConfig  # noqa: F401
 from .gripper import Gripper  # noqa: F401
 
 # Config-only imports: safe without any hardware SDK present, and required so the
 # @register_subclass side effects run before a config is parsed or dispatched.
 from .serial.configuration_serial import SerialGripperConfig  # noqa: F401
 from .taccap.configuration_taccap import TaccapFollowerConfig  # noqa: F401
-from .utils import make_gripper_from_config  # noqa: F401
+from .utils import command_gripper_position, make_gripper_from_config  # noqa: F401

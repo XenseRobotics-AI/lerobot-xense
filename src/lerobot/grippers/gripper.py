@@ -18,8 +18,8 @@
 
 Grippers are arm-agnostic: an arm robot holds one (or one per side) and drives it
 through the small contract below, without knowing which backend is underneath.
-Two backends exist: ``serial`` (USB-serial parallel jaw) and ``taccap_follower``
-(the centric TacCap gripper).
+Backends include ``serial`` (USB-serial parallel jaw), ``taccap_follower``
+(the centric TacCap gripper), and ``dh-ag95`` (Modbus RTU via an injected transport).
 
 Normalized position convention, uniform across every backend:
 
@@ -109,7 +109,10 @@ class Gripper(abc.ABC):
 
     @abc.abstractmethod
     def get_gripper_position(self) -> float:
-        """Return the current jaw position, normalized to [0, 1].
+        """Return the backend's jaw position, normalized to [0, 1].
+
+        DH AG-95 with position polling disabled reports the last acknowledged
+        command, as in the validated Dobot setup; see that backend's README.
 
         Raises:
             DeviceNotConnectedError: If not connected.

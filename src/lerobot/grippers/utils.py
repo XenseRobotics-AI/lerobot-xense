@@ -51,4 +51,21 @@ def make_gripper_from_config(config: GripperConfig | None) -> Gripper | None:
 
         return TaccapFollower(config)
 
+    elif gripper_type == "dh-ag95":
+        from .dh_ag95 import DHAG95Gripper
+
+        return DHAG95Gripper(config)
+
     raise ValueError(f"Unknown gripper type {gripper_type!r} (config: {config}).")
+
+
+def command_gripper_position(gripper: Gripper, position: float) -> float:
+    """Submit a position and return the applied target for action recording.
+
+    AG-95 retains the tested Dobot binary action mapping. Existing backends
+    retain their continuous targets and do not need a new public method.
+    """
+    if gripper.config.type == "dh-ag95":
+        position = gripper.config.normalize_position(position)
+    gripper.set_gripper_position(position)
+    return position

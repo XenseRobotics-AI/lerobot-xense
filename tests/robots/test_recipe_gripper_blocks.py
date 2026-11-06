@@ -25,11 +25,12 @@ from pathlib import Path
 import pytest
 import yaml
 
-from lerobot.grippers import GripperConfig, SerialGripperConfig, TaccapFollowerConfig
+from lerobot.grippers import DHAG95GripperConfig, GripperConfig, SerialGripperConfig, TaccapFollowerConfig
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RECIPES = sorted((REPO_ROOT / "recipes").rglob("*.yaml"))
 CLS: dict[str, type[GripperConfig]] = {
+    "dh-ag95": DHAG95GripperConfig,
     "serial": SerialGripperConfig,
     "taccap_follower": TaccapFollowerConfig,
 }

@@ -31,13 +31,21 @@ import sys
 import pytest
 
 # Every wheel a bare host might be missing.
-HARDWARE_SDKS = ("xensesdk", "xgripper", "xense.taccap")
+HARDWARE_SDKS = ("xensesdk", "xgripper", "xense.taccap", "libpyelite", "elite_cs_sdk")
 
 
 @pytest.fixture
 def without_hardware_sdks(monkeypatch):
     """Make importing any hardware SDK raise, as it would on a host without them."""
+    import lerobot
+
     real_import = builtins.__import__
+    # Reloading a package also replaces its attribute on the parent module.
+    # Restoring sys.modules alone leaves camera/discovery tests traversing the
+    # temporary package, even though Python restored the original submodules.
+    parent = lerobot
+    original_grippers = getattr(parent, "grippers", None)
+    original_modules = set(sys.modules)
 
     def _blocked(name, *args, **kwargs):
         if any(name == sdk or name.startswith(sdk + ".") for sdk in HARDWARE_SDKS):
@@ -52,20 +60,31 @@ def without_hardware_sdks(monkeypatch):
             monkeypatch.delitem(sys.modules, mod)
 
     monkeypatch.setattr(builtins, "__import__", _blocked)
+    try:
+        yield
+    finally:
+        for name in set(sys.modules) - original_modules:
+            if name.startswith("lerobot.grippers"):
+                sys.modules.pop(name, None)
+        if original_grippers is None:
+            parent.__dict__.pop("grippers", None)
+        else:
+            parent.grippers = original_grippers
 
 
 def test_config_classes_import_without_any_sdk(without_hardware_sdks):
-    from lerobot.grippers import SerialGripperConfig, TaccapFollowerConfig
+    from lerobot.grippers import DHAG95GripperConfig, SerialGripperConfig, TaccapFollowerConfig
 
     assert SerialGripperConfig(side="left").side == "left"
     assert TaccapFollowerConfig() is not None
+    assert DHAG95GripperConfig().type == "dh-ag95"
 
 
 def test_gripper_types_stay_registered_without_any_sdk(without_hardware_sdks):
     """--robot.type dispatch needs the @register_subclass side effects to have run."""
     from lerobot.grippers import GripperConfig
 
-    assert set(GripperConfig.get_known_choices()) >= {"serial", "taccap_follower"}
+    assert set(GripperConfig.get_known_choices()) >= {"serial", "taccap_follower", "dh-ag95"}
 
 
 def test_a_recipe_gripper_block_parses_without_any_sdk(without_hardware_sdks):
@@ -79,7 +98,7 @@ def test_a_recipe_gripper_block_parses_without_any_sdk(without_hardware_sdks):
     assert cfg.side == "left"
 
 
-@pytest.mark.parametrize("module", ["lerobot.grippers.serial", "lerobot.grippers.taccap"])
+@pytest.mark.parametrize("module", ["lerobot.grippers.serial", "lerobot.grippers.taccap", "lerobot.grippers.dh_ag95"])
 def test_backend_subpackages_import_without_any_sdk(without_hardware_sdks, module):
     """The half that keeps the laziness honest.
 
