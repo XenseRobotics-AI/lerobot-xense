@@ -36,7 +36,7 @@ from typing import Any
 import numpy as np
 
 from lerobot.cameras.utils import make_cameras_from_configs
-from lerobot.grippers import Gripper, make_gripper_from_config
+from lerobot.grippers import Gripper, command_gripper_position, make_gripper_from_config
 from lerobot.grippers.camera_injection import (
     adopt_taccap_mcu_device,
     attach_wrist_fisheye_calibration,
@@ -62,6 +62,11 @@ from lerobot.robots.elite_cs66_rt.elite_cs66_rt import (
     _validate_configuration_model,
 )
 from lerobot.robots.elite_cs66_rt.joint_reset import JointReset, joint_sample
+from lerobot.robots.elite_cs66_rt.tool_rs485 import (
+    EliteToolRS485,
+    connect_elite_gripper,
+    disconnect_elite_tool_gripper,
+)
 from lerobot.robots.robot import Robot
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 from lerobot.utils.robot_utils import (
@@ -457,6 +462,9 @@ class BiEliteCS66RT(Robot):
         if self.is_connected:
             raise DeviceAlreadyConnectedError(f"{self} already connected, do not run connect() twice.")
 
+        if any(g is not None and g.config.type == "dh-ag95" for g in self._gripper.values()):
+            EliteToolRS485.preflight(self.config.tool_rs485)
+
         if self.config.native_collision_profile is not None:
             from libpyelite.collision import StationLayer
 
@@ -614,7 +622,7 @@ class BiEliteCS66RT(Robot):
         gripper = self._gripper[side]
         if gripper is not None:
             self.logger.info(f"{side} arm: connecting gripper ({type(gripper).__name__})...")
-            gripper.connect()
+            connect_elite_gripper(gripper, driver, ip, self.config.tool_rs485, self.config.connect_timeout_s)
 
     def _cleanup_after_failed_connect(self) -> None:
         self._joint_reset.close()
@@ -629,6 +637,7 @@ class BiEliteCS66RT(Robot):
             self._stop_station_layer()
         for side in _SIDES:
             with best_effort(self.logger, f"stopping control ({side})"):
+                disconnect_elite_tool_gripper(self._gripper[side], self.logger)
                 if self._driver[side] is not None:
                     self._driver[side].stopControl(1000)
             with best_effort(self.logger, f"closing the dashboard connection ({side})"):
@@ -658,6 +667,8 @@ class BiEliteCS66RT(Robot):
             self._driver[s] is not None or self._rtsi[s] is not None or self._dashboard[s] is not None for s in _SIDES
         )
         if not self._is_connected and not any_handle:
+            for gripper in self._gripper.values():
+                disconnect_elite_tool_gripper(gripper, self.logger)
             self.logger.warn(f"{self} is not connected, skipping disconnect.")
             return
 
@@ -665,8 +676,9 @@ class BiEliteCS66RT(Robot):
         self._q_start = dict.fromkeys(_SIDES)
         self._clear_reset_targets()
         for cam in self.cameras.values():
-            if cam.is_connected:
-                cam.disconnect()
+            with best_effort(self.logger, "disconnecting camera", level="warn"):
+                if cam.is_connected:
+                    cam.disconnect()
 
         for side in _SIDES:
             self._stop_servo_loop(side)
@@ -690,6 +702,9 @@ class BiEliteCS66RT(Robot):
         with best_effort(self.logger, "stopping the station collision layer"):
             self._stop_station_layer()
 
+        # Close both tools even if the first controller's teardown raises later.
+        for gripper in self._gripper.values():
+            disconnect_elite_tool_gripper(gripper, self.logger)
         for side in _SIDES:
             driver = self._driver[side]
             if driver is not None:
@@ -1233,8 +1248,7 @@ class BiEliteCS66RT(Robot):
             gripper_key = self._gripper_key[side]
             if gripper is not None:
                 if gripper_key in action:
-                    gripper.set_gripper_position(float(action[gripper_key]))
-                    held[gripper_key] = float(action[gripper_key])
+                    held[gripper_key] = command_gripper_position(gripper, float(action[gripper_key]))
                 else:
                     held[gripper_key] = gripper.get_gripper_position()
         return held
@@ -1280,8 +1294,7 @@ class BiEliteCS66RT(Robot):
             sent.update(dict(zip(joint_keys, target_joints, strict=True)))
 
         if gripper is not None and gripper_key in action:
-            gripper.set_gripper_position(float(action[gripper_key]))
-            sent[gripper_key] = float(action[gripper_key])
+            sent[gripper_key] = command_gripper_position(gripper, float(action[gripper_key]))
 
     # =========================================================================
     # Reset

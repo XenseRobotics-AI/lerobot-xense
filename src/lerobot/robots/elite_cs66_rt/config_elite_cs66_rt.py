@@ -18,6 +18,7 @@ from pathlib import Path
 from lerobot.cameras.configs import CameraConfig
 from lerobot.grippers import GripperConfig
 from lerobot.robots.config import RobotConfig
+from lerobot.robots.elite_cs66_rt.config_tool_rs485 import EliteToolRS485Config
 from lerobot.robots.elite_cs66_rt.joint_reset import validate_reset_config
 
 
@@ -226,6 +227,7 @@ class EliteCS66RTConfig(RobotConfig):
     # A single arm has no side to infer, so `side` (or `port`/`sn`) has to be set
     # in the block for the serial backend to find its board.
     gripper: GripperConfig | None = None
+    tool_rs485: EliteToolRS485Config = field(default_factory=EliteToolRS485Config)
 
     # External cameras.
     cameras: dict[str, CameraConfig] = field(default_factory=dict)

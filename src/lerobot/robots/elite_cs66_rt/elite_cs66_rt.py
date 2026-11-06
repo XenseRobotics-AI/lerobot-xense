@@ -21,7 +21,7 @@ from typing import Any
 import numpy as np
 
 from lerobot.cameras.utils import make_cameras_from_configs
-from lerobot.grippers import Gripper, make_gripper_from_config
+from lerobot.grippers import Gripper, command_gripper_position, make_gripper_from_config
 from lerobot.grippers.camera_injection import (
     adopt_taccap_mcu_device,
     attach_wrist_fisheye_calibration,
@@ -33,6 +33,11 @@ from lerobot.robots.elite_cs66_rt.config_elite_cs66_rt import (
     EliteCS66RTControlMode,
 )
 from lerobot.robots.elite_cs66_rt.joint_reset import JointReset, joint_sample
+from lerobot.robots.elite_cs66_rt.tool_rs485 import (
+    EliteToolRS485,
+    connect_elite_gripper,
+    disconnect_elite_tool_gripper,
+)
 from lerobot.robots.robot import Robot
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 from lerobot.utils.robot_utils import (
@@ -433,6 +438,9 @@ class EliteCS66RT(Robot):
         if self.is_connected:
             raise DeviceAlreadyConnectedError(f"{self} already connected, do not run connect() twice.")
 
+        if self.config.gripper is not None and self.config.gripper.type == "dh-ag95":
+            EliteToolRS485.preflight(self.config.tool_rs485)
+
         self._joint_reset.prepare_connection()
         self._q_start = None
         self._cs = _import_elite_sdk()
@@ -502,7 +510,13 @@ class EliteCS66RT(Robot):
             # no point at which the calibration could be handed over.
             if self._gripper is not None:
                 self.logger.info(f"Connecting gripper ({type(self._gripper).__name__})...")
-                self._gripper.connect()
+                connect_elite_gripper(
+                    self._gripper,
+                    self._driver,
+                    self.config.robot_ip,
+                    self.config.tool_rs485,
+                    self.config.connect_timeout_s,
+                )
 
             attach_wrist_fisheye_calibration(self.cameras, {self._gripper_side: self._gripper}, self.logger)
 
@@ -549,6 +563,7 @@ class EliteCS66RT(Robot):
         self._joint_reset.close()
         self._q_start = None
         self._clear_reset_targets()
+        disconnect_elite_tool_gripper(self._gripper, self.logger)
         # Drop the driver / dashboard / RTSI handles first.
         with best_effort(self.logger, "stopping control"):
             if self._driver is not None:
@@ -811,8 +826,7 @@ class EliteCS66RT(Robot):
             held = self._tcp_rotvec_to_feature_values(_controller_tcp_to_pose6(self._rtsi.getActualTCPPose()))
         if self._gripper is not None:
             if "gripper.pos" in action:
-                self._gripper.set_gripper_position(float(action["gripper.pos"]))
-                held["gripper.pos"] = float(action["gripper.pos"])
+                held["gripper.pos"] = command_gripper_position(self._gripper, float(action["gripper.pos"]))
             else:
                 held["gripper.pos"] = self._gripper.get_gripper_position()
         return held
@@ -845,8 +859,7 @@ class EliteCS66RT(Robot):
             sent.update(dict(zip(JOINT_POSITION_KEYS, target_joints, strict=True)))
 
         if self._gripper is not None and "gripper.pos" in action:
-            self._gripper.set_gripper_position(float(action["gripper.pos"]))
-            sent["gripper.pos"] = float(action["gripper.pos"])
+            sent["gripper.pos"] = command_gripper_position(self._gripper, float(action["gripper.pos"]))
 
         return sent
 
@@ -854,6 +867,8 @@ class EliteCS66RT(Robot):
         # Idempotent: re-running disconnect after a failed connect or after a
         # previous successful disconnect should be a quiet no-op, not raise.
         if not self._is_connected and self._driver is None and self._rtsi is None and self._dashboard is None:
+            # Retry a tool session whose SSH cleanup failed on the prior call.
+            disconnect_elite_tool_gripper(self._gripper, self.logger)
             self.logger.warn(f"{self} is not connected, skipping disconnect.")
             return
 
@@ -863,8 +878,9 @@ class EliteCS66RT(Robot):
         self._q_start = None
         self._clear_reset_targets()
         for cam in self.cameras.values():
-            if cam.is_connected:
-                cam.disconnect()
+            with best_effort(self.logger, "disconnecting camera", level="warn"):
+                if cam.is_connected:
+                    cam.disconnect()
 
         self._stop_servo_loop()
 
@@ -886,6 +902,7 @@ class EliteCS66RT(Robot):
             # it again before stopControl.
             self._stop_servo_loop()
 
+        disconnect_elite_tool_gripper(self._gripper, self.logger)
         if self._driver is not None:
             try:
                 # Clean shutdown: write idle so the controller-side script

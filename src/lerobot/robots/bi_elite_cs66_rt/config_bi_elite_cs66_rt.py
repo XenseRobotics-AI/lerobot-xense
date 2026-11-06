@@ -27,6 +27,7 @@ from pathlib import Path
 from lerobot.cameras.configs import CameraConfig
 from lerobot.grippers import GripperConfig
 from lerobot.robots.config import RobotConfig
+from lerobot.robots.elite_cs66_rt.config_tool_rs485 import EliteToolRS485Config
 from lerobot.robots.elite_cs66_rt.joint_reset import validate_reset_config
 
 ROBOT_TYPE = "bi_elite_cs66_rt"
@@ -263,6 +264,7 @@ class BiEliteCS66RTConfig(RobotConfig):
     # Tactile sensors are separate XenseTactileCamera devices (see the block's own
     # `enable_tactile`), never the gripper object itself.
     gripper: GripperConfig | None = None
+    tool_rs485: EliteToolRS485Config = field(default_factory=EliteToolRS485Config)
     left_use_gripper: bool = True
     right_use_gripper: bool = True
 
