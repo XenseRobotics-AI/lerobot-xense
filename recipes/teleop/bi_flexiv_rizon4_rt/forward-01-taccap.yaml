@@ -69,16 +69,19 @@ robot:
     status_print_hz: 5.0            # row-content rate; teleop stays 30 Hz, SDK stream 100 Hz
 
     # ── ForcePositionController parameters ────────────────────────────────────
-    # 只剩一个旋钮。力矩预算(grasp_torque_nm)和它的两个天花板都不再由上层配 ——
-    # 固件把超过包络 cont(本机 1.1Nm)的一律削回去,配 1.8 拿到的还是 1.1,只多换
-    # 来 I2t 累积和掉电风险(SDK 注释记着 1.5Nm 对 1.6Nm 包络就把板子拉到欠压的
-    # 现场事故)。close_preload_nm(0.25Nm,把爪子坐死在闭合止点)同样走 SDK 默认。
+    # 力矩预算(grasp_torque_nm)只能往下调:默认 null 走 SDK(电机连续堵转额定,
+    # 本机 1.1Nm),只在需要夹得更轻时设一个更小的值。往上配没有意义 —— 固件把
+    # 超过包络 cont 的一律削回去,配 1.8 拿到的还是 1.1,只多换来 I2t 累积和掉电
+    # 风险(SDK 注释记着 1.5Nm 对 1.6Nm 包络就把板子拉到欠压的现场事故),所以
+    # connect() 直接拒绝。它的两个天花板仍不由上层配。close_preload_nm(0.25Nm,
+    # 把爪子坐死在闭合止点)同样走 SDK 默认。
     # 接触检测和位置增益在 SDK 0.2.0 就移进 C++ 的 detail:: 了,MCU 以 500Hz 跑
     # 同一个堵转判据并且是权威。
     # 行进段**设定点斜坡**的推进速率,不是发给电机的速度命令。实测能跑满
     # (均速/命令 102%),全行程 1.2rad 约 0.4 秒。SDK 默认是 0.5,这里刻意调高。
     close_speed_radps: 3.0
     status_timeout_ms: 350
+    # grasp_torque_nm: null           # grasp force; null = SDK default (motor stall rating), set lower to grip lighter
 
     auto_discover_cameras: true
     enable_tactile: true

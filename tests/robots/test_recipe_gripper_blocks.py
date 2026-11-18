@@ -51,6 +51,7 @@ TACCAP_ADVANCED_CONTROLLER_FIELDS = {
     "status_print_hz",
     "close_speed_radps",
     "status_timeout_ms",
+    "grasp_torque_nm",
 }
 TACCAP_CONTROLLER_REFERENCE = REPO_ROOT / "recipes/teleop/bi_flexiv_rizon4_rt/forward-01-taccap.yaml"
 
@@ -87,11 +88,17 @@ def test_forward_01_is_the_complete_taccap_controller_reference():
 
     assert block["type"] == "taccap_follower"
     assert block["controller"] == "force_position"
-    assert set(block) >= TACCAP_ADVANCED_CONTROLLER_FIELDS
+    # grasp_torque_nm is the one advanced knob the reference documents rather
+    # than sets: at null the SDK default (the motor's stall rating) applies,
+    # which is what a reference should show (see the next test).
+    assert set(block) >= TACCAP_ADVANCED_CONTROLLER_FIELDS - {"grasp_torque_nm"}
+    lines = _gripper_block_lines(TACCAP_CONTROLLER_REFERENCE.read_text())
+    commented = {m.group(1) for line in lines if (m := COMMENTED.match(line))}
+    assert "grasp_torque_nm" in commented
 
 
 def test_forward_01_leaves_the_torque_budget_to_the_sdk():
-    """The recipe must not configure grasp torque or its ceilings at all.
+    """The recipe must not SET grasp torque or its ceilings (it lists grasp_torque_nm commented, at null).
 
     It used to pin grasp_torque_nm=1.8 against a 1.1 Nm continuous envelope —
     a value the firmware clamps straight back to 1.1, so the configured grip
@@ -100,6 +107,10 @@ def test_forward_01_leaves_the_torque_budget_to_the_sdk():
     connect. The knob is gone rather than merely retuned: there is no value
     above the envelope worth allowing, and below it the SDK default is already
     the motor's continuous rating.
+
+    grasp_torque_nm came back as a lower-only knob (a lighter grip for fragile
+    objects); connect() refuses anything above the stall rating. A reference
+    recipe still leaves it at null, so the SDK default is what it documents.
 
     `close_position` was asserted here before that. SDK 0.2.0 removed it too:
     the closed endpoint is normalized 0.0 by construction, and firmware 1.2.5

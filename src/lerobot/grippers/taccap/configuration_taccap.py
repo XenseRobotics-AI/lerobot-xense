@@ -73,10 +73,16 @@ class TaccapFollowerConfig(GripperConfig):
     ForcePositionController:
         close_speed_radps: Rate of the time-based SETPOINT RAMP during travel —
                      not a velocity command to the motor.
+        grasp_torque_nm: Grasp torque budget (N·m), i.e. the force a blocked jaw
+                     holds an object with. ``None`` (default) keeps the SDK's
+                     value for the fitted motor, its continuous stall rating
+                     (EL05 1.1 / RS00 3.6). Set it only to grip LIGHTER, e.g. a
+                     fragile object; connect() refuses anything above the stall
+                     rating, as the SDK's start() would.
 
-        Nothing else is exposed. The torque budget, its two ceilings and the
-        closed-end preload are all SDK defaults; see the block next to the
-        fields below for why each one is better left there.
+        Nothing else is exposed. The two torque ceilings and the closed-end
+        preload are SDK defaults; see the block next to the fields below for
+        why each one is better left there.
 
         The closed-endpoint preload (``close_preload_nm``, 0.25 Nm) is left at
         the SDK default and not exposed here. Add it to this dataclass and to
@@ -118,14 +124,19 @@ class TaccapFollowerConfig(GripperConfig):
     # loop skips fields the SDK no longer declares. Removed rather than left
     # looking tunable.
     #
-    # 力矩三兄弟也不在这里了,一律由 SDK 按设备装的电机给出
+    # 力矩三兄弟的默认值一律由 SDK 按设备装的电机给出
     #   (ForcePositionConfig.for_spec(motor.get_spec()),见 taccap_follower.py):
     #
     #   grasp_torque_nm = 电机的**连续堵转额定**:EL05 1.1 Nm、RS00 3.6 Nm。这是
     #     硬要求 —— 被挡住的爪子无限期坐在它上面,超过它 SDK 的 start() 直接拒绝。
-    #     固件包络 cont 也严格等于它。暴露它只会让人配出得不到或不能长期维持的值。
-    #     SDK 注释记着一次现场事故:EL05 上 1.5Nm 夹持对 1.6Nm 包络把板子拉到欠压、
-    #     连 USB 一起断。
+    #     固件包络 cont 也严格等于它。SDK 注释记着一次现场事故:EL05 上 1.5Nm 夹持
+    #     对 1.6Nm 包络把板子拉到欠压、连 USB 一起断。
+    #
+    #     它曾经整个不暴露,理由是"往上配没有意义,往下 SDK 默认就是额定"。现在
+    #     作为**只能往下调**的旋钮加回来(下面的 grasp_torque_nm 字段):部署端
+    #     要按任务夹得更轻(易碎件),而夹持力就是这个预算 —— SDK 0.4 的接触锁存
+    #     在爪子停在目标之外时把推力升到预算并锁住。上限仍是堵转额定:connect()
+    #     先按 for_spec 给出的值校验,SDK 的 start() 再校验一次。None = SDK 默认。
     #
     #   hold_torque_limit_nm = 电机旋转额定(EL05 1.8 / RS00 5.0),校验 grasp 上界。
     #
@@ -134,6 +145,8 @@ class TaccapFollowerConfig(GripperConfig):
     #     ForcePositionConfig()(EL05 的 6.0),RS00 上 0x700B 是 14。
     close_speed_radps: float = 3.0
     status_timeout_ms: int = 350
+    # None = the SDK default for the fitted motor (its continuous stall rating).
+    grasp_torque_nm: float | None = None
 
     # ── Behavior ───────────────────────────────────────────────────────────────
     init_open: bool = True
@@ -180,6 +193,12 @@ class TaccapFollowerConfig(GripperConfig):
         if not math.isfinite(self.close_speed_radps) or self.close_speed_radps <= 0.0:
             raise ValueError(
                 f"TaccapFollowerConfig: close_speed_radps must be finite and > 0, got {self.close_speed_radps}."
+            )
+        if self.grasp_torque_nm is not None and (
+            not math.isfinite(self.grasp_torque_nm) or self.grasp_torque_nm <= 0.0
+        ):
+            raise ValueError(
+                f"TaccapFollowerConfig: grasp_torque_nm must be None or finite and > 0, got {self.grasp_torque_nm}."
             )
         if self.status_timeout_ms <= 0:
             raise ValueError(f"TaccapFollowerConfig: status_timeout_ms must be > 0, got {self.status_timeout_ms}.")
