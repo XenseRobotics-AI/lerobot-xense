@@ -36,6 +36,8 @@ class _FakeForcePositionConfig:
     close_speed_radps = None
     status_timeout_ms = None
     motor_stream_hz = None
+    # What for_spec() / the bare constructor give on an EL05: its stall rating.
+    grasp_torque_nm = 1.1
 
 
 class _FakeForcePositionController:
@@ -563,3 +565,43 @@ def test_out_of_range_targets_are_rejected():
                 follower.set_gripper_position(bad)
     finally:
         monkeypatch.undo()
+
+
+# ---- grasp torque ------------------------------------------------------------
+
+
+@pytest.mark.parametrize("value", [0.0, -0.5, float("nan"), float("inf")])
+def test_grasp_torque_must_be_positive_and_finite(value):
+    with pytest.raises(ValueError, match="grasp_torque_nm"):
+        TaccapFollowerConfig(grasp_torque_nm=value)
+
+
+def test_grasp_torque_defaults_to_the_sdk_value(monkeypatch):
+    """None must leave for_spec's stall rating in place, not overwrite it."""
+    _install_fake_sdk(monkeypatch)
+    controller = _follower(TaccapFollowerConfig())._make_sdk_controller()
+    assert controller.config.grasp_torque_nm == 1.1
+
+
+def test_grasp_torque_is_forwarded_when_lowered(monkeypatch):
+    _install_fake_sdk(monkeypatch)
+    controller = _follower(TaccapFollowerConfig(grasp_torque_nm=0.6))._make_sdk_controller()
+    assert controller.config.grasp_torque_nm == 0.6
+
+
+def test_grasp_torque_above_the_stall_rating_is_refused(monkeypatch):
+    """The SDK's start() refuses it too; refusing here names the motor's rating."""
+    _install_fake_sdk(monkeypatch)
+    with pytest.raises(ValueError, match="stall"):
+        _follower(TaccapFollowerConfig(grasp_torque_nm=1.5))._make_sdk_controller()
+
+
+def test_grasp_torque_on_an_sdk_without_the_field_fails_loudly(monkeypatch):
+    """A force the recipe asked for must not be dropped like the optional fields are."""
+
+    class _OldForcePositionConfig:
+        close_speed_radps = None
+
+    _install_fake_sdk(monkeypatch, force_position_config=_OldForcePositionConfig)
+    with pytest.raises(RuntimeError, match="grasp_torque_nm"):
+        _follower(TaccapFollowerConfig(grasp_torque_nm=0.6))._make_sdk_controller()

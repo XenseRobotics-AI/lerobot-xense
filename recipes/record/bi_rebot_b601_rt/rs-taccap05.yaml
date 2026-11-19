@@ -67,6 +67,7 @@ robot:
       status_print_hz: 5.0 # > 0 (Hz); runtime status refresh rate
       close_speed_radps: 3.0 # > 0 (rad/s); closing setpoint ramp speed
       status_timeout_ms: 350 # > 0 (ms); motor status timeout
+      # grasp_torque_nm: null # null, (0, stall rating] (N·m); SDK default (EL05 1.1 / RS00 3.6) / lighter grip
       auto_discover_cameras: true # true, false; discover wrist/tactile cameras / configure manually
       enable_tactile: true # true, false; include / omit tactile cameras during discovery
       undistort_wrist: false # true, false; rectify / retain raw wrist fisheye images
@@ -127,6 +128,7 @@ robot:
       status_print_hz: 5.0 # > 0 (Hz); runtime status refresh rate
       close_speed_radps: 3.0 # > 0 (rad/s); closing setpoint ramp speed
       status_timeout_ms: 350 # > 0 (ms); motor status timeout
+      # grasp_torque_nm: null # null, (0, stall rating] (N·m); SDK default (EL05 1.1 / RS00 3.6) / lighter grip
       auto_discover_cameras: true # true, false; discover wrist/tactile cameras / configure manually
       enable_tactile: true # true, false; include / omit tactile cameras during discovery
       undistort_wrist: false # true, false; rectify / retain raw wrist fisheye images

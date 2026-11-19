@@ -197,6 +197,8 @@ class TaccapFollower(Gripper):
                 setattr(force_cfg, name, getattr(cfg, name))
             else:
                 missing_fields.append(name)
+        if cfg.grasp_torque_nm is not None:
+            self._apply_grasp_torque(force_cfg, cfg.grasp_torque_nm)
         if missing_fields:
             self.logger.warn(
                 "Installed xense.taccap native extension is older than this "
@@ -206,6 +208,28 @@ class TaccapFollower(Gripper):
                 "in this environment."
             )
         return taccap.ForcePositionController(self._gripper, force_cfg)
+
+    def _apply_grasp_torque(self, force_cfg, grasp_torque_nm: float) -> None:
+        """Lower the SDK's grasp budget to ``grasp_torque_nm``.
+
+        Never silently: an extension without the field cannot honour a force the
+        recipe asked for, and a value above what ``for_spec`` gave -- the fitted
+        motor's continuous stall rating -- is one the SDK's start() would refuse
+        anyway, so say so here with the rating in the message.
+        """
+        if not hasattr(force_cfg, "grasp_torque_nm"):
+            raise RuntimeError(
+                "grasp_torque_nm is set, but the installed xense.taccap native extension's "
+                "ForcePositionConfig has no grasp_torque_nm. Rebuild it with "
+                "`pip install -e third_party/taccap-gripper --no-build-isolation`."
+            )
+        stall_rating = getattr(force_cfg, "grasp_torque_nm", None)
+        if stall_rating is not None and grasp_torque_nm > float(stall_rating) + 1e-4:
+            raise ValueError(
+                f"{self}: grasp_torque_nm={grasp_torque_nm} N·m exceeds this motor's continuous stall "
+                f"rating {float(stall_rating):.3f} N·m, which a blocked jaw holds indefinitely."
+            )
+        force_cfg.grasp_torque_nm = grasp_torque_nm
 
     def _latest_observation(self):
         """Return the controller's latest GripperObservation."""
