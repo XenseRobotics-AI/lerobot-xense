@@ -147,9 +147,10 @@ class TaccapFollower(Gripper):
         """
         if self._mcu_device:
             return self._mcu_device
-        finder = taccap.find_left if self._side == "left" else taccap.find_right
-        eps = finder()  # throws if the requested side isn't visible on the bus
-        return eps.mcu_device
+        from .discovery import find_follower_on_side
+
+        # Throws if no follower on the requested side is visible on the bus.
+        return find_follower_on_side(taccap, self._side).mcu_device
 
     def _make_sdk_controller(self):
         """Build the SDK controller selected by the recipe."""
