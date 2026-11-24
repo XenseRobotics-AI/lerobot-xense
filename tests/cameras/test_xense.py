@@ -48,7 +48,7 @@ def test_to_landscape_is_a_clockwise_rotation_not_a_mirror(channels):
     assert np.array_equal(np.transpose(image, (1, 0) + tuple(range(2, image.ndim))), landscape[:, ::-1])
 
 
-def test_read_sensor_data_rotates_every_image_output_the_same_way():
+def test_read_sensor_data_rotates_every_image_output_the_same_way(monkeypatch):
     from lerobot.cameras.xense.configuration_xense import XenseOutputType
 
     rectify, depth = _portrait(3), _portrait(None)
@@ -77,7 +77,7 @@ def test_read_sensor_data_rotates_every_image_output_the_same_way():
     camera._Sensor = FakeSensorModule
     camera._sensor_output_types_cache = None
     camera._sensor_output_types_cache_key = None
-    type(camera).is_connected = property(lambda self: True)
+    monkeypatch.setattr(XenseTactileCamera, "is_connected", property(lambda self: True))
 
     camera.output_types = [XenseOutputType.RECTIFY, XenseOutputType.DEPTH, XenseOutputType.FORCE]
     got_rectify, got_depth, got_force = camera._read_sensor_data()
