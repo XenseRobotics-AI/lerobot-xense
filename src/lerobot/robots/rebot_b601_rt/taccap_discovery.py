@@ -4,7 +4,7 @@ import os
 import re
 
 from lerobot.grippers.camera_injection import _add_side_cameras
-from lerobot.grippers.taccap.discovery import _import_taccap
+from lerobot.grippers.taccap.discovery import _import_taccap, find_follower_on_side
 from lerobot.grippers.usb_topology import sysfs_device_dir, video_node
 from lerobot.utils.errors import DeviceNotConnectedError
 
@@ -35,9 +35,8 @@ def inject_taccap_cameras(
     sdk = _import_taccap()
     devices = {}
     for side in sides:
-        finder = sdk.find_left if side == "left" else sdk.find_right
         try:
-            endpoint = finder()
+            endpoint = find_follower_on_side(sdk, side)
         except Exception as error:
             raise DeviceNotConnectedError(f"taccap auto-discover: no {side} gripper/wrist camera found.") from error
         hub, _ = nearest_hub_and_port(sysfs_device_dir("tty", os.path.realpath(endpoint.mcu_device)))

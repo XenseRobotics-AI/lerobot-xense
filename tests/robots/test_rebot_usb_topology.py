@@ -44,8 +44,9 @@ def test_taccap_grippers_on_a_shared_upstream_hub_keep_their_own_sensors(monkeyp
         ),
     )
     sdk = SimpleNamespace(
-        find_left=lambda: SimpleNamespace(firmware_sn="TCGU01A25Z0015s", mcu_device="/dev/ttyACM0"),
-        find_right=lambda: SimpleNamespace(firmware_sn="TCGU01A28Z0052s", mcu_device="/dev/ttyACM2"),
+        Role=SimpleNamespace(Follower="s", Leader="m"),
+        find_left=lambda role=None: SimpleNamespace(firmware_sn="TCGU01A25Z0015s", mcu_device="/dev/ttyACM0"),
+        find_right=lambda role=None: SimpleNamespace(firmware_sn="TCGU01A28Z0052s", mcu_device="/dev/ttyACM2"),
         parse_serial=lambda sn: SimpleNamespace(product="TCGU01"),
     )
     monkeypatch.setattr(discovery, "_import_taccap", lambda: sdk)

@@ -68,6 +68,35 @@ def _import_taccap():
     return taccap
 
 
+def find_follower_on_side(taccap, side: str):
+    """The follower gripper on ``side`` -- never a leader of the same side.
+
+    The SDK's ``find_left()`` / ``find_right()`` without a role return the first
+    unit on that side whatever its role. A leader plugged into the same host
+    (teleop) is then picked whenever its CH343 serial sorts first; on the bench a
+    left leader next to the left follower was avoided only by serial order.
+    ``role=`` arrived after SDK 0.5.0; an older extension falls back to the
+    role-less call and refuses a leader it returns, rather than open it as a
+    follower.
+    """
+    finder = taccap.find_left if side == "left" else taccap.find_right
+    try:
+        return finder(role=taccap.Role.Follower)
+    except (TypeError, AttributeError):
+        pass  # native extension older than the role filter
+    logger.warn(
+        f"The installed xense.taccap has no role filter on find_{side}(); a leader on the same host "
+        "could be picked. Reinstall third_party/taccap-gripper in this environment."
+    )
+    eps = finder()
+    if str(getattr(eps, "firmware_sn", "")).lower().endswith("m"):
+        raise RuntimeError(
+            f"find_{side}() returned leader {eps.firmware_sn} where a follower was expected. "
+            "Reinstall third_party/taccap-gripper (its find_left/find_right take role=), or unplug the leader."
+        )
+    return eps
+
+
 def discover_taccap_sides() -> dict[str, TaccapSideDevices]:
     """Discover per-side (left/right) TacCap wrist camera + GSPS tactile SNs.
 
@@ -83,9 +112,9 @@ def discover_taccap_sides() -> dict[str, TaccapSideDevices]:
 
     # --- 1. Sniff grippers per side, derive wrist name, resolve USB hub ---
     sides: dict[str, TaccapSideDevices] = {}
-    for finder, side in ((taccap.find_left, "left"), (taccap.find_right, "right")):
+    for side in ("left", "right"):
         try:
-            eps = finder()
+            eps = find_follower_on_side(taccap, side)
         except Exception as e:
             logger.info(f"No {side} TacCap gripper found: {e}")
             continue
