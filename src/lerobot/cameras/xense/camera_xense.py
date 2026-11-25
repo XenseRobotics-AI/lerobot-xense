@@ -93,6 +93,21 @@ def _patch_ctypes_find_library_for_udev() -> None:
     _CTYPES_FIND_LIBRARY_UDEV_PATCHED = True
 
 
+def to_landscape(image: np.ndarray) -> np.ndarray:
+    """Turn the SDK's portrait image (700, 400[, C]) into the stored landscape (400, 700[, C]).
+
+    Rotate 90° clockwise — the same as the backpack collector (taccap-core
+    ``RECTIFY_ROTATE_DEG = 270``), so both capture stacks store the same picture.
+
+    This used to be ``np.transpose(image, (1, 0, ...))``. A transpose is not a
+    rotation: it equals a 90° clockwise rotation followed by a left-right flip,
+    so every tactile image recorded through this driver was mirrored — the
+    contact tip that points right in the collector pointed left here, and shear
+    to the left read as shear to the right.
+    """
+    return np.ascontiguousarray(np.rot90(image, k=-1, axes=(0, 1)))
+
+
 class XenseTactileCamera(Camera):
     """
     Manages tactile sensor interactions using Xense SDK for efficient data recording.
@@ -353,10 +368,8 @@ class XenseTactileCamera(Camera):
                 for i, output_type in enumerate(self.output_types):
                     data = results[i]
                     if output_type in image_outputs and getattr(data, "ndim", 0) >= 2:
-                        # Transpose to swap h and w dimensions:
-                        # - HWC -> WHC
-                        # - HW  -> WH
-                        data = np.transpose(data, (1, 0) + tuple(range(2, data.ndim)))
+                        # portrait (700, 400) -> landscape (400, 700); see to_landscape
+                        data = to_landscape(data)
                     if output_type == XenseOutputType.DEPTH:
                         data = np.asarray(data) + np.float32(0.01)  # add 10mm to avoid log zero
                     processed_results.append(data)
@@ -364,8 +377,7 @@ class XenseTactileCamera(Camera):
             else:
                 # single output type
                 if self.output_types[0] in image_outputs and getattr(results, "ndim", 0) >= 2:
-                    # print(f"DEBUG: Transposing shape {results.shape}")
-                    results = np.transpose(results, (1, 0) + tuple(range(2, results.ndim)))
+                    results = to_landscape(results)
                 if self.output_types[0] == XenseOutputType.DEPTH and results is not None:
                     results = np.asarray(results) + np.float32(0.01)  # add 10mm to avoid log zero
                 return results
